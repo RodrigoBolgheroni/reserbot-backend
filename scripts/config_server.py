@@ -28,6 +28,8 @@ CONFIG_KEYS: Final[set[str]] = {
     "HORARIO_DISPARO",
 }
 MAX_UPLOAD_MB_PADRAO: Final[int] = 15
+CLIENTES_PAGE_SIZE_PADRAO: Final[int] = 100
+CLIENTES_PAGE_SIZE_MAX: Final[int] = 500
 _IMPORTACOES_PENDENTES: dict[str, pdf_clientes.ResultadoExtracaoPDF] = {}
 
 
@@ -202,9 +204,24 @@ class ConfigHandler(BaseHTTPRequestHandler):
         self._responder_json({"ok": True, "perfis": perfis.listar_perfis()})
 
     def _listar_clientes(self) -> None:
-        limite = _query_int(self.path, "limit", 500)
-        clientes = clientes_supabase.listar_clientes(limite=limite)
-        self._responder_json({"ok": True, "clientes": clientes, "total": len(clientes)})
+        page, page_size, offset = _paginacao_clientes(self.path)
+        resultado = clientes_supabase.listar_clientes(limite=page_size, offset=offset, contar=True)
+        clientes = resultado["clientes"]
+        total = resultado.get("total")
+        total_pages = _total_pages(total, page_size)
+        has_next = page < total_pages if total_pages is not None else len(clientes) == page_size
+        self._responder_json(
+            {
+                "ok": True,
+                "clientes": clientes,
+                "page": page,
+                "page_size": page_size,
+                "total": total if total is not None else len(clientes),
+                "total_pages": total_pages if total_pages is not None else None,
+                "has_next": has_next,
+                "has_prev": page > 1,
+            }
+        )
 
     def _listar_reservas(self) -> None:
         limite = _query_int(self.path, "limit", 500)
@@ -487,6 +504,36 @@ def _query_int(path: str, nome: str, padrao: int) -> int:
         return int(query.get(nome, [str(padrao)])[0])
     except (TypeError, ValueError):
         return padrao
+
+
+def _paginacao_clientes(path: str) -> tuple[int, int, int]:
+    query = parse_qs(urlparse(path).query)
+    page_size = _query_param_int(query, "page_size", _query_param_int(query, "limit", CLIENTES_PAGE_SIZE_PADRAO))
+    page_size = max(1, min(page_size, CLIENTES_PAGE_SIZE_MAX))
+    offset_recebido = _query_param_int(query, "offset", -1)
+    if offset_recebido >= 0:
+        offset = max(0, offset_recebido)
+        page = (offset // page_size) + 1
+        return page, page_size, offset
+
+    page = max(1, _query_param_int(query, "page", 1))
+    offset = (page - 1) * page_size
+    return page, page_size, offset
+
+
+def _query_param_int(query: dict[str, list[str]], nome: str, padrao: int) -> int:
+    try:
+        return int(query.get(nome, [str(padrao)])[0])
+    except (TypeError, ValueError):
+        return padrao
+
+
+def _total_pages(total: int | None, page_size: int) -> int | None:
+    if total is None:
+        return None
+    if total <= 0:
+        return 0
+    return (total + page_size - 1) // page_size
 
 
 def _cors_origin(origin: str) -> str:

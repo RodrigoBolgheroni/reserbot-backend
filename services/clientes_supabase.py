@@ -44,6 +44,11 @@ class ResultadoSupabase(TypedDict, total=False):
     detalhe: str
 
 
+class ResultadoListaClientes(TypedDict):
+    clientes: list[dict[str, Any]]
+    total: int | None
+
+
 def salvar_clientes(
     registros: Sequence[Mapping[str, Any]],
     *,
@@ -152,22 +157,29 @@ def listar_clientes(
     *,
     tabela: str | None = None,
     limite: int = 500,
-) -> list[dict[str, Any]]:
+    offset: int = 0,
+    contar: bool = False,
+) -> ResultadoListaClientes:
     tabela_final = tabela or supabase.tabela_env("SUPABASE_CLIENTES_TABLE", DEFAULT_TABLE)
     resultado = supabase.selecionar(
         tabela_final,
         colunas="*",
-        limite=max(1, min(limite, 2000)),
+        limite=max(1, limite),
+        offset=max(0, offset),
+        contar=contar,
     )
     if not resultado.get("ok"):
         logger.warning("Nao foi possivel listar clientes: %s", resultado.get("erro"))
-        return []
+        return {"clientes": [], "total": None}
 
     dados = resultado.get("data")
     if not isinstance(dados, list):
-        return []
+        return {"clientes": [], "total": _total_resultado(resultado)}
     clientes = [item for item in dados if isinstance(item, dict)]
-    return sorted(clientes, key=lambda item: str(item.get("nome") or "").lower())
+    return {
+        "clientes": sorted(clientes, key=lambda item: str(item.get("nome") or "").lower()),
+        "total": _total_resultado(resultado),
+    }
 
 
 def _preparar_registro(
@@ -393,3 +405,10 @@ def _contar_registros_resposta(dados: Any, padrao: int) -> int:
     if isinstance(dados, list):
         return len(dados)
     return padrao
+
+
+def _total_resultado(resultado: Mapping[str, Any]) -> int | None:
+    total = resultado.get("total")
+    if isinstance(total, int):
+        return total
+    return None

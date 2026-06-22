@@ -28,6 +28,8 @@ class SupabaseResultado(TypedDict, total=False):
     status: int
     tabela: str
     data: Any
+    total: int
+    content_range: str
     erro: str
     detalhe: str
 
@@ -64,13 +66,18 @@ def selecionar(
     filtros: Mapping[str, str] | None = None,
     colunas: str = "*",
     limite: int | None = None,
+    offset: int | None = None,
+    contar: bool = False,
 ) -> SupabaseResultado:
     parametros: dict[str, str] = {"select": colunas}
     for campo, valor in (filtros or {}).items():
         parametros[campo] = valor
     if limite is not None:
         parametros["limit"] = str(limite)
-    return requisitar("GET", tabela, query=f"?{urlencode(parametros)}")
+    if offset is not None:
+        parametros["offset"] = str(offset)
+    prefer = "count=exact" if contar else None
+    return requisitar("GET", tabela, query=f"?{urlencode(parametros)}", prefer=prefer)
 
 
 def atualizar(
@@ -129,12 +136,19 @@ def requisitar(
     try:
         with urlopen(request, timeout=TIMEOUT_SEGUNDOS) as response:
             corpo = response.read().decode("utf-8")
-            return {
+            resultado: SupabaseResultado = {
                 "ok": True,
                 "status": getattr(response, "status", 200),
                 "tabela": tabela,
                 "data": _parse_json(corpo),
             }
+            content_range = response.headers.get("Content-Range", "")
+            if content_range:
+                resultado["content_range"] = content_range
+                total = _parse_total_content_range(content_range)
+                if total is not None:
+                    resultado["total"] = total
+            return resultado
     except HTTPError as erro:
         detalhe = _ler_erro_http(erro)
         logger.warning("Supabase HTTP %s em %s: %s", erro.code, tabela, detalhe)
@@ -206,6 +220,18 @@ def _parse_json(corpo: str) -> Any:
         return json.loads(corpo)
     except json.JSONDecodeError:
         return corpo
+
+
+def _parse_total_content_range(valor: str) -> int | None:
+    if "/" not in valor:
+        return None
+    total = valor.rsplit("/", 1)[-1].strip()
+    if not total or total == "*":
+        return None
+    try:
+        return int(total)
+    except ValueError:
+        return None
 
 
 def _ler_erro_http(erro: HTTPError) -> str:

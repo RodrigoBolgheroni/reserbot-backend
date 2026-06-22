@@ -191,6 +191,24 @@ class ClientesSupabaseTest(unittest.TestCase):
         self.assertEqual(resultado["erro"], "Nao foi possivel salvar os clientes importados.")
         self.assertEqual(resultado["detalhe"], "All object keys must match")
 
+    def test_listar_clientes_usa_limit_offset_e_contagem(self) -> None:
+        with patch.object(
+            clientes_supabase.supabase,
+            "selecionar",
+            return_value={"ok": True, "data": [{"nome": "Cliente 2"}, {"nome": "Cliente 1"}], "total": 1234},
+        ) as selecionar:
+            resultado = clientes_supabase.listar_clientes(tabela="clientes", limite=100, offset=100, contar=True)
+
+        selecionar.assert_called_once_with(
+            "clientes",
+            colunas="*",
+            limite=100,
+            offset=100,
+            contar=True,
+        )
+        self.assertEqual(resultado["total"], 1234)
+        self.assertEqual([cliente["nome"] for cliente in resultado["clientes"]], ["Cliente 1", "Cliente 2"])
+
 
 if __name__ == "__main__":
     unittest.main()
