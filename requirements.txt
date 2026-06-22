@@ -1,0 +1,12 @@
+# ReservaBot - Fase 1
+selenium==4.44.0
+webdriver-manager==4.1.2
+pyperclip==1.11.0
+groq==1.4.0
+APScheduler==3.11.2
+pandas==3.0.3
+openpyxl==3.1.5
+pypdf==6.13.3
+python-dotenv==1.2.2
+certifi==2026.5.20
+truststore==0.10.4
