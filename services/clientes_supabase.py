@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Mapping, Sequence
 from typing import Any, Final, TypedDict
 
@@ -9,6 +10,28 @@ from services import mensagens, perfis, supabase
 logger = logging.getLogger(__name__)
 
 DEFAULT_TABLE: Final[str] = "clientes"
+DEFAULT_BATCH_SIZE: Final[int] = 100
+CAMPOS_CLIENTES: Final[tuple[str, ...]] = (
+    "nome",
+    "telefone",
+    "telefone_raw",
+    "telefones",
+    "data_nascimento",
+    "data_nascimento_raw",
+    "aniversario_ddmm",
+    "idade",
+    "info_topo_pdf",
+    "periodo_aniversario",
+    "tipo",
+    "regiao",
+    "numero",
+    "origem",
+    "pagina",
+    "linha",
+    "perfil_id",
+    "perfil_nome",
+    "metadata",
+)
 
 
 class ResultadoSupabase(TypedDict, total=False):
@@ -32,6 +55,12 @@ def salvar_clientes(
         for registro in registros
         if registro.get("importavel", True)
     ]
+    payload = [registro for registro in payload if registro.get("nome") and registro.get("telefone")]
+    logger.info(
+        "Confirmacao de importacao: %s cliente(s) recebidos, %s importavel(is) para Supabase.",
+        len(registros),
+        len(payload),
+    )
     if not payload:
         return {
             "ok": True,
@@ -40,23 +69,45 @@ def salvar_clientes(
             "salvos": 0,
         }
 
-    resultado = supabase.upsert(tabela_final, payload, on_conflict="telefone")
-    if not resultado.get("ok"):
-        return {
-            "ok": False,
-            "tabela": tabela_final,
-            "enviados": len(payload),
-            "salvos": 0,
-            "erro": resultado.get("erro", "Falha ao salvar clientes no Supabase"),
-            "detalhe": resultado.get("detalhe", ""),
-        }
+    logger.info("Campos enviados para Supabase.%s: %s", tabela_final, ", ".join(CAMPOS_CLIENTES))
+    salvos = 0
+    batch_size = _batch_size()
+    for indice, lote in enumerate(_chunks(payload, batch_size), start=1):
+        resultado = supabase.upsert(tabela_final, lote, on_conflict="telefone")
+        if not resultado.get("ok"):
+            detalhe = resultado.get("detalhe", "")
+            logger.warning(
+                "Falha ao salvar lote %s de clientes no Supabase. enviados=%s salvos_antes=%s erro=%s detalhe=%s",
+                indice,
+                len(lote),
+                salvos,
+                resultado.get("erro", ""),
+                detalhe,
+            )
+            return {
+                "ok": False,
+                "tabela": tabela_final,
+                "enviados": len(payload),
+                "salvos": salvos,
+                "erro": "Nao foi possivel salvar os clientes importados.",
+                "detalhe": detalhe or resultado.get("erro", "Falha ao salvar clientes no Supabase"),
+            }
 
-    logger.info("%s cliente(s) enviados ao Supabase.", len(payload))
+        salvos += _contar_registros_resposta(resultado.get("data"), len(lote))
+        logger.info(
+            "Lote %s salvo no Supabase.%s: %s cliente(s). Total salvo ate agora: %s.",
+            indice,
+            tabela_final,
+            len(lote),
+            salvos,
+        )
+
+    logger.info("%s cliente(s) enviados ao Supabase; %s salvo(s).", len(payload), salvos)
     return {
         "ok": True,
         "tabela": tabela_final,
         "enviados": len(payload),
-        "salvos": _contar_registros_resposta(resultado.get("data"), len(payload)),
+        "salvos": salvos,
     }
 
 
@@ -115,15 +166,17 @@ def _preparar_registro(
     metadata.setdefault("info_topo_pdf", registro.get("info_topo_pdf") or registro.get("periodo_aniversario"))
     idade = mensagens.calcular_idade(registro.get("data_nascimento"), registro.get("idade"))
     perfil = perfis.classificar_cliente(registro, perfis_disponiveis=perfis_ativos or [])
+    perfil_score = None
     if perfil:
+        perfil_metadata = perfil.get("metadata")
+        if isinstance(perfil_metadata, dict):
+            perfil_score = perfil_metadata.get("score_classificacao")
         metadata.setdefault(
             "perfil_classificacao",
             {
                 "perfil_id": perfil.get("id", ""),
                 "perfil_nome": perfil.get("nome", ""),
-                "score": (perfil.get("metadata") or {}).get("score_classificacao")
-                if isinstance(perfil.get("metadata"), dict)
-                else None,
+                "score": perfil_score,
             },
         )
 
@@ -149,13 +202,61 @@ def _preparar_registro(
         "metadata": metadata,
     }
 
-    return {chave: valor for chave, valor in payload.items() if valor not in ("", [], None)}
+    return _normalizar_campos_cliente(payload)
+
+
+def _normalizar_campos_cliente(cliente: Mapping[str, Any]) -> dict[str, Any]:
+    normalizado = {campo: cliente.get(campo) for campo in CAMPOS_CLIENTES}
+    normalizado["nome"] = _texto(normalizado.get("nome"))
+    normalizado["telefone"] = _texto(normalizado.get("telefone"))
+    normalizado["telefone_raw"] = _texto(normalizado.get("telefone_raw")) or None
+    normalizado["telefones"] = _lista_json(normalizado.get("telefones"))
+    normalizado["data_nascimento"] = normalizado.get("data_nascimento") or None
+    normalizado["data_nascimento_raw"] = _texto(normalizado.get("data_nascimento_raw")) or None
+    normalizado["aniversario_ddmm"] = _texto(normalizado.get("aniversario_ddmm")) or None
+    normalizado["idade"] = normalizado.get("idade")
+    normalizado["info_topo_pdf"] = _texto(normalizado.get("info_topo_pdf")) or None
+    normalizado["periodo_aniversario"] = _texto(normalizado.get("periodo_aniversario")) or None
+    normalizado["tipo"] = _texto(normalizado.get("tipo")) or None
+    normalizado["regiao"] = _texto(normalizado.get("regiao")) or None
+    normalizado["numero"] = normalizado.get("numero")
+    normalizado["origem"] = _texto(normalizado.get("origem")) or "pdf"
+    normalizado["pagina"] = normalizado.get("pagina")
+    normalizado["linha"] = normalizado.get("linha")
+    normalizado["perfil_id"] = normalizado.get("perfil_id") or None
+    normalizado["perfil_nome"] = _texto(normalizado.get("perfil_nome")) or None
+    normalizado["metadata"] = _dict_json(normalizado.get("metadata"))
+    return normalizado
 
 
 def _texto(valor: Any) -> str:
     if valor is None:
         return ""
     return str(valor).strip()
+
+
+def _lista_json(valor: Any) -> list[Any]:
+    if isinstance(valor, list):
+        return valor
+    if isinstance(valor, tuple):
+        return list(valor)
+    return []
+
+
+def _dict_json(valor: Any) -> dict[str, Any]:
+    return dict(valor) if isinstance(valor, Mapping) else {}
+
+
+def _chunks(registros: Sequence[dict[str, Any]], tamanho: int) -> list[list[dict[str, Any]]]:
+    return [list(registros[indice : indice + tamanho]) for indice in range(0, len(registros), tamanho)]
+
+
+def _batch_size() -> int:
+    try:
+        valor = int(os.getenv("SUPABASE_CLIENTES_BATCH_SIZE", str(DEFAULT_BATCH_SIZE)))
+    except ValueError:
+        return DEFAULT_BATCH_SIZE
+    return max(1, min(valor, 500))
 
 
 def _contar_registros_resposta(dados: Any, padrao: int) -> int:

@@ -164,13 +164,25 @@ class ConfigHandler(BaseHTTPRequestHandler):
             return
 
         registros = pdf_clientes.registros_importaveis(resultado)
+        logger.info(
+            "Confirmando importacao PDF import_id=%s com %s cliente(s) importavel(is).",
+            import_id,
+            len(registros),
+        )
         resultado_supabase = clientes_supabase.salvar_clientes(registros)
         if not resultado_supabase.get("ok"):
+            logger.warning(
+                "Falha na confirmacao da importacao PDF import_id=%s: %s %s",
+                import_id,
+                resultado_supabase.get("erro", ""),
+                resultado_supabase.get("detalhe", ""),
+            )
             self._responder_json(
                 {
                     "ok": False,
-                    "erro": resultado_supabase.get("erro", "Falha ao salvar no Supabase"),
-                    "detalhe": resultado_supabase.get("detalhe", ""),
+                    "erro": "Nao foi possivel salvar os clientes importados.",
+                    "detalhes": resultado_supabase.get("detalhe") or resultado_supabase.get("erro", ""),
+                    "supabase": resultado_supabase,
                     "resumo": pdf_clientes.resumir_extracao(resultado),
                 },
                 status=HTTPStatus.BAD_GATEWAY,
