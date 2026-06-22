@@ -45,6 +45,9 @@ class ConfigHandler(BaseHTTPRequestHandler):
         if rota == "/api/config":
             self._responder_json(_ler_env())
             return
+        if rota == "/api/clientes/aniversarios-proximos":
+            self._listar_aniversarios_proximos()
+            return
         if rota == "/api/clientes":
             self._listar_clientes()
             return
@@ -220,6 +223,19 @@ class ConfigHandler(BaseHTTPRequestHandler):
                 "total_pages": total_pages if total_pages is not None else None,
                 "has_next": has_next,
                 "has_prev": page > 1,
+            }
+        )
+
+    def _listar_aniversarios_proximos(self) -> None:
+        dias = max(1, min(_query_int(self.path, "dias", 15), 60))
+        limite = max(1, min(_query_int(self.path, "limit", 50), 100))
+        resultado = clientes_supabase.listar_aniversarios_proximos(dias=dias, limite_clientes=limite)
+        self._responder_json(
+            {
+                "ok": True,
+                "dias": resultado["dias"],
+                "total": resultado["total"],
+                "clientes": resultado["clientes"],
             }
         )
 

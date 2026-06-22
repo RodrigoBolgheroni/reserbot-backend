@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from collections.abc import Mapping, Sequence
+from datetime import date, datetime
 from typing import Any, Final, TypedDict
 
 from services import mensagens, perfis, supabase
@@ -47,6 +49,13 @@ class ResultadoSupabase(TypedDict, total=False):
 class ResultadoListaClientes(TypedDict):
     clientes: list[dict[str, Any]]
     total: int | None
+
+
+class ResultadoAniversariosProximos(TypedDict):
+    dias: int
+    total: int
+    clientes: list[dict[str, Any]]
+    analisados: int
 
 
 def salvar_clientes(
@@ -182,6 +191,72 @@ def listar_clientes(
     }
 
 
+def listar_aniversarios_proximos(
+    *,
+    dias: int = 15,
+    limite_clientes: int = 50,
+    hoje: date | None = None,
+    tabela: str | None = None,
+) -> ResultadoAniversariosProximos:
+    dias_final = max(1, min(int(dias or 15), 60))
+    limite_final = max(1, min(int(limite_clientes or 50), 100))
+    hoje_final = hoje or date.today()
+    tabela_final = tabela or supabase.tabela_env("SUPABASE_CLIENTES_TABLE", DEFAULT_TABLE)
+    page_size = 500
+    offset = 0
+    total_base: int | None = None
+    analisados = 0
+    encontrados: list[dict[str, Any]] = []
+
+    while True:
+        resultado = supabase.selecionar(
+            tabela_final,
+            colunas="id,nome,telefone,data_nascimento,aniversario_ddmm,perfil_nome",
+            limite=page_size,
+            offset=offset,
+            contar=offset == 0,
+        )
+        if not resultado.get("ok"):
+            logger.warning("Nao foi possivel listar aniversarios proximos: %s", resultado.get("erro"))
+            break
+
+        if offset == 0:
+            total_base = _total_resultado(resultado)
+
+        dados = resultado.get("data")
+        if not isinstance(dados, list) or not dados:
+            break
+
+        for cliente in dados:
+            if not isinstance(cliente, dict):
+                continue
+            analisados += 1
+            dias_ate = _dias_ate_aniversario(cliente, hoje_final)
+            if dias_ate is None or dias_ate > dias_final:
+                continue
+            encontrados.append(_resumir_aniversariante(cliente, dias_ate, hoje_final))
+
+        offset += len(dados)
+        if total_base is not None and offset >= total_base:
+            break
+        if len(dados) < page_size:
+            break
+
+    encontrados.sort(key=lambda item: (int(item.get("dias_ate_aniversario") or 0), str(item.get("nome") or "").lower()))
+    logger.info(
+        "Aniversarios proximos calculados: dias=%s clientes_analisados=%s aniversariantes=%s.",
+        dias_final,
+        analisados,
+        len(encontrados),
+    )
+    return {
+        "dias": dias_final,
+        "total": len(encontrados),
+        "clientes": encontrados[:limite_final],
+        "analisados": analisados,
+    }
+
+
 def _preparar_registro(
     registro: Mapping[str, Any],
     *,
@@ -262,6 +337,70 @@ def _texto(valor: Any) -> str:
     if valor is None:
         return ""
     return str(valor).strip()
+
+
+def _dias_ate_aniversario(cliente: Mapping[str, Any], hoje: date) -> int | None:
+    dia_mes = _dia_mes_aniversario(cliente)
+    if dia_mes is None:
+        return None
+
+    dia, mes = dia_mes
+    aniversario = _data_aniversario_no_ano(dia, mes, hoje.year)
+    if aniversario is None:
+        return None
+    if aniversario < hoje:
+        aniversario = _data_aniversario_no_ano(dia, mes, hoje.year + 1)
+    if aniversario is None:
+        return None
+    return (aniversario - hoje).days
+
+
+def _dia_mes_aniversario(cliente: Mapping[str, Any]) -> tuple[int, int] | None:
+    data_nascimento = _texto(cliente.get("data_nascimento"))
+    if data_nascimento:
+        try:
+            data = datetime.strptime(data_nascimento[:10], "%Y-%m-%d").date()
+            return data.day, data.month
+        except ValueError:
+            pass
+
+    ddmm = _texto(cliente.get("aniversario_ddmm"))
+    match = re.match(r"^\s*(\d{1,2})[/-](\d{1,2})\s*$", ddmm)
+    if not match:
+        return None
+    dia = int(match.group(1))
+    mes = int(match.group(2))
+    if not (1 <= dia <= 31 and 1 <= mes <= 12):
+        return None
+    return dia, mes
+
+
+def _data_aniversario_no_ano(dia: int, mes: int, ano: int) -> date | None:
+    try:
+        return date(ano, mes, dia)
+    except ValueError:
+        return None
+
+
+def _resumir_aniversariante(cliente: Mapping[str, Any], dias_ate: int, hoje: date) -> dict[str, Any]:
+    dia_mes = _dia_mes_aniversario(cliente)
+    aniversario = ""
+    if dia_mes is not None:
+        dia, mes = dia_mes
+        data = _data_aniversario_no_ano(dia, mes, hoje.year)
+        if data is not None and data < hoje:
+            data = _data_aniversario_no_ano(dia, mes, hoje.year + 1)
+        aniversario = f"{mes:02d}-{dia:02d}"
+
+    return {
+        "id": cliente.get("id"),
+        "nome": _texto(cliente.get("nome")),
+        "telefone": _texto(cliente.get("telefone")),
+        "aniversario": aniversario,
+        "data_nascimento": cliente.get("data_nascimento"),
+        "dias_ate_aniversario": dias_ate,
+        "perfil": _texto(cliente.get("perfil_nome")) or None,
+    }
 
 
 def _lista_json(valor: Any) -> list[Any]:

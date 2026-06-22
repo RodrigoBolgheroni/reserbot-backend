@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from datetime import date
 from unittest.mock import patch
 
 from services import clientes_supabase
@@ -208,6 +209,34 @@ class ClientesSupabaseTest(unittest.TestCase):
         )
         self.assertEqual(resultado["total"], 1234)
         self.assertEqual([cliente["nome"] for cliente in resultado["clientes"]], ["Cliente 1", "Cliente 2"])
+
+    def test_listar_aniversarios_proximos_calcula_mesmo_mes_e_ignora_invalidos(self) -> None:
+        dados = [
+            {"id": "1", "nome": "Ana", "telefone": "1", "data_nascimento": "1990-06-25", "perfil_nome": "VIP"},
+            {"id": "2", "nome": "Bruno", "telefone": "2", "aniversario_ddmm": "30/06"},
+            {"id": "3", "nome": "Invalido", "telefone": "3", "data_nascimento": "data ruim", "aniversario_ddmm": "99/99"},
+            {"id": "4", "nome": "Fora", "telefone": "4", "data_nascimento": "1990-07-30"},
+        ]
+        with patch.object(clientes_supabase.supabase, "selecionar", return_value={"ok": True, "data": dados, "total": len(dados)}):
+            resultado = clientes_supabase.listar_aniversarios_proximos(dias=15, hoje=date(2026, 6, 22), tabela="clientes")
+
+        self.assertEqual(resultado["total"], 2)
+        self.assertEqual([cliente["nome"] for cliente in resultado["clientes"]], ["Ana", "Bruno"])
+        self.assertEqual(resultado["clientes"][0]["dias_ate_aniversario"], 3)
+        self.assertEqual(resultado["clientes"][0]["aniversario"], "06-25")
+
+    def test_listar_aniversarios_proximos_funciona_na_virada_do_ano(self) -> None:
+        dados = [
+            {"id": "1", "nome": "Janeiro", "telefone": "1", "data_nascimento": "1990-01-05"},
+            {"id": "2", "nome": "Dezembro", "telefone": "2", "aniversario_ddmm": "30/12"},
+            {"id": "3", "nome": "Fora", "telefone": "3", "aniversario_ddmm": "20/01"},
+        ]
+        with patch.object(clientes_supabase.supabase, "selecionar", return_value={"ok": True, "data": dados, "total": len(dados)}):
+            resultado = clientes_supabase.listar_aniversarios_proximos(dias=15, hoje=date(2026, 12, 28), tabela="clientes")
+
+        self.assertEqual(resultado["total"], 2)
+        self.assertEqual([cliente["nome"] for cliente in resultado["clientes"]], ["Dezembro", "Janeiro"])
+        self.assertEqual([cliente["dias_ate_aniversario"] for cliente in resultado["clientes"]], [2, 8])
 
 
 if __name__ == "__main__":

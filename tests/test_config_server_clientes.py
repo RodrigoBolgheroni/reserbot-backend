@@ -58,6 +58,27 @@ class ConfigServerClientesTest(unittest.TestCase):
         self.assertTrue(respostas[0]["has_next"])
         self.assertTrue(respostas[0]["has_prev"])
 
+    def test_listar_aniversarios_proximos_responde_dados_globais(self) -> None:
+        handler = object.__new__(config_server.ConfigHandler)
+        handler.path = "/api/clientes/aniversarios-proximos?dias=15"
+        respostas: list[dict[str, object]] = []
+
+        with (
+            patch.object(
+                config_server.clientes_supabase,
+                "listar_aniversarios_proximos",
+                return_value={"dias": 15, "total": 42, "clientes": [{"nome": "Maria"}], "analisados": 1234},
+            ) as listar,
+            patch.object(config_server.ConfigHandler, "_responder_json", lambda _self, payload, status=None: respostas.append(payload)),
+        ):
+            config_server.ConfigHandler._listar_aniversarios_proximos(handler)
+
+        listar.assert_called_once_with(dias=15, limite_clientes=50)
+        self.assertEqual(respostas[0]["ok"], True)
+        self.assertEqual(respostas[0]["dias"], 15)
+        self.assertEqual(respostas[0]["total"], 42)
+        self.assertEqual(respostas[0]["clientes"], [{"nome": "Maria"}])
+
 
 if __name__ == "__main__":
     unittest.main()
