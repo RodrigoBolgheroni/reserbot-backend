@@ -87,22 +87,42 @@ class ConfigServerClientesTest(unittest.TestCase):
             patch.object(
                 config_server.ConfigHandler,
                 "_ler_json_body",
-                return_value={"dias": 15, "telefone": "5511999999999", "somente_teste": True},
+                return_value={"dias": 15, "telefone": "5511999999999", "modo_teste": True, "forcar_reenvio": True},
             ),
             patch.object(
                 config_server.disparador,
                 "executar_disparo_diario",
-                return_value=[{"nome": "Rodrigo Teste", "telefone": "5511999999999", "status": "enviado", "enviado": True}],
+                return_value=[{"nome": "Rodrigo Teste", "telefone": "5511999999999", "status": "reenviado_teste", "enviado": True, "reenviado_teste": True}],
             ) as executar,
             patch.object(config_server.ConfigHandler, "_responder_json", lambda _self, payload, status=None: respostas.append(payload)),
         ):
             config_server.ConfigHandler._disparar_aniversarios(handler)
 
-        executar.assert_called_once_with(dias=15, telefone="5511999999999", somente_teste=True)
+        executar.assert_called_once_with(
+            dias=15,
+            telefone="5511999999999",
+            somente_teste=True,
+            modo_teste=True,
+            forcar_reenvio=True,
+        )
         self.assertEqual(respostas[0]["ok"], True)
         self.assertEqual(respostas[0]["total_encontrados"], 1)
         self.assertEqual(respostas[0]["total_enviados"], 1)
         self.assertEqual(respostas[0]["falhas"], 0)
+        self.assertEqual(respostas[0]["reenviados_teste"], 1)
+
+    def test_disparar_aniversarios_nao_forca_reenvio_sem_telefone(self) -> None:
+        handler = object.__new__(config_server.ConfigHandler)
+        respostas: list[tuple[dict[str, object], object]] = []
+
+        with (
+            patch.object(config_server.ConfigHandler, "_ler_json_body", return_value={"forcar_reenvio": True}),
+            patch.object(config_server.ConfigHandler, "_responder_json", lambda _self, payload, status=None: respostas.append((payload, status))),
+        ):
+            config_server.ConfigHandler._disparar_aniversarios(handler)
+
+        self.assertEqual(respostas[0][0]["ok"], False)
+        self.assertEqual(respostas[0][1], config_server.HTTPStatus.BAD_REQUEST)
 
 
 if __name__ == "__main__":

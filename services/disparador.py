@@ -15,6 +15,7 @@ from services import supabase
 
 
 logger = logging.getLogger(__name__)
+DEFAULT_DISPAROS_TABLE = "disparos_mensagens"
 
 
 class ResultadoEnvio(TypedDict, total=False):
@@ -46,13 +47,19 @@ def executar_disparo_diario(
     dias: int | None = None,
     telefone: str = "",
     somente_teste: bool = False,
+    modo_teste: bool = False,
+    forcar_reenvio: bool = False,
 ) -> list[ResultadoEnvio]:
+    if forcar_reenvio and not normalizar_telefone(telefone):
+        raise ValueError("forcar_reenvio exige telefone especifico")
+
     if supabase.configurado():
         return _executar_disparo_supabase(
             data_referencia=data_referencia,
             dias=dias or 15,
             telefone=telefone,
-            somente_teste=somente_teste,
+            somente_teste=somente_teste or modo_teste or forcar_reenvio,
+            forcar_reenvio=forcar_reenvio,
         )
 
     logger.info("Disparo usando fonte: planilha local.")
@@ -161,10 +168,19 @@ def _executar_disparo_supabase(
     dias: int = 15,
     telefone: str = "",
     somente_teste: bool = False,
+    forcar_reenvio: bool = False,
 ) -> list[ResultadoEnvio]:
     data_ref = data_referencia or date.today()
     dias_final = max(1, min(int(dias or 15), 60))
     telefone_filtro = normalizar_telefone(telefone)
+    if forcar_reenvio and not telefone_filtro:
+        raise ValueError("forcar_reenvio exige telefone especifico")
+    logger.info(
+        "Disparo solicitado: telefone=%s modo_teste=%s forcar_reenvio=%s.",
+        telefone_filtro or "",
+        somente_teste,
+        forcar_reenvio,
+    )
     resultado_aniversarios = clientes_supabase.listar_aniversarios_proximos(
         dias=dias_final,
         limite_clientes=2000,
@@ -203,7 +219,11 @@ def _executar_disparo_supabase(
             continue
 
         try:
-            if not somente_teste and dados.ja_enviado(telefone_cliente, data_ref):
+            ja_enviado_hoje = _disparo_ja_registrado_supabase(telefone_cliente, data_ref)
+            if ja_enviado_hoje and forcar_reenvio:
+                logger.info("Ignorando bloqueio de envio diario para teste: telefone=%s.", telefone_cliente)
+            if ja_enviado_hoje and not forcar_reenvio:
+                logger.info("Ja enviado hoje: telefone=%s.", telefone_cliente)
                 resultados.append(
                     {
                         "telefone": telefone_cliente,
@@ -211,6 +231,7 @@ def _executar_disparo_supabase(
                         "status": "pulado",
                         "detalhe": "Contato ja recebeu mensagem hoje.",
                         "enviado": False,
+                        "pulado": True,
                     }
                 )
                 continue
@@ -227,6 +248,15 @@ def _executar_disparo_supabase(
                 envio.get("erro", ""),
             )
             if not envio.get("ok"):
+                _registrar_disparo_supabase(
+                    cliente=cliente,
+                    telefone=telefone_cliente,
+                    data_referencia=data_ref,
+                    mensagem=texto,
+                    status="falha",
+                    envio=envio,
+                    modo_teste=somente_teste or forcar_reenvio,
+                )
                 resultados.append(
                     {
                         "telefone": telefone_cliente,
@@ -238,8 +268,15 @@ def _executar_disparo_supabase(
                 )
                 continue
 
-            if not somente_teste:
-                dados.marcar_enviado(telefone_cliente, nome, data_ref)
+            _registrar_disparo_supabase(
+                cliente=cliente,
+                telefone=telefone_cliente,
+                data_referencia=data_ref,
+                mensagem=texto,
+                status="enviado",
+                envio=envio,
+                modo_teste=somente_teste or forcar_reenvio,
+            )
             conversa_banco = fluxo_reservas.iniciar_conversa(
                 {
                     **cliente,
@@ -263,9 +300,10 @@ def _executar_disparo_supabase(
                 {
                     "telefone": telefone_cliente,
                     "nome": nome,
-                    "status": "enviado",
-                    "detalhe": "Mensagem enviada e conversa ativada.",
+                    "status": "reenviado_teste" if forcar_reenvio else "enviado",
+                    "detalhe": "Mensagem reenviada em modo de teste." if forcar_reenvio else "Mensagem enviada e conversa ativada.",
                     "enviado": True,
+                    "reenviado_teste": bool(forcar_reenvio),
                     "provider_message_id": str(envio.get("provider_message_id") or ""),
                 }
             )
@@ -283,10 +321,78 @@ def _executar_disparo_supabase(
                 }
             )
 
-    enviados = sum(1 for item in resultados if item.get("status") == "enviado")
+    enviados = sum(1 for item in resultados if item.get("status") in {"enviado", "reenviado_teste"})
     falhas = sum(1 for item in resultados if item.get("status") == "erro")
     logger.info("Disparo finalizado: enviados=%s falhas=%s.", enviados, falhas)
     return resultados
+
+
+def _disparo_ja_registrado_supabase(
+    telefone: str,
+    data_referencia: date,
+    *,
+    tipo_disparo: str = "aniversario",
+) -> bool:
+    tabela = supabase.tabela_env("SUPABASE_DISPAROS_TABLE", DEFAULT_DISPAROS_TABLE)
+    resultado = supabase.selecionar(
+        tabela,
+        colunas="id,status",
+        filtros={
+            "telefone": f"eq.{telefone}",
+            "tipo_disparo": f"eq.{tipo_disparo}",
+            "data_referencia": f"eq.{data_referencia.isoformat()}",
+            "modo_teste": "eq.false",
+        },
+        limite=1,
+    )
+    if not resultado.get("ok"):
+        logger.warning("Nao foi possivel verificar controle de disparo no Supabase: %s", resultado.get("erro"))
+        return False
+    dados_resultado = resultado.get("data")
+    return isinstance(dados_resultado, list) and bool(dados_resultado)
+
+
+def _registrar_disparo_supabase(
+    *,
+    cliente: dict[str, Any],
+    telefone: str,
+    data_referencia: date,
+    mensagem: str,
+    status: str,
+    envio: dict[str, Any],
+    modo_teste: bool,
+    tipo_disparo: str = "aniversario",
+) -> None:
+    tabela = supabase.tabela_env("SUPABASE_DISPAROS_TABLE", DEFAULT_DISPAROS_TABLE)
+    payload = {
+        "cliente_id": cliente.get("id") or None,
+        "telefone": telefone,
+        "tipo_disparo": tipo_disparo,
+        "data_referencia": data_referencia.isoformat(),
+        "mensagem": mensagem,
+        "status": status,
+        "provider": envio.get("provider"),
+        "provider_message_id": envio.get("provider_message_id") or None,
+        "erro": envio.get("erro") or envio.get("detalhe") or None,
+        "modo_teste": bool(modo_teste),
+        "metadata": {
+            "cliente_nome": cliente.get("nome", ""),
+            "perfil_id": cliente.get("perfil_id"),
+            "perfil_nome": cliente.get("perfil_nome"),
+            "dias_ate_aniversario": cliente.get("dias_ate_aniversario"),
+        },
+    }
+    resultado = supabase.inserir(tabela, payload, retornar=False)
+    if resultado.get("ok"):
+        logger.info("Disparo registrado em %s para telefone=%s modo_teste=%s.", tabela, telefone, modo_teste)
+    else:
+        logger.warning(
+            "Nao foi possivel registrar disparo em %s para telefone=%s: %s %s",
+            tabela,
+            telefone,
+            resultado.get("erro", ""),
+            resultado.get("detalhe", ""),
+        )
 
 
 def monitorar_respostas(parar_evento: threading.Event | None = None) -> None:

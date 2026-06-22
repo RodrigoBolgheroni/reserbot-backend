@@ -82,6 +82,24 @@ create table if not exists public.reservas (
     updated_at timestamptz not null default now()
 );
 
+create table if not exists public.disparos_mensagens (
+    id uuid primary key default gen_random_uuid(),
+    cliente_id uuid references public.clientes(id) on delete set null,
+    telefone text not null,
+    tipo_disparo text not null default 'aniversario',
+    data_referencia date not null default current_date,
+    mensagem text,
+    status text not null default 'pendente'
+        check (status in ('pendente', 'enviado', 'falha', 'pulado')),
+    provider text,
+    provider_message_id text,
+    erro text,
+    modo_teste boolean not null default false,
+    metadata jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+);
+
 create index if not exists idx_clientes_telefone on public.clientes (telefone);
 create index if not exists idx_clientes_aniversario on public.clientes (aniversario_ddmm);
 create index if not exists idx_clientes_perfil on public.clientes (perfil_id);
@@ -94,6 +112,11 @@ create unique index if not exists idx_mensagens_provider_message_id_unico
 create index if not exists idx_reservas_cliente on public.reservas (cliente_id);
 create index if not exists idx_reservas_data on public.reservas (data_reserva);
 create index if not exists idx_perfis_clientes_ativo on public.perfis_clientes (ativo);
+create index if not exists idx_disparos_mensagens_telefone_data
+    on public.disparos_mensagens (telefone, tipo_disparo, data_referencia);
+create unique index if not exists ux_disparos_mensagens_dia
+    on public.disparos_mensagens (telefone, tipo_disparo, data_referencia)
+    where modo_teste = false;
 
 alter table public.clientes
     add column if not exists perfil_id uuid references public.perfis_clientes(id) on delete set null,
@@ -129,11 +152,17 @@ create trigger trg_reservas_updated_at
 before update on public.reservas
 for each row execute function public.set_updated_at();
 
+drop trigger if exists trg_disparos_mensagens_updated_at on public.disparos_mensagens;
+create trigger trg_disparos_mensagens_updated_at
+before update on public.disparos_mensagens
+for each row execute function public.set_updated_at();
+
 alter table public.clientes enable row level security;
 alter table public.perfis_clientes enable row level security;
 alter table public.conversas enable row level security;
 alter table public.mensagens enable row level security;
 alter table public.reservas enable row level security;
+alter table public.disparos_mensagens enable row level security;
 
 -- No public policies are created here. The backend flow should use
 -- SUPABASE_SERVICE_ROLE_KEY; anon access remains blocked by RLS by default.

@@ -298,19 +298,37 @@ class ConfigHandler(BaseHTTPRequestHandler):
             payload = self._ler_json_body()
             if not isinstance(payload, dict):
                 payload = {}
+            telefone = str(payload.get("telefone") or "")
+            modo_teste = bool(payload.get("modo_teste") or payload.get("somente_teste"))
+            forcar_reenvio = bool(payload.get("forcar_reenvio"))
+            if forcar_reenvio and not telefone.strip():
+                self._responder_json(
+                    {
+                        "ok": False,
+                        "erro": "Informe um telefone para reenviar teste.",
+                    },
+                    status=HTTPStatus.BAD_REQUEST,
+                )
+                return
             resultados = disparador.executar_disparo_diario(
                 dias=_int_payload(payload, "dias", 15),
-                telefone=str(payload.get("telefone") or ""),
-                somente_teste=bool(payload.get("somente_teste")),
+                telefone=telefone,
+                somente_teste=modo_teste,
+                modo_teste=modo_teste,
+                forcar_reenvio=forcar_reenvio,
             )
+        except ValueError as erro:
+            self._responder_json({"ok": False, "erro": str(erro)}, status=HTTPStatus.BAD_REQUEST)
+            return
         except Exception:
             logger.exception("Falha ao executar disparo de aniversariantes pela API.")
             self._responder_erro(HTTPStatus.INTERNAL_SERVER_ERROR, "Falha ao executar disparo")
             return
 
-        enviados = sum(1 for item in resultados if item.get("status") == "enviado")
+        enviados = sum(1 for item in resultados if item.get("status") in {"enviado", "reenviado_teste"})
         erros = sum(1 for item in resultados if item.get("status") == "erro")
         pulados = sum(1 for item in resultados if item.get("status") == "pulado")
+        reenviados_teste = sum(1 for item in resultados if item.get("status") == "reenviado_teste")
         mensagem = "" if resultados else "Nenhum aniversariante encontrado para envio."
         self._responder_json(
             {
@@ -318,6 +336,7 @@ class ConfigHandler(BaseHTTPRequestHandler):
                 "total_encontrados": len(resultados),
                 "total_enviados": enviados,
                 "falhas": erros,
+                "reenviados_teste": reenviados_teste,
                 "enviados": enviados,
                 "erros": erros,
                 "pulados": pulados,
