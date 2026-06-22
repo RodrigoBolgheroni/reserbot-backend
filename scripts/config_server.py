@@ -295,7 +295,14 @@ class ConfigHandler(BaseHTTPRequestHandler):
 
     def _disparar_aniversarios(self) -> None:
         try:
-            resultados = disparador.executar_disparo_diario()
+            payload = self._ler_json_body()
+            if not isinstance(payload, dict):
+                payload = {}
+            resultados = disparador.executar_disparo_diario(
+                dias=_int_payload(payload, "dias", 15),
+                telefone=str(payload.get("telefone") or ""),
+                somente_teste=bool(payload.get("somente_teste")),
+            )
         except Exception:
             logger.exception("Falha ao executar disparo de aniversariantes pela API.")
             self._responder_erro(HTTPStatus.INTERNAL_SERVER_ERROR, "Falha ao executar disparo")
@@ -304,12 +311,17 @@ class ConfigHandler(BaseHTTPRequestHandler):
         enviados = sum(1 for item in resultados if item.get("status") == "enviado")
         erros = sum(1 for item in resultados if item.get("status") == "erro")
         pulados = sum(1 for item in resultados if item.get("status") == "pulado")
+        mensagem = "" if resultados else "Nenhum aniversariante encontrado para envio."
         self._responder_json(
             {
                 "ok": True,
+                "total_encontrados": len(resultados),
+                "total_enviados": enviados,
+                "falhas": erros,
                 "enviados": enviados,
                 "erros": erros,
                 "pulados": pulados,
+                "mensagem": mensagem,
                 "resultados": resultados,
             }
         )
@@ -500,6 +512,13 @@ def _int_env(nome: str, padrao: int) -> int:
     try:
         return int(os.getenv(nome, str(padrao)))
     except ValueError:
+        return padrao
+
+
+def _int_payload(payload: dict[str, Any], nome: str, padrao: int) -> int:
+    try:
+        return int(payload.get(nome, padrao))
+    except (TypeError, ValueError):
         return padrao
 
 

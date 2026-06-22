@@ -199,7 +199,7 @@ def listar_aniversarios_proximos(
     tabela: str | None = None,
 ) -> ResultadoAniversariosProximos:
     dias_final = max(1, min(int(dias or 15), 60))
-    limite_final = max(1, min(int(limite_clientes or 50), 100))
+    limite_final = max(1, min(int(limite_clientes or 50), 2000))
     hoje_final = hoje or date.today()
     tabela_final = tabela or supabase.tabela_env("SUPABASE_CLIENTES_TABLE", DEFAULT_TABLE)
     page_size = 500
@@ -211,7 +211,7 @@ def listar_aniversarios_proximos(
     while True:
         resultado = supabase.selecionar(
             tabela_final,
-            colunas="id,nome,telefone,data_nascimento,aniversario_ddmm,perfil_nome",
+            colunas="id,nome,telefone,data_nascimento,aniversario_ddmm,perfil_id,perfil_nome",
             limite=page_size,
             offset=offset,
             contar=offset == 0,
@@ -397,8 +397,11 @@ def _resumir_aniversariante(cliente: Mapping[str, Any], dias_ate: int, hoje: dat
         "nome": _texto(cliente.get("nome")),
         "telefone": _texto(cliente.get("telefone")),
         "aniversario": aniversario,
+        "aniversario_ddmm": f"{dia_mes[0]:02d}/{dia_mes[1]:02d}" if dia_mes is not None else None,
         "data_nascimento": cliente.get("data_nascimento"),
         "dias_ate_aniversario": dias_ate,
+        "perfil_id": cliente.get("perfil_id"),
+        "perfil_nome": _texto(cliente.get("perfil_nome")) or None,
         "perfil": _texto(cliente.get("perfil_nome")) or None,
     }
 

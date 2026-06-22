@@ -7,19 +7,23 @@ import threading
 import time
 from datetime import date, datetime
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from services import agente, clientes_supabase, dados, fluxo_reservas, mensagens, perfis, planilha, whatsapp
+from services.comunicacao import normalizar_telefone
+from services import supabase
 
 
 logger = logging.getLogger(__name__)
 
 
-class ResultadoEnvio(TypedDict):
+class ResultadoEnvio(TypedDict, total=False):
     telefone: str
     nome: str
     status: str
     detalhe: str
+    enviado: bool
+    provider_message_id: str
 
 
 class ConversaAtiva(TypedDict, total=False):
@@ -39,7 +43,19 @@ _lock_conversas = threading.Lock()
 def executar_disparo_diario(
     caminho_planilha: str | Path = planilha.PLANILHA_PADRAO,
     data_referencia: date | None = None,
+    dias: int | None = None,
+    telefone: str = "",
+    somente_teste: bool = False,
 ) -> list[ResultadoEnvio]:
+    if supabase.configurado():
+        return _executar_disparo_supabase(
+            data_referencia=data_referencia,
+            dias=dias or 15,
+            telefone=telefone,
+            somente_teste=somente_teste,
+        )
+
+    logger.info("Disparo usando fonte: planilha local.")
     aniversariantes = planilha.obter_aniversariantes_do_dia(
         caminho_planilha=caminho_planilha,
         data_referencia=data_referencia,
@@ -136,6 +152,140 @@ def executar_disparo_diario(
             )
 
     logger.info("Disparo finalizado.")
+    return resultados
+
+
+def _executar_disparo_supabase(
+    *,
+    data_referencia: date | None = None,
+    dias: int = 15,
+    telefone: str = "",
+    somente_teste: bool = False,
+) -> list[ResultadoEnvio]:
+    data_ref = data_referencia or date.today()
+    dias_final = max(1, min(int(dias or 15), 60))
+    telefone_filtro = normalizar_telefone(telefone)
+    resultado_aniversarios = clientes_supabase.listar_aniversarios_proximos(
+        dias=dias_final,
+        limite_clientes=2000,
+        hoje=data_ref,
+    )
+    clientes = resultado_aniversarios["clientes"]
+    logger.info("Disparo usando fonte: supabase.")
+    logger.info("Clientes encontrados no Supabase: %s", resultado_aniversarios.get("analisados", 0))
+    logger.info("Aniversariantes no periodo: %s", resultado_aniversarios["total"])
+
+    if telefone_filtro:
+        clientes = [
+            cliente for cliente in clientes
+            if normalizar_telefone(str(cliente.get("telefone") or "")) == telefone_filtro
+        ]
+        logger.info("Disparo filtrado para telefone de teste: encontrados=%s.", len(clientes))
+
+    resultados: list[ResultadoEnvio] = []
+    if not clientes:
+        logger.info("Disparo finalizado: enviados=0 falhas=0.")
+        return resultados
+
+    for cliente in clientes:
+        telefone_cliente = normalizar_telefone(str(cliente.get("telefone") or ""))
+        nome = str(cliente.get("nome") or "Cliente").strip() or "Cliente"
+        if not telefone_cliente:
+            resultados.append(
+                {
+                    "telefone": str(cliente.get("telefone") or ""),
+                    "nome": nome,
+                    "status": "erro",
+                    "detalhe": "Telefone invalido.",
+                    "enviado": False,
+                }
+            )
+            continue
+
+        try:
+            if not somente_teste and dados.ja_enviado(telefone_cliente, data_ref):
+                resultados.append(
+                    {
+                        "telefone": telefone_cliente,
+                        "nome": nome,
+                        "status": "pulado",
+                        "detalhe": "Contato ja recebeu mensagem hoje.",
+                        "enviado": False,
+                    }
+                )
+                continue
+
+            mensagem_personalizada = mensagens.gerar_mensagem_aniversario(cliente)
+            texto = mensagem_personalizada["texto"]
+            logger.info("Enviando mensagem de aniversario para %s.", telefone_cliente)
+            envio = whatsapp.enviar_com_resultado(telefone_cliente, texto)
+            logger.info(
+                "Resposta WhatsApp para %s: ok=%s provider=%s erro=%s",
+                telefone_cliente,
+                envio.get("ok"),
+                envio.get("provider"),
+                envio.get("erro", ""),
+            )
+            if not envio.get("ok"):
+                resultados.append(
+                    {
+                        "telefone": telefone_cliente,
+                        "nome": nome,
+                        "status": "erro",
+                        "detalhe": str(envio.get("erro") or "Falha no envio pelo WhatsApp."),
+                        "enviado": False,
+                    }
+                )
+                continue
+
+            if not somente_teste:
+                dados.marcar_enviado(telefone_cliente, nome, data_ref)
+            conversa_banco = fluxo_reservas.iniciar_conversa(
+                {
+                    **cliente,
+                    "telefone": telefone_cliente,
+                    "nome": nome,
+                    "perfil_mensagem": mensagem_personalizada.get("perfil", ""),
+                    "idade": mensagem_personalizada.get("idade"),
+                },
+                origem="aniversario",
+                mensagem_inicial=texto,
+            )
+            adicionar_conversa_ativa(
+                telefone=telefone_cliente,
+                nome=nome,
+                ultima_mensagem_cliente="__INIT__",
+                conversa_id=str(conversa_banco.get("id", "")),
+                perfil_id=mensagem_personalizada.get("perfil_id", "") or str(cliente.get("perfil_id") or ""),
+                perfil_nome=mensagem_personalizada.get("perfil_nome", "") or str(cliente.get("perfil_nome") or ""),
+            )
+            resultados.append(
+                {
+                    "telefone": telefone_cliente,
+                    "nome": nome,
+                    "status": "enviado",
+                    "detalhe": "Mensagem enviada e conversa ativada.",
+                    "enviado": True,
+                    "provider_message_id": str(envio.get("provider_message_id") or ""),
+                }
+            )
+            if not somente_teste:
+                _aguardar_intervalo_envio()
+        except Exception:
+            logger.exception("Erro ao processar contato %s.", telefone_cliente)
+            resultados.append(
+                {
+                    "telefone": telefone_cliente,
+                    "nome": nome,
+                    "status": "erro",
+                    "detalhe": "Erro inesperado no disparador.",
+                    "enviado": False,
+                }
+            )
+
+    enviados = sum(1 for item in resultados if item.get("status") == "enviado")
+    falhas = sum(1 for item in resultados if item.get("status") == "erro")
+    logger.info("Disparo finalizado: enviados=%s falhas=%s.", enviados, falhas)
     return resultados
 
 
