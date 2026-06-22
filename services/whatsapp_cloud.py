@@ -120,6 +120,20 @@ def extrair_mensagens_webhook(payload: dict[str, Any]) -> list[MensagemRecebida]
     return mensagens
 
 
+def extrair_status_webhook(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    statuses: list[dict[str, Any]] = []
+    for entry in _lista(payload.get("entry")):
+        for change in _lista(entry.get("changes")):
+            value = change.get("value") if isinstance(change, dict) else {}
+            if not isinstance(value, dict):
+                continue
+            for item in _lista(value.get("statuses")):
+                status = _parse_status(item)
+                if status is not None:
+                    statuses.append(status)
+    return statuses
+
+
 def verificar_token_webhook(token_recebido: str) -> bool:
     esperado = _verify_token()
     return bool(esperado and token_recebido == esperado)
@@ -145,6 +159,36 @@ def _parse_mensagem(item: Any, contatos: dict[str, str]) -> MensagemRecebida | N
         "remetente": contatos.get(telefone, telefone),
         "timestamp": timestamp,
         "provider_message_id": str(item.get("id") or ""),
+        "raw": item,
+    }
+
+
+def _parse_status(item: Any) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    message_id = str(item.get("id") or "").strip()
+    status = str(item.get("status") or "").strip().lower()
+    if not message_id or not status:
+        return None
+    erros: list[dict[str, Any]] = []
+    for erro in _lista(item.get("errors")):
+        if not isinstance(erro, dict):
+            continue
+        error_data = erro.get("error_data")
+        erros.append(
+            {
+                "code": erro.get("code"),
+                "title": erro.get("title"),
+                "message": erro.get("message"),
+                "details": error_data.get("details") if isinstance(error_data, dict) else None,
+            }
+        )
+    return {
+        "message_id": message_id,
+        "status": status,
+        "timestamp": _timestamp(item.get("timestamp")),
+        "recipient_id": normalizar_telefone(str(item.get("recipient_id") or "")),
+        "errors": erros,
         "raw": item,
     }
 

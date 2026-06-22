@@ -90,7 +90,7 @@ create table if not exists public.disparos_mensagens (
     data_referencia date not null default current_date,
     mensagem text,
     status text not null default 'pendente'
-        check (status in ('pendente', 'enviado', 'falha', 'pulado')),
+        check (status in ('pendente', 'enviado', 'entregue', 'lido', 'falha', 'pulado')),
     provider text,
     provider_message_id text,
     erro text,

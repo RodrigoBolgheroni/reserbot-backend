@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 TABELA_CONVERSAS_PADRAO = "conversas"
 TABELA_MENSAGENS_PADRAO = "mensagens"
 TABELA_RESERVAS_PADRAO = "reservas"
+TABELA_DISPAROS_PADRAO = "disparos_mensagens"
 
 
 class ResultadoWebhook(TypedDict, total=False):
@@ -215,6 +216,47 @@ def processar_mensagem_webhook(mensagem: MensagemRecebida) -> ResultadoWebhook:
     }
 
 
+def processar_status_whatsapp(status: Mapping[str, Any]) -> dict[str, Any]:
+    message_id = str(status.get("message_id") or "").strip()
+    status_meta = str(status.get("status") or "").strip().lower()
+    timestamp = str(status.get("timestamp") or "")
+    recipient_id = str(status.get("recipient_id") or "")
+    erros = status.get("errors") if isinstance(status.get("errors"), list) else []
+    erro_texto = _erro_status_texto(erros)
+    logger.info(
+        "Status WhatsApp recebido: wamid=%s status=%s timestamp=%s recipient_id=%s erro=%s",
+        message_id,
+        status_meta,
+        timestamp,
+        recipient_id,
+        erro_texto,
+    )
+    if not message_id:
+        return {"ok": False, "status": status_meta, "erro": "message_id ausente"}
+
+    status_interno = _status_whatsapp_interno(status_meta)
+    atualizacoes = 0
+    metadata_status = {
+        "whatsapp_status": status_meta,
+        "whatsapp_status_timestamp": timestamp,
+        "whatsapp_recipient_id": recipient_id,
+        "whatsapp_errors": erros,
+    }
+
+    if _atualizar_disparo_status(message_id, status_interno, erro_texto, metadata_status):
+        atualizacoes += 1
+    if _atualizar_mensagem_status(message_id, status_interno, erro_texto, metadata_status):
+        atualizacoes += 1
+
+    return {
+        "ok": True,
+        "message_id": message_id,
+        "status": status_meta,
+        "status_interno": status_interno,
+        "atualizacoes": atualizacoes,
+    }
+
+
 def registrar_reserva_confirmada(
     *,
     cliente: Mapping[str, Any],
@@ -356,6 +398,10 @@ def _tabela_reservas() -> str:
     return supabase.tabela_env("SUPABASE_RESERVAS_TABLE", TABELA_RESERVAS_PADRAO)
 
 
+def _tabela_disparos() -> str:
+    return supabase.tabela_env("SUPABASE_DISPAROS_TABLE", TABELA_DISPAROS_PADRAO)
+
+
 def _agora() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -412,3 +458,78 @@ def _reserva_confirmada_existente(conversa_id: str) -> bool:
 
     dados = resultado.get("data")
     return isinstance(dados, list) and bool(dados)
+
+
+def _status_whatsapp_interno(status: str) -> str:
+    mapa = {
+        "sent": "enviado",
+        "delivered": "entregue",
+        "read": "lido",
+        "failed": "falha",
+    }
+    return mapa.get(status, "enviado")
+
+
+def _erro_status_texto(erros: Any) -> str:
+    if not isinstance(erros, list) or not erros:
+        return ""
+    partes: list[str] = []
+    for erro in erros:
+        if not isinstance(erro, Mapping):
+            continue
+        code = erro.get("code")
+        title = erro.get("title")
+        message = erro.get("message")
+        details = erro.get("details")
+        partes.append(" | ".join(str(item) for item in (code, title, message, details) if item))
+    return "; ".join(partes)
+
+
+def _atualizar_disparo_status(
+    message_id: str,
+    status_interno: str,
+    erro: str,
+    metadata_status: Mapping[str, Any],
+) -> bool:
+    payload = {
+        "status": status_interno,
+        "erro": erro or None,
+        "metadata": metadata_status,
+    }
+    resultado = supabase.atualizar(
+        _tabela_disparos(),
+        _sem_vazios(payload),
+        filtros={"provider_message_id": f"eq.{message_id}"},
+        retornar=False,
+    )
+    if resultado.get("ok"):
+        logger.info("Status de disparo atualizado: wamid=%s status=%s.", message_id, status_interno)
+        return True
+    logger.warning("Nao foi possivel atualizar disparo %s: %s", message_id, resultado.get("erro"))
+    return False
+
+
+def _atualizar_mensagem_status(
+    message_id: str,
+    status_interno: str,
+    erro: str,
+    metadata_status: Mapping[str, Any],
+) -> bool:
+    payload = {
+        "metadata": {
+            **dict(metadata_status),
+            "status_entrega": status_interno,
+            "erro_entrega": erro,
+        },
+    }
+    resultado = supabase.atualizar(
+        _tabela_mensagens(),
+        payload,
+        filtros={"provider_message_id": f"eq.{message_id}"},
+        retornar=False,
+    )
+    if resultado.get("ok"):
+        logger.info("Status de mensagem atualizado: wamid=%s status=%s.", message_id, status_interno)
+        return True
+    logger.warning("Nao foi possivel atualizar mensagem %s: %s", message_id, resultado.get("erro"))
+    return False

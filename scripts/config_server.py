@@ -370,6 +370,23 @@ class ConfigHandler(BaseHTTPRequestHandler):
             self._responder_erro(HTTPStatus.BAD_REQUEST, "JSON precisa ser um objeto")
             return
 
+        statuses = whatsapp_cloud.extrair_status_webhook(payload)
+        resultados_status: list[dict[str, Any]] = []
+        for status in statuses:
+            try:
+                resultado_status = fluxo_reservas.processar_status_whatsapp(status)
+                resultados_status.append(dict(resultado_status))
+            except Exception:
+                logger.exception("Falha ao processar status recebido da Cloud API.")
+                resultados_status.append(
+                    {
+                        "ok": False,
+                        "message_id": status.get("message_id", ""),
+                        "status": status.get("status", ""),
+                        "erro": "falha ao processar status",
+                    }
+                )
+
         recebidas = whatsapp_cloud.extrair_mensagens_webhook(payload)
         resultados: list[dict[str, Any]] = []
         for mensagem in recebidas:
@@ -393,8 +410,11 @@ class ConfigHandler(BaseHTTPRequestHandler):
             {
                 "ok": True,
                 "recebidas": len(recebidas),
+                "statuses_recebidos": len(statuses),
+                "statuses_processados": sum(1 for resultado in resultados_status if resultado.get("ok")),
                 "processadas": processadas,
                 "reservas_confirmadas": reservas,
+                "resultados_status": resultados_status,
                 "resultados": resultados,
             }
         )
