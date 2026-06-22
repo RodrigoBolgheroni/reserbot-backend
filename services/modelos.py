@@ -3,7 +3,16 @@ from __future__ import annotations
 from typing import Any, Literal, TypedDict
 
 
-StatusConversa = Literal["aberta", "aguardando_cliente", "em_atendimento", "finalizada", "erro"]
+StatusConversa = Literal[
+    "aberta",
+    "aguardando_cliente",
+    "em_atendimento",
+    "bot_ativo",
+    "humano",
+    "aguardando_humano",
+    "finalizada",
+    "erro",
+]
 OrigemConversa = Literal["aniversario", "pdf", "whatsapp", "manual", "webhook"]
 RemetenteMensagem = Literal["cliente", "bot", "agente", "sistema"]
 StatusReserva = Literal["pendente", "identificada", "confirmada", "cancelada", "erro"]

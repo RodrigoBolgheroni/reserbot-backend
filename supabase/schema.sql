@@ -44,8 +44,8 @@ create table if not exists public.conversas (
     id uuid primary key default gen_random_uuid(),
     cliente_id uuid references public.clientes(id) on delete set null,
     cliente_telefone text not null,
-    status text not null default 'aguardando_cliente'
-        check (status in ('aberta', 'aguardando_cliente', 'em_atendimento', 'finalizada', 'erro')),
+    status text not null default 'bot_ativo'
+        check (status in ('aberta', 'aguardando_cliente', 'em_atendimento', 'bot_ativo', 'humano', 'aguardando_humano', 'finalizada', 'erro')),
     data_inicio timestamptz not null default now(),
     data_fim timestamptz,
     origem text not null default 'aniversario'
@@ -121,6 +121,13 @@ create unique index if not exists ux_disparos_mensagens_dia
 alter table public.clientes
     add column if not exists perfil_id uuid references public.perfis_clientes(id) on delete set null,
     add column if not exists perfil_nome text;
+
+alter table public.conversas
+    drop constraint if exists conversas_status_check;
+
+alter table public.conversas
+    add constraint conversas_status_check
+    check (status in ('aberta', 'aguardando_cliente', 'em_atendimento', 'bot_ativo', 'humano', 'aguardando_humano', 'finalizada', 'erro'));
 
 create or replace function public.set_updated_at()
 returns trigger

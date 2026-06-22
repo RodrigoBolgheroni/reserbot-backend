@@ -86,6 +86,9 @@ class ConfigHandler(BaseHTTPRequestHandler):
         if rota == "/api/disparos/aniversarios":
             self._disparar_aniversarios()
             return
+        if rota == "/api/conversas/status":
+            self._atualizar_status_conversa()
+            return
         if rota == "/api/whatsapp/webhook":
             self._receber_webhook_whatsapp()
             return
@@ -344,6 +347,26 @@ class ConfigHandler(BaseHTTPRequestHandler):
                 "resultados": resultados,
             }
         )
+
+    def _atualizar_status_conversa(self) -> None:
+        try:
+            payload = self._ler_json_body()
+        except ValueError as erro:
+            self._responder_erro(HTTPStatus.BAD_REQUEST, str(erro))
+            return
+
+        if not isinstance(payload, dict):
+            self._responder_erro(HTTPStatus.BAD_REQUEST, "JSON precisa ser um objeto")
+            return
+
+        resultado = fluxo_reservas.definir_status_conversa_por_telefone(
+            telefone=str(payload.get("telefone") or ""),
+            status=str(payload.get("status") or ""),
+        )
+        if not resultado.get("ok"):
+            self._responder_json(resultado, status=HTTPStatus.BAD_REQUEST)
+            return
+        self._responder_json(resultado)
 
     def _validar_webhook_whatsapp(self) -> None:
         query = parse_qs(urlparse(self.path).query)

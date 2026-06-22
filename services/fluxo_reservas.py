@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any, TypedDict
@@ -16,6 +17,19 @@ TABELA_CONVERSAS_PADRAO = "conversas"
 TABELA_MENSAGENS_PADRAO = "mensagens"
 TABELA_RESERVAS_PADRAO = "reservas"
 TABELA_DISPAROS_PADRAO = "disparos_mensagens"
+STATUS_BOT_ATIVO = {"bot_ativo", "aberta", "aguardando_cliente", "em_atendimento"}
+STATUS_HUMANO = {"humano", "aguardando_humano", "finalizada"}
+STATUS_CONVERSA_PERMITIDOS = STATUS_BOT_ATIVO | STATUS_HUMANO | {"erro"}
+PADROES_PEDIDO_HUMANO = (
+    r"\batendente\b",
+    r"\bhumano\b",
+    r"\bpessoa\b",
+    r"falar\s+com\s+algu[eé]m",
+    r"falar\s+com\s+(?:um\s+)?funcion[aá]rio",
+    r"quero\s+falar\s+com\s+(?:um\s+)?funcion[aá]rio",
+    r"cancelar\s+bot",
+    r"n[aã]o\s+quero\s+bot",
+)
 
 
 class ResultadoWebhook(TypedDict, total=False):
@@ -33,6 +47,7 @@ def iniciar_conversa(
     *,
     origem: OrigemConversa = "aniversario",
     mensagem_inicial: str = "",
+    status: str = "bot_ativo",
 ) -> Conversa:
     agora = _agora()
     telefone = str(cliente.get("telefone") or "").strip()
@@ -40,7 +55,7 @@ def iniciar_conversa(
     conversa: Conversa = {
         "cliente_id": str(cliente.get("id") or ""),
         "cliente_telefone": telefone,
-        "status": "aguardando_cliente",
+        "status": status if status in STATUS_CONVERSA_PERMITIDOS else "bot_ativo",
         "data_inicio": agora,
         "origem": origem,
         "metadata": {
@@ -57,7 +72,10 @@ def iniciar_conversa(
         conversa_salva = _primeiro(resultado.get("data"))
         if conversa_salva:
             conversa.update(conversa_salva)
-        logger.info("Conversa registrada no Supabase para %s.", telefone)
+        if conversa.get("status") == "bot_ativo":
+            logger.info("Conversa criada pelo disparo/fluxo do ReservaBot: telefone=%s origem=%s.", telefone, origem)
+        else:
+            logger.info("Conversa registrada no Supabase para %s com status=%s.", telefone, conversa.get("status"))
     else:
         conversa["id"] = f"local:{telefone}:{agora}"
         logger.warning("Conversa mantida localmente para %s: %s", telefone, resultado.get("erro"))
@@ -136,9 +154,48 @@ def processar_resposta_cliente(
     perfil_cliente = _resolver_perfil_seguro(cliente)
     conversa_atual = conversa or buscar_conversa_ativa_por_telefone(telefone_limpo)
     if conversa_atual is None:
-        conversa_atual = iniciar_conversa(cliente, origem="webhook")
-    else:
-        atualizar_status_conversa(conversa_atual, status="em_atendimento")
+        conversa_atual = buscar_conversa_por_telefone(telefone_limpo)
+        if conversa_atual is None:
+            conversa_atual = iniciar_conversa(cliente, origem="webhook", status="aguardando_humano")
+        logger.info("Mensagem recebida fora de fluxo ativo. Bot nao respondeu. telefone=%s", telefone_limpo)
+        registrar_mensagem(
+            conversa_atual,
+            remetente="cliente",
+            conteudo=mensagem_limpa,
+            provider_message_id=provider_message_id,
+            metadata=metadata_mensagem,
+        )
+        if str(conversa_atual.get("status") or "") not in STATUS_HUMANO:
+            atualizar_status_conversa(conversa_atual, status="aguardando_humano")
+        return {
+            "texto": "",
+            "reserva_confirmada": False,
+            "dados_reserva": {},
+            "status_reserva": "aguardando_humano",
+            "confianca": 1.0,
+        }
+
+    status_conversa = str(conversa_atual.get("status") or "")
+    if status_conversa in STATUS_HUMANO:
+        logger.info(
+            "Bot ignorou mensagem porque conversa esta em atendimento humano. telefone=%s status=%s",
+            telefone_limpo,
+            status_conversa,
+        )
+        registrar_mensagem(
+            conversa_atual,
+            remetente="cliente",
+            conteudo=mensagem_limpa,
+            provider_message_id=provider_message_id,
+            metadata=metadata_mensagem,
+        )
+        return {
+            "texto": "",
+            "reserva_confirmada": False,
+            "dados_reserva": {},
+            "status_reserva": status_conversa,
+            "confianca": 1.0,
+        }
 
     registrar_mensagem(
         conversa_atual,
@@ -147,6 +204,19 @@ def processar_resposta_cliente(
         provider_message_id=provider_message_id,
         metadata=metadata_mensagem,
     )
+    if _pediu_atendimento_humano(mensagem_limpa):
+        atualizar_status_conversa(conversa_atual, status="humano")
+        logger.info("Bot pausado por pedido de humano. telefone=%s", telefone_limpo)
+        return {
+            "texto": "",
+            "reserva_confirmada": False,
+            "dados_reserva": {},
+            "status_reserva": "humano",
+            "confianca": 1.0,
+        }
+
+    atualizar_status_conversa(conversa_atual, status="bot_ativo")
+    logger.info("Bot respondeu porque conversa esta ativa. telefone=%s", telefone_limpo)
     resposta = agente.processar_mensagem(
         telefone=telefone_limpo,
         mensagem_cliente=mensagem_limpa,
@@ -344,20 +414,25 @@ def finalizar_conversa(conversa: Mapping[str, Any], *, status: str = "finalizada
 
 
 def buscar_conversa_ativa_por_telefone(telefone: str) -> Conversa | None:
+    return buscar_conversa_por_telefone(telefone, statuses=STATUS_BOT_ATIVO)
+
+
+def buscar_conversa_por_telefone(telefone: str, *, statuses: set[str] | None = None) -> Conversa | None:
     telefone_limpo = telefone.strip()
     if not telefone_limpo:
         return None
 
+    filtros = {"cliente_telefone": f"eq.{telefone_limpo}"}
+    if statuses:
+        filtros["status"] = f"in.({','.join(sorted(statuses))})"
+
     resultado = supabase.selecionar(
         _tabela_conversas(),
-        filtros={
-            "cliente_telefone": f"eq.{telefone_limpo}",
-            "status": "in.(aberta,aguardando_cliente,em_atendimento)",
-        },
+        filtros=filtros,
         limite=25,
     )
     if not resultado.get("ok"):
-        logger.debug("Sem conversa ativa recuperada para %s: %s", telefone_limpo, resultado.get("erro"))
+        logger.debug("Sem conversa recuperada para %s: %s", telefone_limpo, resultado.get("erro"))
         return None
 
     dados = resultado.get("data")
@@ -382,8 +457,42 @@ def atualizar_status_conversa(conversa: Mapping[str, Any], *, status: str) -> No
         filtros={"id": f"eq.{conversa_id}"},
         retornar=False,
     )
-    if not resultado.get("ok"):
+    if resultado.get("ok"):
+        if status in {"humano", "aguardando_humano"}:
+            logger.info("Bot pausado manualmente/por regra para conversa %s status=%s.", conversa_id, status)
+        elif status == "bot_ativo":
+            logger.info("Bot retomado para conversa %s.", conversa_id)
+    else:
         logger.warning("Nao foi possivel atualizar conversa %s: %s", conversa_id, resultado.get("erro"))
+
+
+def definir_status_conversa_por_telefone(*, telefone: str, status: str) -> dict[str, Any]:
+    telefone_limpo = str(telefone or "").strip()
+    status_limpo = str(status or "").strip()
+    if not telefone_limpo:
+        return {"ok": False, "erro": "Telefone obrigatorio."}
+    if status_limpo not in STATUS_CONVERSA_PERMITIDOS:
+        return {"ok": False, "erro": "Status de atendimento invalido."}
+
+    cliente = clientes_supabase.buscar_cliente_por_telefone(telefone_limpo) or {"telefone": telefone_limpo}
+    conversa = buscar_conversa_por_telefone(telefone_limpo)
+    if conversa is None:
+        conversa = iniciar_conversa(cliente, origem="manual", status=status_limpo)
+    else:
+        atualizar_status_conversa(conversa, status=status_limpo)
+        conversa = {**dict(conversa), "status": status_limpo}
+
+    if status_limpo in {"humano", "aguardando_humano"}:
+        logger.info("Bot pausado manualmente. telefone=%s status=%s", telefone_limpo, status_limpo)
+    elif status_limpo == "bot_ativo":
+        logger.info("Bot retomado manualmente. telefone=%s", telefone_limpo)
+
+    return {
+        "ok": True,
+        "telefone": telefone_limpo,
+        "status": status_limpo,
+        "conversa_id": str(conversa.get("id") or ""),
+    }
 
 
 def _tabela_conversas() -> str:
@@ -429,6 +538,19 @@ def _resolver_perfil_seguro(cliente: Mapping[str, Any]) -> dict[str, Any] | None
         logger.exception("Falha ao resolver perfil do cliente %s.", cliente.get("telefone", ""))
         return None
     return dict(perfil) if perfil else None
+
+
+def _pediu_atendimento_humano(texto: str) -> bool:
+    normalizado = _normalizar_texto(texto)
+    return any(re.search(padrao, normalizado) for padrao in PADROES_PEDIDO_HUMANO)
+
+
+def _normalizar_texto(texto: str) -> str:
+    substituicoes = str.maketrans(
+        "áàãâäéèêëíìîïóòõôöúùûüç",
+        "aaaaaeeeeiiiiooooouuuuc",
+    )
+    return str(texto or "").lower().translate(substituicoes)
 
 
 def _mensagem_ja_processada(provider_message_id: str) -> bool:
