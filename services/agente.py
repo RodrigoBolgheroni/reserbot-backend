@@ -103,6 +103,8 @@ class EstadoReserva(TypedDict, total=False):
     observacoes: str
     campo_pendente: str
     etapa: str
+    pedido_imediato: bool
+    tentativas_campos: dict[str, int]
     aguardando_confirmacao: bool
 
 
@@ -241,11 +243,29 @@ def aplicar_guardrails_reserva(
             "confianca": interpretacao["confianca"],
         }
 
+    if _eh_pedido_imediato(mensagem_cliente):
+        return _resposta_pedido_imediato(
+            estado,
+            mensagem_cliente=mensagem_cliente,
+            confianca=max(interpretacao["confianca"], 0.9),
+        )
+
+    if _pergunta_sobre_horario_indisponivel(mensagem_cliente, estado):
+        estado["aguardando_confirmacao"] = False
+        _definir_campo_pendente(estado, "horario")
+        return {
+            "texto": _mensagem_horario_fora_funcionamento(),
+            "reserva_confirmada": False,
+            "dados_reserva": _dados_reserva_do_estado(estado),
+            "status_reserva": "em_coleta",
+            "confianca": max(interpretacao["confianca"], 0.8),
+        }
+
     if _pergunta_data_disponivel(mensagem_cliente):
         estado["aguardando_confirmacao"] = False
         _definir_campo_pendente(estado, "data_reserva")
         return {
-            "texto": "Consigo verificar a data que você preferir. Me fala o dia que você quer reservar.",
+            "texto": "Você tem alguma data em mente? Me fala o dia e eu verifico para você.",
             "reserva_confirmada": False,
             "dados_reserva": _dados_reserva_do_estado(estado),
             "status_reserva": "em_coleta",
@@ -317,22 +337,26 @@ def aplicar_guardrails_reserva(
     if invalidos:
         campo = _primeiro_campo_pendente(list(invalidos), estado, telefone_limpo)
         _definir_campo_pendente(estado, campo)
+        texto = _mensagem_campo_invalido(campo, estado, telefone_limpo)
+        status_reserva = "aguardando_humano" if _deve_encaminhar_humano_por_tentativas(estado, campo) else "em_coleta"
         return {
-            "texto": _mensagem_campo_invalido(campo, estado, telefone_limpo),
+            "texto": texto,
             "reserva_confirmada": False,
             "dados_reserva": dados_estado,
-            "status_reserva": "em_coleta",
+            "status_reserva": status_reserva,
             "confianca": interpretacao["confianca"],
         }
 
     if faltantes:
         campo = faltantes[0]
         _definir_campo_pendente(estado, campo)
+        texto = _mensagem_pedir_campo(campo, estado)
+        status_reserva = "aguardando_humano" if _deve_encaminhar_humano_por_tentativas(estado, campo) else "em_coleta"
         return {
-            "texto": _mensagem_pedir_campo(campo, estado),
+            "texto": texto,
             "reserva_confirmada": False,
             "dados_reserva": dados_estado,
-            "status_reserva": "em_coleta",
+            "status_reserva": status_reserva,
             "confianca": interpretacao["confianca"],
         }
 
@@ -568,6 +592,7 @@ def _definir_data_estado(
     estado["data_reserva"] = data_texto
     if valor_original:
         estado["data_reserva_original"] = valor_original.strip()
+    _limpar_tentativas_campo(estado, "data_reserva")
     logger.info(
         "Data de reserva registrada: original=%r interpretada=%s salva=%s fonte=%s.",
         valor_original,
@@ -611,6 +636,7 @@ def _definir_horario_estado(estado: EstadoReserva, valor: Any, *, invalidos: set
         return
     estado["horario"] = horario
     estado.pop("horario_invalido", None)
+    _limpar_tentativas_campo(estado, "horario")
 
 
 def _definir_pessoas_estado(estado: EstadoReserva, valor: Any, *, invalidos: set[str]) -> None:
@@ -622,6 +648,7 @@ def _definir_pessoas_estado(estado: EstadoReserva, valor: Any, *, invalidos: set
         invalidos.add("pessoas")
         return
     estado["pessoas"] = pessoas
+    _limpar_tentativas_campo(estado, "pessoas")
 
 
 def _definir_campo_pendente(estado: EstadoReserva, campo: str) -> None:
@@ -636,6 +663,32 @@ def _campo_aguardado(estado: Mapping[str, Any]) -> str:
     if etapa in CAMPO_POR_ETAPA:
         return CAMPO_POR_ETAPA[etapa]
     return str(estado.get("campo_pendente") or "").strip()
+
+
+def _registrar_tentativa_campo(estado: EstadoReserva, campo: str) -> int:
+    tentativas = estado.setdefault("tentativas_campos", {})
+    tentativas[campo] = int(tentativas.get(campo, 0)) + 1
+    return tentativas[campo]
+
+
+def _tentativas_campo(estado: Mapping[str, Any], campo: str) -> int:
+    tentativas = estado.get("tentativas_campos")
+    if not isinstance(tentativas, Mapping):
+        return 0
+    try:
+        return int(tentativas.get(campo, 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _limpar_tentativas_campo(estado: EstadoReserva, campo: str) -> None:
+    tentativas = estado.get("tentativas_campos")
+    if isinstance(tentativas, dict):
+        tentativas.pop(campo, None)
+
+
+def _deve_encaminhar_humano_por_tentativas(estado: Mapping[str, Any], campo: str) -> bool:
+    return _tentativas_campo(estado, campo) >= 3
 
 
 def _pode_aceitar_dado_modelo(campo: str, mensagem_cliente: str, estado: EstadoReserva) -> bool:
@@ -697,31 +750,53 @@ def _primeiro_campo_pendente(invalidos: list[str], estado: EstadoReserva, telefo
 
 
 def _mensagem_campo_invalido(campo: str, estado: EstadoReserva, telefone: str) -> str:
+    tentativa = _registrar_tentativa_campo(estado, campo)
     if campo == "data_reserva":
+        if tentativa >= 3:
+            return "Não consegui entender uma data válida. Me passa no formato dia/mês, como 26/07? Se preferir, posso chamar alguém da equipe."
         return "Essa data já passou. Me fala uma data a partir de hoje para eu verificar a reserva."
     if campo == "horario":
+        if tentativa >= 3:
+            return "Não consegui entender o horário. Você pode me passar no formato 19h ou 19:30? Se preferir, posso chamar alguém da equipe."
         return _mensagem_horario_fora_funcionamento()
     if campo == "pessoas":
+        if tentativa >= 3:
+            return "Não consegui entender a quantidade de pessoas. Pode me mandar só o número, como 4 ou 6? Se preferir, posso chamar alguém da equipe."
         return "Esse numero de pessoas e maior do que consigo confirmar por aqui. Para quantas pessoas sera a reserva?"
     return _mensagem_pedir_campo(campo, estado)
 
 
 def _mensagem_pedir_campo(campo: str, estado: EstadoReserva) -> str:
+    tentativa = _registrar_tentativa_campo(estado, campo)
     if campo == "data_reserva":
-        return "Perfeito, para qual data voce quer fazer a reserva?"
+        if tentativa == 1:
+            return "Certo, para qual data você quer fazer a reserva?"
+        if tentativa == 2:
+            return "Você tem algum dia em mente? Pode me mandar como 26/07."
+        return "Não consegui entender a data. Me passa no formato dia/mês, como 26/07? Se preferir, posso chamar alguém da equipe."
     if campo == "horario":
+        if tentativa >= 3:
+            return "Não consegui entender o horário. Você pode me passar no formato 19h ou 19:30? Se preferir, posso chamar alguém da equipe."
+        if tentativa == 2:
+            return "Você pode me passar um horário aproximado, como 19h ou 20h?"
         if estado.get("horario_invalido"):
             return _mensagem_horario_fora_funcionamento()
         if estado.get("data_reserva") and estado.get("pessoas"):
-            return "Perfeito, tenho a data e a quantidade de pessoas. Só falta o horário. Qual horário você prefere?"
+            return "Certo, tenho a data e a quantidade de pessoas. Só falta o horário. Qual horário fica melhor para você?"
         if estado.get("data_reserva"):
-            return "Perfeito, tenho a data. Qual horário você prefere?"
-        return "Perfeito, qual horário você prefere?"
+            return "Certo, tenho a data. Qual horário fica melhor para você?"
+        return "Certo, qual horário fica melhor para você?"
     if campo == "pessoas":
-        return "Perfeito, para quantas pessoas será a reserva?"
+        if tentativa == 1:
+            return "Beleza, para quantas pessoas será a reserva?"
+        if tentativa == 2:
+            return "Me manda só a quantidade de pessoas, pode ser um número como 4 ou 6."
+        return "Não consegui entender a quantidade de pessoas. Pode me mandar só o número, como 4 ou 6? Se preferir, posso chamar alguém da equipe."
     if campo == "nome_cliente":
-        return "Perfeito, só falta seu nome para deixar a reserva certinha. Qual nome devo colocar?"
-    return "Perfeito, antes de confirmar preciso completar os dados da reserva."
+        if tentativa >= 3:
+            return "Não consegui identificar o nome para a reserva. Se preferir, posso chamar alguém da equipe para ajudar."
+        return "Só falta seu nome para deixar a reserva certinha. Qual nome devo colocar?"
+    return "Antes de confirmar, preciso completar os dados da reserva."
 
 
 def _mensagem_horario_fora_funcionamento() -> str:
@@ -733,10 +808,13 @@ def _mensagem_horario_fora_funcionamento() -> str:
 
 
 def _mensagem_confirmacao_previa(dados: Mapping[str, Any]) -> str:
+    nome = str(dados.get("nome_cliente") or "").strip()
+    nome_trecho = f", no nome de {nome}" if nome else ""
     return (
-        "Perfeito, só confirmando: reserva para "
+        "Deixa eu confirmar: ficou para "
         f"{_formatar_data_cliente(str(dados.get('data_reserva') or ''))}, "
-        f"às {dados.get('horario')}, para {dados.get('pessoas')} pessoas. Posso confirmar?"
+        f"às {dados.get('horario')}, para {dados.get('pessoas')} pessoas"
+        f"{nome_trecho}. Posso confirmar?"
     )
 
 
@@ -825,6 +903,54 @@ def _eh_recusa_reserva(texto: str) -> bool:
         or re.search(r"\bnao\s+(?:quero|tenho interesse|vou querer|preciso)\b", normalizado)
         or re.search(r"\bobrigad[ao]\s+nao\b", normalizado)
     )
+
+
+def _eh_pedido_imediato(texto: str) -> bool:
+    normalizado = _normalizar_busca(texto)
+    return bool(
+        re.search(r"\b(agora|agr|hj agora|hoje agora)\b", normalizado)
+        or re.search(r"\b(to|tou|estou)\s+(indo|chegando)\b", normalizado)
+        or re.search(r"\b(chegando|indo ai|indo agora|mais rapido possivel|o quanto antes)\b", normalizado)
+        or re.search(r"\bquero\s+(?:pra\s+)?agora\b", normalizado)
+    )
+
+
+def _resposta_pedido_imediato(
+    estado: EstadoReserva,
+    *,
+    mensagem_cliente: str,
+    confianca: float,
+) -> RespostaAgente:
+    estado["pedido_imediato"] = True
+    estado["aguardando_confirmacao"] = False
+    estado["data_reserva"] = _hoje().isoformat()
+    estado["data_reserva_original"] = mensagem_cliente.strip()
+    _definir_campo_pendente(estado, "horario")
+    logger.info(
+        "Pedido imediato identificado. original=%r data_salva=%s.",
+        mensagem_cliente,
+        estado.get("data_reserva", ""),
+    )
+    return {
+        "texto": (
+            "Entendi, você quer para agora. Como é uma reserva em cima da hora, "
+            "preciso que a equipe confirme a disponibilidade."
+        ),
+        "reserva_confirmada": False,
+        "dados_reserva": _dados_reserva_do_estado(estado),
+        "status_reserva": "aguardando_humano",
+        "confianca": confianca,
+    }
+
+
+def _pergunta_sobre_horario_indisponivel(texto: str, estado: Mapping[str, Any]) -> bool:
+    normalizado = _normalizar_busca(texto)
+    if not re.search(r"\b(por que|pq|porque|motivo|nao pode|nao disponivel|indisponivel|funcionamento)\b", normalizado):
+        return False
+    horario = _extrair_horario(texto, permitir_numero_isolado=False) or str(estado.get("horario_invalido") or "")
+    if horario and not _horario_reserva_valido(horario):
+        return True
+    return bool(re.search(r"\b(horario|hora|manha|madrugada|funcionamento)\b", normalizado))
 
 
 def mensagem_indica_interesse_reserva(texto: str) -> bool:

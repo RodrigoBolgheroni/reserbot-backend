@@ -538,6 +538,13 @@ def _monitorar_conversa(telefone: str, conversa: ConversaAtiva) -> None:
         logger.info("Conversa finalizada por recusa ao convite de reserva. telefone=%s", telefone)
         return
 
+    if resposta.get("status_reserva") == "aguardando_humano":
+        fluxo_reservas.atualizar_status_conversa(_conversa_banco(conversa), status="aguardando_humano")
+        agente.limpar_historico(telefone)
+        remover_conversa_ativa(telefone)
+        logger.info("Conversa pausada para atendimento humano. telefone=%s", telefone)
+        return
+
 
 def _registrar_reserva_confirmada(
     telefone: str,

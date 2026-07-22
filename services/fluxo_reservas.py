@@ -266,6 +266,12 @@ def processar_resposta_cliente(
             },
         )
 
+    if resposta.get("status_reserva") == "aguardando_humano":
+        atualizar_status_conversa(conversa_atual, status="aguardando_humano")
+        agente.limpar_historico(telefone_limpo)
+        logger.info("Bot pausado para atendimento humano. telefone=%s motivo=%s", telefone_limpo, resposta.get("status_reserva"))
+        return resposta
+
     if resposta.get("status_reserva") == "sem_interesse":
         finalizar_conversa(conversa_atual, status="finalizada")
         agente.limpar_historico(telefone_limpo)
