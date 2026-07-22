@@ -91,7 +91,7 @@ class AgenteGuardrailsReservaTest(unittest.TestCase):
         self.assertFalse(resposta["reserva_confirmada"])
         self.assertEqual(
             resposta["texto"],
-            "Consigo verificar a data que voce preferir. Me fala o dia que voce quer reservar.",
+            "Consigo verificar a data que você preferir. Me fala o dia que você quer reservar.",
         )
 
     def test_nao_confirma_estado_com_data_passada(self) -> None:

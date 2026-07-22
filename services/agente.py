@@ -209,7 +209,7 @@ def aplicar_guardrails_reserva(
         estado["aguardando_confirmacao"] = False
         estado["campo_pendente"] = "data_reserva"
         return {
-            "texto": "Consigo verificar a data que voce preferir. Me fala o dia que voce quer reservar.",
+            "texto": "Consigo verificar a data que você preferir. Me fala o dia que você quer reservar.",
             "reserva_confirmada": False,
             "dados_reserva": _dados_reserva_do_estado(estado),
             "status_reserva": "em_coleta",
