@@ -4,6 +4,7 @@ import logging
 import json
 import os
 import re
+import threading
 import unicodedata
 from collections.abc import Mapping, Sequence
 from datetime import date, timedelta
@@ -112,6 +113,8 @@ class EstadoReserva(TypedDict, total=False):
 
 _historicos: dict[str, list[Mensagem]] = {}
 _estados_reserva: dict[str, EstadoReserva] = {}
+_locks_conversa: dict[str, threading.RLock] = {}
+_locks_conversa_guard = threading.Lock()
 
 ETAPA_POR_CAMPO: Final[dict[str, str]] = {
     "data_reserva": "aguardando_data",
@@ -126,6 +129,32 @@ CAMPO_POR_ETAPA: Final[dict[str, str]] = {etapa: campo for campo, etapa in ETAPA
 
 
 def processar_mensagem(
+    telefone: str,
+    mensagem_cliente: str,
+    nome_cliente: str = "",
+    perfil_cliente: Mapping[str, Any] | None = None,
+) -> RespostaAgente:
+    telefone_limpo = telefone.strip()
+    mensagem_limpa = mensagem_cliente.strip()
+    if not telefone_limpo or not mensagem_limpa:
+        return {
+            "texto": "",
+            "reserva_confirmada": False,
+            "dados_reserva": {},
+            "status_reserva": "sem_mensagem",
+            "confianca": 0.0,
+        }
+
+    with _lock_conversa(telefone_limpo):
+        return _processar_mensagem_sem_lock(
+            telefone=telefone_limpo,
+            mensagem_cliente=mensagem_limpa,
+            nome_cliente=nome_cliente,
+            perfil_cliente=perfil_cliente,
+        )
+
+
+def _processar_mensagem_sem_lock(
     telefone: str,
     mensagem_cliente: str,
     nome_cliente: str = "",
@@ -166,6 +195,7 @@ def processar_mensagem(
             texto_modelo = _chamar_groq(
                 mensagens=[
                     _mensagem_sistema(nome_cliente, perfil_cliente=perfil_cliente),
+                    _mensagem_contexto_reserva(telefone_limpo),
                     *historico,
                 ],
                 modelo=os.getenv("GROQ_MODEL", MODELO_PADRAO),
@@ -190,6 +220,7 @@ def processar_mensagem(
     if texto_cliente:
         historico.append({"role": "assistant", "content": texto_cliente})
         _limitar_historico(historico)
+        _registrar_ultima_resposta(telefone_limpo, texto_cliente)
 
     if reserva_confirmada:
         limpar_historico(telefone_limpo)
@@ -203,10 +234,50 @@ def processar_mensagem(
     }
 
 
+def _lock_conversa(telefone: str) -> threading.RLock:
+    with _locks_conversa_guard:
+        lock = _locks_conversa.get(telefone)
+        if lock is None:
+            lock = threading.RLock()
+            _locks_conversa[telefone] = lock
+        return lock
+
+
 def limpar_historico(telefone: str) -> None:
     telefone_limpo = telefone.strip()
     _historicos.pop(telefone_limpo, None)
     _estados_reserva.pop(telefone_limpo, None)
+
+
+def _mensagem_contexto_reserva(telefone: str) -> Mensagem:
+    estado = _estados_reserva.get(telefone, {})
+    dados = _dados_reserva_do_estado(estado)
+    campo = _campo_retomada_apos_informacao(estado, telefone) if estado else "data_reserva"
+    payload = {
+        "dados_reserva_ja_coletados": dados,
+        "campo_que_ainda_falta": campo,
+        "etapa_interna": estado.get("etapa", ""),
+    }
+    return {
+        "role": "system",
+        "content": (
+            "Contexto interno da conversa atual. Use isto para responder de forma natural, "
+            "sem repetir perguntas ja feitas e sem perder dados coletados: "
+            f"{json.dumps(payload, ensure_ascii=False)}. "
+            "Antes de pedir o campo faltante, responda ao significado da mensagem do cliente. "
+            "Se o cliente fizer uma pergunta ou comentario, isso nao e erro."
+        ),
+    }
+
+
+def _registrar_ultima_resposta(telefone: str, texto: str) -> None:
+    estado = _estados_reserva.get(telefone)
+    if estado is None:
+        return
+    estado["ultimo_texto_bot"] = texto.strip()
+    campo = _campo_aguardado(estado)
+    if campo:
+        estado["ultimo_campo_perguntado"] = campo
 
 
 def aplicar_guardrails_reserva(
@@ -225,6 +296,7 @@ def aplicar_guardrails_reserva(
     if _nome_parece_valido(nome_cliente):
         estado["nome_cliente"] = nome_cliente.strip()
 
+    intencao_conversacional = _intencao_conversacional(mensagem_cliente)
     categoria_pergunta_restaurante = _categoria_pergunta_restaurante(mensagem_cliente)
 
     if _eh_recusa_reserva(mensagem_cliente):
@@ -246,6 +318,22 @@ def aplicar_guardrails_reserva(
             "status_reserva": "cancelada",
             "confianca": interpretacao["confianca"],
         }
+
+    if intencao_conversacional:
+        return _responder_intencao_conversacional(
+            intencao=intencao_conversacional,
+            telefone=telefone_limpo,
+            estado=estado,
+            interpretacao=interpretacao,
+        )
+
+    if categoria_pergunta_restaurante:
+        return _responder_pergunta_restaurante(
+            categoria=categoria_pergunta_restaurante,
+            telefone=telefone_limpo,
+            estado=estado,
+            confianca=max(interpretacao["confianca"], 0.8),
+        )
 
     if _eh_pedido_imediato(mensagem_cliente):
         return _resposta_pedido_imediato(
@@ -275,14 +363,6 @@ def aplicar_guardrails_reserva(
             "status_reserva": "em_coleta",
             "confianca": interpretacao["confianca"],
         }
-
-    if categoria_pergunta_restaurante:
-        return _responder_pergunta_restaurante(
-            categoria=categoria_pergunta_restaurante,
-            telefone=telefone_limpo,
-            estado=estado,
-            confianca=max(interpretacao["confianca"], 0.8),
-        )
 
     if _deve_respeitar_nao_aplicavel(estado, mensagem_cliente, status_modelo):
         return {
@@ -362,7 +442,9 @@ def aplicar_guardrails_reserva(
     if faltantes:
         campo = faltantes[0]
         _definir_campo_pendente(estado, campo)
-        texto = _mensagem_pedir_campo(campo, estado)
+        texto = _texto_modelo_para_pedir_campo(interpretacao["texto"], campo, estado, mensagem_cliente)
+        if not texto:
+            texto = _mensagem_pedir_campo(campo, estado)
         status_reserva = "aguardando_humano" if _deve_encaminhar_humano_por_tentativas(estado, campo) else "em_coleta"
         return {
             "texto": texto,
@@ -481,9 +563,21 @@ def interpretar_resposta_modelo(
 
     reserva = payload.get("reserva")
     reserva_dict = reserva if isinstance(reserva, dict) else {}
+    acao = str(payload.get("acao") or "").strip().lower()
     status = str(reserva_dict.get("status") or payload.get("status_reserva") or "em_coleta").strip().lower()
+    if acao == "confirmar_reserva":
+        status = "confirmada"
+    elif acao == "cancelar":
+        status = "cancelada"
+    elif acao == "encaminhar_humano":
+        status = "aguardando_humano"
+    if acao in {"continuar_conversa", "continuar_reserva"} and status == "nao_aplicavel":
+        status = "em_coleta"
     dados_reserva = _dados_reserva_de_json(reserva_dict)
-    texto_cliente = str(payload.get("resposta_cliente") or payload.get("texto") or "").strip()
+    dados_extraidos = payload.get("dados_extraidos")
+    if isinstance(dados_extraidos, dict):
+        dados_reserva.update(_dados_extraidos_de_json(dados_extraidos))
+    texto_cliente = str(payload.get("resposta_cliente") or payload.get("resposta") or payload.get("texto") or "").strip()
     if not texto_cliente:
         texto_cliente = _resposta_contingencia()
 
@@ -498,6 +592,27 @@ def interpretar_resposta_modelo(
         "status_reserva": status,
         "confianca": _confianca(payload.get("confianca") or reserva_dict.get("confianca")),
     }
+
+
+def _dados_extraidos_de_json(dados: Mapping[str, Any]) -> DadosReserva:
+    reserva: DadosReserva = {}
+    data_reserva = dados.get("data_reserva") or dados.get("data")
+    if isinstance(data_reserva, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", data_reserva.strip()):
+        reserva["data_reserva"] = data_reserva.strip()
+
+    horario = dados.get("horario") or dados.get("hora")
+    if isinstance(horario, str) and re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", horario.strip()):
+        reserva["horario"] = horario.strip()
+
+    pessoas = _pessoas_json(dados.get("pessoas") or dados.get("quantidade") or dados.get("quantidade_pessoas"))
+    if pessoas is not None:
+        reserva["pessoas"] = pessoas
+
+    nome = dados.get("nome_cliente") or dados.get("nome")
+    if isinstance(nome, str) and _nome_parece_valido(nome):
+        reserva["nome_cliente"] = nome.strip()
+
+    return reserva
 
 
 def _atualizar_estado_reserva(
@@ -815,7 +930,8 @@ def _mensagem_horario_fora_funcionamento() -> str:
     abertura, fechamento = _horario_funcionamento_texto()
     return (
         "Esse horário fica fora do nosso funcionamento, que é das "
-        f"{abertura} às {fechamento}. Qual horário dentro desse período você prefere?"
+        f"{_horario_para_cliente(abertura)} às {_horario_para_cliente(fechamento)}. "
+        "Qual horário dentro desse período você prefere?"
     )
 
 
@@ -966,6 +1082,170 @@ def _pergunta_sobre_horario_indisponivel(texto: str, estado: Mapping[str, Any]) 
     )
 
 
+def _intencao_conversacional(texto: str) -> str | None:
+    normalizado = _normalizar_busca(texto)
+    if not normalizado:
+        return None
+    if _mensagem_tem_sinal_data(texto) or _mensagem_tem_sinal_horario(texto) or _mensagem_tem_sinal_pessoas(texto):
+        return None
+    if re.search(r"\b(como|de onde|onde)\b", normalizado) and re.search(
+        r"\b(sabe|sabem|saber|informacoes|dados|horarios|funcionamento|endereco)\b",
+        normalizado,
+    ):
+        return "pergunta_fonte"
+    if re.search(r"\b(voce|vc|vcs|atendente|assistente)\b", normalizado) and re.search(
+        r"\b(robo|bot|virtual|automatico|ia|inteligencia artificial|humano)\b",
+        normalizado,
+    ):
+        return "pergunta_bot"
+    if re.search(r"\b(quem e voce|quem esta falando|estou falando com quem|isso e automatico)\b", normalizado):
+        return "pergunta_bot"
+    if re.search(
+        r"\b(nao sei ainda|nao sei|estou vendo|to vendo|vou ver|preciso ver|preciso confirmar|vendo com|falar com meus amigos|falar com a galera|depois te falo|te aviso|ainda nao decidi)\b",
+        normalizado,
+    ):
+        return "comentario_indecisao"
+    if _eh_saudacao_simples(normalizado):
+        return "saudacao"
+    return None
+
+
+def _responder_intencao_conversacional(
+    *,
+    intencao: str,
+    telefone: str,
+    estado: EstadoReserva,
+    interpretacao: ResultadoReservaEstruturada,
+) -> RespostaAgente:
+    campo = _campo_retomada_apos_informacao(estado, telefone)
+    if campo:
+        _definir_campo_pendente(estado, campo)
+
+    texto = _texto_modelo_para_intencao(interpretacao.get("texto", ""), intencao)
+    if not texto:
+        texto = _texto_fallback_intencao(intencao, estado)
+
+    logger.info(
+        "Intencao conversacional respondida sem contar erro: intencao=%s campo_retomada=%s.",
+        intencao,
+        campo,
+    )
+    return {
+        "texto": texto,
+        "reserva_confirmada": False,
+        "dados_reserva": _dados_reserva_do_estado(estado),
+        "status_reserva": "aguardando_confirmacao" if campo == "confirmacao" else "em_coleta",
+        "confianca": max(interpretacao["confianca"], 0.8),
+    }
+
+
+def _texto_modelo_para_intencao(texto: str, intencao: str) -> str:
+    texto_limpo = remover_flag_reserva(str(texto or ""))
+    if not texto_limpo or _texto_modelo_parece_rigido(texto_limpo):
+        return ""
+    normalizado = _normalizar_busca(texto_limpo)
+    if intencao == "pergunta_fonte":
+        return texto_limpo if re.search(r"\b(cadastrad|equipe|sistema|informacoes|dados)\b", normalizado) else ""
+    if intencao == "pergunta_bot":
+        return texto_limpo if re.search(r"\b(assistente|virtual|bot|robo|atendente|equipe)\b", normalizado) else ""
+    if intencao == "comentario_indecisao":
+        return texto_limpo if re.search(r"\b(sem problema|tranquilo|quando|decidir|continuo|por aqui)\b", normalizado) else ""
+    if intencao == "saudacao":
+        return texto_limpo if not _texto_so_pede_campo(texto_limpo) else ""
+    return texto_limpo
+
+
+def _texto_fallback_intencao(intencao: str, estado: EstadoReserva) -> str:
+    if intencao == "pergunta_fonte":
+        return _com_continuacao_fluxo(
+            "Essas informacoes foram cadastradas pela propria equipe do restaurante no nosso sistema.",
+            estado,
+        )
+    if intencao == "pergunta_bot":
+        return (
+            "Sou o assistente virtual do restaurante e estou aqui para ajudar com sua reserva. "
+            "Se preferir falar com alguem da equipe, tambem posso encaminhar."
+        )
+    if intencao == "comentario_indecisao":
+        return "Sem problema. Quando decidir, me chama por aqui que eu continuo a reserva com voce."
+    if intencao == "saudacao":
+        return "Oi! Estou por aqui para ajudar com sua reserva."
+    return _com_continuacao_fluxo("Certo, sigo com voce.", estado)
+
+
+def _texto_modelo_parece_rigido(texto: str) -> bool:
+    normalizado = _normalizar_busca(texto)
+    return bool(
+        re.search(r"\bnao consegui entender\b", normalizado)
+        or re.search(r"\bme passa no formato\b", normalizado)
+        or re.search(r"\breserva confirmada\b", normalizado)
+        or re.search(r"\bantes de confirmar preciso completar\b", normalizado)
+        or re.search(r"\btive uma instabilidade\b", normalizado)
+    )
+
+
+def _texto_modelo_para_pedir_campo(texto: str, campo: str, estado: EstadoReserva, mensagem_cliente: str) -> str:
+    if not _mensagem_pode_usar_coleta_natural(mensagem_cliente):
+        return ""
+    texto_limpo = remover_flag_reserva(str(texto or ""))
+    if not texto_limpo or _texto_modelo_parece_rigido(texto_limpo):
+        return ""
+    normalizado = _normalizar_busca(texto_limpo)
+    if re.search(r"\b(confirmad|posso confirmar|confirma\??|reserva para)\b", normalizado):
+        return ""
+    termos_por_campo = {
+        "data_reserva": r"\b(data|dia|quando)\b",
+        "horario": r"\b(horario|hora|periodo)\b",
+        "pessoas": r"\b(pessoas|quantas|total|convidados)\b",
+        "nome_cliente": r"\b(nome)\b",
+    }
+    padrao = termos_por_campo.get(campo)
+    if padrao and not re.search(padrao, normalizado):
+        return ""
+    ultimo_texto = str(estado.get("ultimo_texto_bot") or "")
+    if ultimo_texto and _textos_muito_parecidos(ultimo_texto, texto_limpo):
+        return ""
+    return texto_limpo
+
+
+def _mensagem_pode_usar_coleta_natural(mensagem_cliente: str) -> bool:
+    normalizado = _normalizar_busca(mensagem_cliente)
+    return bool(
+        _eh_confirmacao_cliente(mensagem_cliente)
+        or mensagem_indica_interesse_reserva(mensagem_cliente)
+        or _eh_saudacao_simples(normalizado)
+        or re.search(r"\b(claro|pode ser|vamos|bora|beleza|perfeito|quero sim|gostaria sim)\b", normalizado)
+    )
+
+
+def _textos_muito_parecidos(anterior: str, atual: str) -> bool:
+    anterior_norm = _normalizar_busca(anterior)
+    atual_norm = _normalizar_busca(atual)
+    if not anterior_norm or not atual_norm:
+        return False
+    if anterior_norm == atual_norm:
+        return True
+    palavras_anterior = {p for p in re.findall(r"\w+", anterior_norm) if len(p) > 3}
+    palavras_atual = {p for p in re.findall(r"\w+", atual_norm) if len(p) > 3}
+    if not palavras_anterior or not palavras_atual:
+        return False
+    intersecao = len(palavras_anterior & palavras_atual)
+    menor = min(len(palavras_anterior), len(palavras_atual))
+    return menor > 0 and intersecao / menor >= 0.8
+
+
+def _texto_so_pede_campo(texto: str) -> bool:
+    normalizado = _normalizar_busca(texto)
+    return bool(
+        re.fullmatch(r".*\b(qual|me fala|me diga|pode me passar)\b.*\b(data|dia|horario|pessoas|nome)\b.*", normalizado)
+        and not re.search(r"\b(oi|ola|claro|perfeito|certo|sem problema)\b", normalizado)
+    )
+
+
+def _eh_saudacao_simples(normalizado: str) -> bool:
+    return bool(re.fullmatch(r"\s*(oi|ola|bom dia|boa tarde|boa noite|opa|e ai|eae)\s*[!.]*\s*", normalizado))
+
+
 def _categoria_pergunta_restaurante(texto: str) -> str | None:
     normalizado = _normalizar_busca(texto)
     if not normalizado:
@@ -1046,18 +1326,20 @@ def _campo_retomada_apos_informacao(estado: EstadoReserva, telefone: str) -> str
 def _texto_pergunta_restaurante(categoria: str, estado: EstadoReserva) -> str:
     config = config_restaurante.obter_config()
     abertura, fechamento = _horario_funcionamento_texto()
+    abertura_cliente = _horario_para_cliente(abertura)
+    fechamento_cliente = _horario_para_cliente(fechamento)
 
     if categoria == "horarios_disponiveis":
         return (
-            f"Atendemos entre {abertura} e {fechamento}. "
+            f"Atendemos entre {abertura_cliente} e {fechamento_cliente}. "
             "Me fala o horario que voce prefere e eu verifico a solicitacao."
         )
 
     if categoria == "funcionamento":
         if estado.get("data_reserva"):
-            base = f"Nesse dia abrimos as {abertura} e fechamos as {fechamento}."
+            base = f"Nesse dia abrimos as {abertura_cliente} e fechamos as {fechamento_cliente}."
         else:
-            base = f"Funcionamos {config.dias_funcionamento}, das {abertura} as {fechamento}."
+            base = f"Funcionamos {config.dias_funcionamento}, das {abertura_cliente} as {fechamento_cliente}."
     elif categoria == "endereco":
         base = f"O endereco e {config.endereco}"
     elif categoria == "estacionamento":
@@ -1236,6 +1518,12 @@ def _horario_funcionamento_texto() -> tuple[str, str]:
     return abertura, fechamento
 
 
+def _horario_para_cliente(horario: str) -> str:
+    if horario == "23:59":
+        return "meia-noite"
+    return horario
+
+
 def _limite_pessoas_reserva() -> int:
     return config_restaurante.limite_pessoas_reserva()
 
@@ -1326,7 +1614,13 @@ def _mensagem_sistema(nome_cliente: str, *, perfil_cliente: Mapping[str, Any] | 
             "\n"
             "Seu objetivo:\n"
             "Coletar dia, horário e número de pessoas. "
-            "Pergunte data e horário juntos na primeira pergunta. "
+            "Converse primeiro como uma atendente humana inteligente. "
+            "Antes de tratar a mensagem como preenchimento de campo, classifique a intencao: "
+            "pedido de humano, pergunta sobre restaurante, pergunta sobre o bot/conversa, correcao, recusa/cancelamento, "
+            "fornecimento de data/horario/quantidade ou mensagem incompreensivel. "
+            "Perguntas, comentarios e duvidas nao sao erro e nao devem soar como formulario. "
+            "Quando fizer sentido, responda ao que o cliente disse e retome naturalmente o proximo dado da reserva. "
+            "Pergunte data e horário juntos na primeira pergunta quando a conversa ainda estiver iniciando. "
             "Depois pergunte o total de pessoas. "
             "Nunca confirme uma reserva sem data, horario, quantidade de pessoas, nome e telefone. "
             "Se o cliente disser sim mas faltar algum campo, pergunte o campo faltante. "
@@ -1344,7 +1638,16 @@ def _mensagem_sistema(nome_cliente: str, *, perfil_cliente: Mapping[str, Any] | 
             f"- Estacionamento: {config.estacionamento}\n"
             f"- Aniversarios: {config.aniversario}\n"
             "Se o cliente fizer uma pergunta normal sobre o restaurante, responda e retome o campo da reserva que faltava. "
-            "Responda sempre e somente em JSON válido, sem markdown, neste formato: "
+            "Se o cliente perguntar como voce sabe uma informacao, explique que os dados foram cadastrados pela equipe no sistema. "
+            "Nunca diga que um horario esta disponivel sem uma agenda real integrada; diga que atende dentro do funcionamento e vai verificar a solicitacao. "
+            "Responda sempre e somente em JSON válido, sem markdown. Prefira este formato: "
+            '{"resposta":"texto natural para enviar ao cliente",'
+            '"intencao":"pedido_humano|pergunta_restaurante|pergunta_bot|pergunta_fonte|correcao|recusa|fornecimento_dados|comentario|incompreensivel",'
+            '"dados_extraidos":{"data":"YYYY-MM-DD ou null","horario":"HH:MM ou null","quantidade":numero ou null},'
+            '"acao":"continuar_conversa|confirmar_reserva|cancelar|encaminhar_humano",'
+            '"proximo_campo":"data|horario|quantidade|nome|confirmacao|null",'
+            '"confianca":0.0}. '
+            "O formato antigo tambem e aceito internamente: "
             '{"resposta_cliente":"texto para enviar ao cliente",'
             '"reserva":{"status":"em_coleta|confirmada|cancelada|nao_aplicavel",'
             '"data_reserva":"YYYY-MM-DD ou null","horario":"HH:MM ou null",'
