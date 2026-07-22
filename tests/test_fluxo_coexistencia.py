@@ -118,7 +118,7 @@ class FluxoCoexistenciaTest(unittest.TestCase):
 
         resposta = fluxo_reservas.processar_resposta_cliente(
             telefone="5511999999999",
-            mensagem_cliente="Quero falar com atendente",
+            mensagem_cliente="Quero falar com alguém",
             provider_message_id="wamid.3",
         )
 

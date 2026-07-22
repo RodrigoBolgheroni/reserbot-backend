@@ -9,6 +9,8 @@ from collections.abc import Mapping, Sequence
 from datetime import date, timedelta
 from typing import Any, Final, Literal, TypedDict
 
+from services import config_restaurante
+
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +225,8 @@ def aplicar_guardrails_reserva(
     if _nome_parece_valido(nome_cliente):
         estado["nome_cliente"] = nome_cliente.strip()
 
+    categoria_pergunta_restaurante = _categoria_pergunta_restaurante(mensagem_cliente)
+
     if _eh_recusa_reserva(mensagem_cliente):
         _estados_reserva.pop(telefone_limpo, None)
         return {
@@ -233,7 +237,7 @@ def aplicar_guardrails_reserva(
             "confianca": 1.0,
         }
 
-    if status_modelo == "cancelada" or _eh_cancelamento_cliente(mensagem_cliente):
+    if (status_modelo == "cancelada" or _eh_cancelamento_cliente(mensagem_cliente)) and not categoria_pergunta_restaurante:
         _estados_reserva.pop(telefone_limpo, None)
         return {
             "texto": interpretacao["texto"] or "Tudo bem, nao vou seguir com essa reserva.",
@@ -271,6 +275,14 @@ def aplicar_guardrails_reserva(
             "status_reserva": "em_coleta",
             "confianca": interpretacao["confianca"],
         }
+
+    if categoria_pergunta_restaurante:
+        return _responder_pergunta_restaurante(
+            categoria=categoria_pergunta_restaurante,
+            telefone=telefone_limpo,
+            estado=estado,
+            confianca=max(interpretacao["confianca"], 0.8),
+        )
 
     if _deve_respeitar_nao_aplicavel(estado, mensagem_cliente, status_modelo):
         return {
@@ -429,7 +441,7 @@ def _extrair_dados_reserva_contextual(
             dados["horario"] = horario
     elif campo_aguardado == "pessoas":
         pessoas = _extrair_pessoas_solicitadas(texto, permitir_numero_isolado=True)
-        if pessoas is not None and 1 <= pessoas <= 30:
+        if pessoas is not None and 1 <= pessoas <= _limite_pessoas_reserva():
             dados["pessoas"] = pessoas
     else:
         data_reserva = _extrair_data(texto)
@@ -507,7 +519,7 @@ def _atualizar_estado_reserva(
         permitir_numero_isolado=campo_pendente == "pessoas",
     )
     if pessoas_solicitadas is not None:
-        if 1 <= pessoas_solicitadas <= 30:
+        if 1 <= pessoas_solicitadas <= _limite_pessoas_reserva():
             dados_usuario["pessoas"] = pessoas_solicitadas
         else:
             invalidos.add("pessoas")
@@ -644,7 +656,7 @@ def _definir_pessoas_estado(estado: EstadoReserva, valor: Any, *, invalidos: set
         pessoas = int(valor)
     except (TypeError, ValueError):
         return
-    if not 1 <= pessoas <= 30:
+    if not 1 <= pessoas <= _limite_pessoas_reserva():
         invalidos.add("pessoas")
         return
     estado["pessoas"] = pessoas
@@ -945,12 +957,159 @@ def _resposta_pedido_imediato(
 
 def _pergunta_sobre_horario_indisponivel(texto: str, estado: Mapping[str, Any]) -> bool:
     normalizado = _normalizar_busca(texto)
-    if not re.search(r"\b(por que|pq|porque|motivo|nao pode|nao disponivel|indisponivel|funcionamento)\b", normalizado):
-        return False
     horario = _extrair_horario(texto, permitir_numero_isolado=False) or str(estado.get("horario_invalido") or "")
     if horario and not _horario_reserva_valido(horario):
         return True
-    return bool(re.search(r"\b(horario|hora|manha|madrugada|funcionamento)\b", normalizado))
+    return bool(
+        re.search(r"\b(por que|pq|porque|motivo|nao pode|nao disponivel|indisponivel)\b", normalizado)
+        and re.search(r"\b(horario|hora|manha|madrugada)\b", normalizado)
+    )
+
+
+def _categoria_pergunta_restaurante(texto: str) -> str | None:
+    normalizado = _normalizar_busca(texto)
+    if not normalizado:
+        return None
+
+    marcador_pergunta = bool(
+        "?" in texto
+        or re.search(r"\b(quando|qual|quais|onde|como|quanto|quantas|tem|aceita|aceitam|funciona|abre|fecha|fica)\b", normalizado)
+    )
+
+    if re.search(r"\b(horarios?|hora)\b", normalizado) and re.search(
+        r"\b(disponivel|disponiveis|disponibilidade|livres|vagos)\b",
+        normalizado,
+    ):
+        return "horarios_disponiveis"
+    if re.search(r"\b(abre|abrir|fecha|fechar|funciona|funcionamento|que horas)\b", normalizado):
+        return "funcionamento"
+    if re.search(r"\b(endereco|onde fica|localizacao|localizado|rua|avenida|bairro)\b", normalizado):
+        return "endereco"
+    if re.search(r"\b(estacionamento|estacionar|manobrista|valet)\b", normalizado):
+        return "estacionamento"
+    if re.search(r"\b(pagamento|pagar|pix|cartao|debito|credito|dinheiro|voucher|vale refeicao)\b", normalizado):
+        return "pagamento"
+    if re.search(r"\b(aniversario|bolo|decoracao|decorar|parabens|comemorar)\b", normalizado):
+        return "aniversario"
+    if re.search(r"\b(quantas pessoas|maximo|maxima|limite|grupo grande|muita gente)\b", normalizado):
+        return "limite_pessoas"
+    if marcador_pergunta and re.search(r"\b(cancelamento|cancelar|desmarcar|remarcar)\b", normalizado):
+        return "cancelamento"
+    if marcador_pergunta and re.search(
+        r"\b(antecedencia|minima|politica|regra|regras|como funciona a reserva|precisa reservar|em cima da hora)\b",
+        normalizado,
+    ):
+        return "politica_reserva"
+    if marcador_pergunta and re.search(r"\b(restaurante|casa|reserva|reservas)\b", normalizado):
+        return "geral"
+    return None
+
+
+def _responder_pergunta_restaurante(
+    *,
+    categoria: str,
+    telefone: str,
+    estado: EstadoReserva,
+    confianca: float,
+) -> RespostaAgente:
+    campo = _campo_retomada_apos_informacao(estado, telefone)
+    if campo:
+        _definir_campo_pendente(estado, campo)
+
+    texto = _texto_pergunta_restaurante(categoria, estado)
+    logger.info(
+        "Pergunta sobre restaurante respondida durante fluxo de reserva: categoria=%s campo_retomada=%s.",
+        categoria,
+        campo,
+    )
+    return {
+        "texto": texto,
+        "reserva_confirmada": False,
+        "dados_reserva": _dados_reserva_do_estado(estado),
+        "status_reserva": "aguardando_confirmacao" if campo == "confirmacao" else "em_coleta",
+        "confianca": confianca,
+    }
+
+
+def _campo_retomada_apos_informacao(estado: EstadoReserva, telefone: str) -> str:
+    campo_atual = _campo_aguardado(estado)
+    if campo_atual in set(ETAPA_POR_CAMPO):
+        return campo_atual
+    if estado.get("aguardando_confirmacao"):
+        return "confirmacao"
+    faltantes = _campos_obrigatorios_faltantes(estado, telefone)
+    if not faltantes:
+        return "confirmacao"
+    return faltantes[0]
+
+
+def _texto_pergunta_restaurante(categoria: str, estado: EstadoReserva) -> str:
+    config = config_restaurante.obter_config()
+    abertura, fechamento = _horario_funcionamento_texto()
+
+    if categoria == "horarios_disponiveis":
+        return (
+            f"Atendemos entre {abertura} e {fechamento}. "
+            "Me fala o horario que voce prefere e eu verifico a solicitacao."
+        )
+
+    if categoria == "funcionamento":
+        if estado.get("data_reserva"):
+            base = f"Nesse dia abrimos as {abertura} e fechamos as {fechamento}."
+        else:
+            base = f"Funcionamos {config.dias_funcionamento}, das {abertura} as {fechamento}."
+    elif categoria == "endereco":
+        base = f"O endereco e {config.endereco}"
+    elif categoria == "estacionamento":
+        base = config.estacionamento
+    elif categoria == "pagamento":
+        base = f"Aceitamos {config.formas_pagamento}."
+    elif categoria == "aniversario":
+        base = config.aniversario
+    elif categoria == "limite_pessoas":
+        base = f"Consigo confirmar automaticamente reservas de ate {config.limite_pessoas_reserva} pessoas por aqui."
+    elif categoria == "cancelamento":
+        base = config.politica_cancelamento
+        if config.telefone_atendimento:
+            base = f"{base} O telefone do atendimento e {config.telefone_atendimento}."
+    elif categoria == "politica_reserva":
+        base = (
+            f"Para reservas, trabalhamos {config.horarios_aceitos_reserva}. "
+            f"Antecedencia minima: {config.antecedencia_minima}. "
+            f"{config.regras_reservas_imediatas}"
+        )
+    else:
+        base = config.informacoes_gerais or (
+            f"Posso te ajudar com funcionamento, endereco, pagamentos e reservas do {config.nome}."
+        )
+
+    return _com_continuacao_fluxo(base, estado)
+
+
+def _com_continuacao_fluxo(base: str, estado: EstadoReserva) -> str:
+    texto = base.strip()
+    if texto and texto[-1] not in ".!?":
+        texto = f"{texto}."
+
+    continuacao = _continuacao_fluxo_apos_informacao(estado)
+    if not continuacao:
+        return texto
+    return f"{texto} {continuacao}"
+
+
+def _continuacao_fluxo_apos_informacao(estado: EstadoReserva) -> str:
+    campo = _campo_aguardado(estado)
+    if campo == "data_reserva":
+        return "Me fala o dia que voce quer reservar."
+    if campo == "horario":
+        return "Qual horario dentro desse periodo fica melhor para voce?"
+    if campo == "pessoas":
+        return "Para quantas pessoas sera a reserva?"
+    if campo == "nome_cliente":
+        return "Qual nome devo colocar na reserva?"
+    if campo == "confirmacao":
+        return "Quando estiver tudo certo, posso confirmar a reserva?"
+    return ""
 
 
 def mensagem_indica_interesse_reserva(texto: str) -> bool:
@@ -1069,13 +1228,16 @@ def _horario_reserva_valido(horario: str) -> bool:
 
 
 def _horario_funcionamento_texto() -> tuple[str, str]:
-    abertura = os.getenv("RESERVA_HORARIO_INICIO", "10:00").strip() or "10:00"
-    fechamento = os.getenv("RESERVA_HORARIO_FIM", "23:59").strip() or "23:59"
+    abertura, fechamento = config_restaurante.horario_funcionamento()
     if _horario_para_minutos(abertura) is None:
         abertura = "10:00"
     if _horario_para_minutos(fechamento) is None:
         fechamento = "23:59"
     return abertura, fechamento
+
+
+def _limite_pessoas_reserva() -> int:
+    return config_restaurante.limite_pessoas_reserva()
 
 
 def _horario_para_minutos(horario: str) -> int | None:
@@ -1119,7 +1281,8 @@ def _chamar_groq(mensagens: Sequence[Mensagem], modelo: str) -> str:
 
 
 def _mensagem_sistema(nome_cliente: str, *, perfil_cliente: Mapping[str, Any] | None = None) -> Mensagem:
-    restaurante = os.getenv("NOME_RESTAURANTE", "o restaurante").strip()
+    config = config_restaurante.obter_config()
+    restaurante = config.nome
     hoje = _hoje().strftime("%d/%m/%Y")
     nome = nome_cliente.strip() or "cliente"
     perfil_nome = str((perfil_cliente or {}).get("nome") or "").strip()
@@ -1170,6 +1333,17 @@ def _mensagem_sistema(nome_cliente: str, *, perfil_cliente: Mapping[str, Any] | 
             "Se o horario ou a quantidade forem invalidos, nao use esse valor. "
             "Antes da confirmacao final, envie um resumo com data, horario e pessoas e pergunte se pode confirmar. "
             "So use status confirmada depois que o cliente confirmar esse resumo. "
+            "\n\n"
+            "Informacoes reais do restaurante para responder perguntas durante a reserva:\n"
+            f"- Endereco: {config.endereco}\n"
+            f"- Funcionamento: {config.dias_funcionamento}, das {config.horario_abertura} as {config.horario_fechamento}\n"
+            f"- Horarios aceitos para reserva: {config.horarios_aceitos_reserva}\n"
+            f"- Limite de pessoas por reserva automatica: {config.limite_pessoas_reserva}\n"
+            f"- Formas de pagamento: {config.formas_pagamento}\n"
+            f"- Cancelamento: {config.politica_cancelamento}\n"
+            f"- Estacionamento: {config.estacionamento}\n"
+            f"- Aniversarios: {config.aniversario}\n"
+            "Se o cliente fizer uma pergunta normal sobre o restaurante, responda e retome o campo da reserva que faltava. "
             "Responda sempre e somente em JSON válido, sem markdown, neste formato: "
             '{"resposta_cliente":"texto para enviar ao cliente",'
             '"reserva":{"status":"em_coleta|confirmada|cancelada|nao_aplicavel",'
@@ -1228,7 +1402,7 @@ def _pessoas_json(valor: Any) -> int | None:
         pessoas = int(valor)
     except (TypeError, ValueError):
         return None
-    return pessoas if 1 <= pessoas <= 30 else None
+    return pessoas if 1 <= pessoas <= _limite_pessoas_reserva() else None
 
 
 def _dados_reserva_minimos(dados: DadosReserva) -> bool:
@@ -1388,7 +1562,7 @@ def _extrair_horario(texto: str, *, permitir_numero_isolado: bool = False) -> st
 
 def _extrair_pessoas(texto: str) -> int | None:
     pessoas_solicitadas = _extrair_pessoas_solicitadas(texto, permitir_numero_isolado=False)
-    if pessoas_solicitadas is not None and 1 <= pessoas_solicitadas <= 30:
+    if pessoas_solicitadas is not None and 1 <= pessoas_solicitadas <= _limite_pessoas_reserva():
         return pessoas_solicitadas
     return None
 

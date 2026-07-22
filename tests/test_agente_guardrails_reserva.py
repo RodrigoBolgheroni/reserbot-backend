@@ -308,6 +308,153 @@ class AgenteGuardrailsReservaTest(unittest.TestCase):
         self.assertIn("23:00", resposta["texto"])
         self.assertNotIn("horario", agente._estados_reserva[telefone])
 
+    def test_pergunta_quando_abre_fecha_responde_sem_humano_e_mantem_horario(self) -> None:
+        telefone = "5511999999999"
+        agente._estados_reserva[telefone] = {
+            "data_reserva": "2026-07-29",
+            "pessoas": 4,
+            "nome_cliente": "Rodrigo Teste",
+            "campo_pendente": "horario",
+            "etapa": "aguardando_horario",
+            "tentativas_campos": {"horario": 1},
+        }
+        payload = {
+            "resposta_cliente": "Qual horario voce prefere?",
+            "reserva": {"status": "em_coleta", "data_reserva": None, "horario": None, "pessoas": None},
+            "confianca": 0.5,
+        }
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "GROQ_API_KEY": "teste",
+                    "RESERVA_HORARIO_INICIO": "12:00",
+                    "RESERVA_HORARIO_FIM": "23:00",
+                },
+            ),
+            patch.object(agente, "_chamar_groq", return_value=self._mock_groq(payload)),
+        ):
+            resposta = agente.processar_mensagem(telefone, "quando abre e fecha?", nome_cliente="Rodrigo Teste")
+
+        self.assertFalse(resposta["reserva_confirmada"])
+        self.assertEqual(resposta["status_reserva"], "em_coleta")
+        self.assertIn("12:00", resposta["texto"])
+        self.assertIn("23:00", resposta["texto"])
+        self.assertIn("qual horario", agente._normalizar_busca(resposta["texto"]))
+        self.assertEqual(agente._estados_reserva[telefone]["campo_pendente"], "horario")
+        self.assertEqual(agente._estados_reserva[telefone]["tentativas_campos"]["horario"], 1)
+
+    def test_pergunta_quais_horarios_disponiveis_nao_inventa_disponibilidade(self) -> None:
+        telefone = "5511999999999"
+        agente._estados_reserva[telefone] = {
+            "data_reserva": "2026-07-29",
+            "pessoas": 4,
+            "nome_cliente": "Rodrigo Teste",
+            "campo_pendente": "horario",
+            "etapa": "aguardando_horario",
+        }
+        payload = {
+            "resposta_cliente": "Temos horario disponivel.",
+            "reserva": {"status": "em_coleta", "data_reserva": None, "horario": None, "pessoas": None},
+            "confianca": 0.5,
+        }
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "GROQ_API_KEY": "teste",
+                    "RESERVA_HORARIO_INICIO": "12:00",
+                    "RESERVA_HORARIO_FIM": "23:00",
+                },
+            ),
+            patch.object(agente, "_chamar_groq", return_value=self._mock_groq(payload)),
+        ):
+            resposta = agente.processar_mensagem(telefone, "Quais horarios estao disponiveis?", nome_cliente="Rodrigo Teste")
+
+        texto_normalizado = agente._normalizar_busca(resposta["texto"])
+        self.assertEqual(resposta["status_reserva"], "em_coleta")
+        self.assertIn("atendemos entre 12:00 e 23:00", texto_normalizado)
+        self.assertIn("verifico a solicitacao", texto_normalizado)
+        self.assertNotIn("temos disponivel", texto_normalizado)
+
+    def test_pergunta_endereco_durante_reserva_mantem_dados(self) -> None:
+        telefone = "5511999999999"
+        agente._estados_reserva[telefone] = {
+            "data_reserva": "2026-07-29",
+            "pessoas": 4,
+            "nome_cliente": "Rodrigo Teste",
+            "campo_pendente": "horario",
+            "etapa": "aguardando_horario",
+        }
+        payload = {
+            "resposta_cliente": "Nao sei.",
+            "reserva": {
+                "status": "em_coleta",
+                "data_reserva": "2026-07-28",
+                "horario": "20:00",
+                "pessoas": 8,
+            },
+            "confianca": 0.5,
+        }
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "GROQ_API_KEY": "teste",
+                    "RESTAURANTE_ENDERECO": "Rua Teste, 123",
+                },
+            ),
+            patch.object(agente, "_chamar_groq", return_value=self._mock_groq(payload)),
+        ):
+            resposta = agente.processar_mensagem(telefone, "qual o endereco?", nome_cliente="Rodrigo Teste")
+
+        estado = agente._estados_reserva[telefone]
+        self.assertIn("Rua Teste, 123", resposta["texto"])
+        self.assertEqual(estado["data_reserva"], "2026-07-29")
+        self.assertEqual(estado["pessoas"], 4)
+        self.assertNotIn("horario", estado)
+        self.assertEqual(estado["campo_pendente"], "horario")
+
+    def test_duas_perguntas_seguidas_nao_aumentam_tentativas(self) -> None:
+        telefone = "5511999999999"
+        agente._estados_reserva[telefone] = {
+            "data_reserva": "2026-07-29",
+            "pessoas": 4,
+            "nome_cliente": "Rodrigo Teste",
+            "campo_pendente": "horario",
+            "etapa": "aguardando_horario",
+            "tentativas_campos": {"horario": 1},
+        }
+        payload = {
+            "resposta_cliente": "Nao entendi.",
+            "reserva": {"status": "em_coleta", "data_reserva": None, "horario": None, "pessoas": None},
+            "confianca": 0.5,
+        }
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "GROQ_API_KEY": "teste",
+                    "RESERVA_HORARIO_INICIO": "12:00",
+                    "RESERVA_HORARIO_FIM": "23:00",
+                    "RESTAURANTE_ENDERECO": "Rua Teste, 123",
+                },
+            ),
+            patch.object(agente, "_chamar_groq", return_value=self._mock_groq(payload)),
+        ):
+            primeira = agente.processar_mensagem(telefone, "quando abre e fecha?", nome_cliente="Rodrigo Teste")
+            segunda = agente.processar_mensagem(telefone, "qual o endereco?", nome_cliente="Rodrigo Teste")
+
+        self.assertEqual(primeira["status_reserva"], "em_coleta")
+        self.assertEqual(segunda["status_reserva"], "em_coleta")
+        self.assertIn("12:00", primeira["texto"])
+        self.assertIn("Rua Teste, 123", segunda["texto"])
+        self.assertEqual(agente._estados_reserva[telefone]["tentativas_campos"]["horario"], 1)
+
     def test_resposta_confusa_reformula_e_depois_oferece_humano(self) -> None:
         telefone = "5511999999999"
         agente._estados_reserva[telefone] = {
