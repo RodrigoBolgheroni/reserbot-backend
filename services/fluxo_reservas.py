@@ -223,6 +223,19 @@ def processar_resposta_cliente(
         nome_cliente=str(cliente.get("nome") or nome_cliente or ""),
         perfil_cliente=perfil_cliente,
     )
+    nome_confirmacao = str(resposta["dados_reserva"].get("nome_cliente") or cliente.get("nome") or nome_cliente or "")
+    if resposta["reserva_confirmada"] and not agente.dados_reserva_obrigatorios_ok(
+        resposta["dados_reserva"],
+        nome_cliente=nome_confirmacao,
+        telefone=telefone_limpo,
+    ):
+        logger.warning("Confirmacao de reserva bloqueada por campos obrigatorios ausentes. telefone=%s", telefone_limpo)
+        resposta = {
+            **resposta,
+            "texto": "Perfeito, antes de confirmar preciso completar data, horario, quantidade de pessoas e nome.",
+            "reserva_confirmada": False,
+            "status_reserva": "em_coleta",
+        }
 
     if resposta["texto"]:
         envio = whatsapp.enviar_com_resultado(telefone_limpo, resposta["texto"])
@@ -334,8 +347,22 @@ def registrar_reserva_confirmada(
     dados_reserva: agente.DadosReserva,
 ) -> bool:
     telefone = str(cliente.get("telefone") or "").strip()
-    nome = str(cliente.get("nome") or "").strip()
+    nome = str(dados_reserva.get("nome_cliente") or cliente.get("nome") or "").strip()
     conversa_id = str((conversa or {}).get("id") or "")
+    if not agente.dados_reserva_obrigatorios_ok(dados_reserva, nome_cliente=nome, telefone=telefone):
+        logger.warning(
+            "Reserva nao registrada por campos obrigatorios ausentes. telefone=%s conversa=%s dados=%s",
+            telefone,
+            conversa_id,
+            {
+                "data_reserva": bool(dados_reserva.get("data_reserva")),
+                "horario": bool(dados_reserva.get("horario")),
+                "pessoas": bool(dados_reserva.get("pessoas")),
+                "nome": bool(nome),
+                "telefone": bool(telefone),
+            },
+        )
+        return False
     if _reserva_confirmada_existente(conversa_id):
         logger.info("Reserva ja registrada para conversa %s; ignorando duplicidade.", conversa_id)
         return True
