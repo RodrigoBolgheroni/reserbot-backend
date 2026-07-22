@@ -129,6 +129,183 @@ class AgenteGuardrailsReservaTest(unittest.TestCase):
             "Consigo verificar a data que você preferir. Me fala o dia que você quer reservar.",
         )
 
+    def test_cliente_informa_26_07_e_resumo_continua_26_07(self) -> None:
+        telefone = "5511999999999"
+        payload = {
+            "resposta_cliente": "Perfeito, só confirmando: reserva para 28/07/2026, às 20:00, para 4 pessoas. Posso confirmar?",
+            "reserva": {
+                "status": "confirmada",
+                "data_reserva": "2026-07-28",
+                "horario": "20:00",
+                "pessoas": 4,
+            },
+            "confianca": 1,
+        }
+
+        with (
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 22)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste"}),
+            patch.object(agente, "_chamar_groq", return_value=self._mock_groq(payload)),
+        ):
+            resposta = agente.processar_mensagem(
+                telefone,
+                "Dia 26/07 as 20h para 4 pessoas",
+                nome_cliente="Rodrigo Teste",
+            )
+
+        self.assertFalse(resposta["reserva_confirmada"])
+        self.assertEqual(resposta["dados_reserva"]["data_reserva"], "2026-07-26")
+        self.assertIn("26/07/2026", resposta["texto"])
+        self.assertNotIn("28/07/2026", resposta["texto"])
+
+    def test_aguardando_quantidade_numero_29_vira_pessoas(self) -> None:
+        telefone = "5511999999999"
+        agente._estados_reserva[telefone] = {
+            "data_reserva": "2026-07-26",
+            "horario": "20:00",
+            "nome_cliente": "Rodrigo Teste",
+            "campo_pendente": "pessoas",
+            "etapa": "aguardando_quantidade",
+        }
+        payload = {
+            "resposta_cliente": "Perfeito, só confirmando: reserva para 28/07/2026, às 22:00, para 29 pessoas. Posso confirmar?",
+            "reserva": {
+                "status": "confirmada",
+                "data_reserva": "2026-07-28",
+                "horario": "22:00",
+                "pessoas": 29,
+            },
+            "confianca": 1,
+        }
+
+        with (
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 22)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste"}),
+            patch.object(agente, "_chamar_groq", return_value=self._mock_groq(payload)),
+        ):
+            resposta = agente.processar_mensagem(telefone, "29", nome_cliente="Rodrigo Teste")
+
+        self.assertFalse(resposta["reserva_confirmada"])
+        self.assertEqual(resposta["status_reserva"], "aguardando_confirmacao")
+        self.assertEqual(resposta["dados_reserva"]["pessoas"], 29)
+        self.assertEqual(resposta["dados_reserva"]["data_reserva"], "2026-07-26")
+        self.assertEqual(resposta["dados_reserva"]["horario"], "20:00")
+        self.assertIn("26/07/2026", resposta["texto"])
+        self.assertIn("20:00", resposta["texto"])
+        self.assertIn("29 pessoas", resposta["texto"])
+
+    def test_nao_valida_data_durante_etapa_de_quantidade(self) -> None:
+        telefone = "5511999999999"
+        agente._estados_reserva[telefone] = {
+            "data_reserva": "2026-07-26",
+            "nome_cliente": "Rodrigo Teste",
+            "campo_pendente": "pessoas",
+            "etapa": "aguardando_quantidade",
+        }
+        payload = {
+            "resposta_cliente": "Essa data já passou.",
+            "reserva": {
+                "status": "em_coleta",
+                "data_reserva": "2026-07-21",
+                "horario": None,
+                "pessoas": 29,
+            },
+            "confianca": 0.9,
+        }
+
+        with (
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 22)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste"}),
+            patch.object(agente, "_chamar_groq", return_value=self._mock_groq(payload)),
+        ):
+            resposta = agente.processar_mensagem(telefone, "29", nome_cliente="Rodrigo Teste")
+
+        self.assertFalse(resposta["reserva_confirmada"])
+        self.assertEqual(agente._estados_reserva[telefone]["data_reserva"], "2026-07-26")
+        self.assertEqual(agente._estados_reserva[telefone]["pessoas"], 29)
+        self.assertNotIn("data ja passou", agente._normalizar_busca(resposta["texto"]))
+        self.assertIn("horario", agente._normalizar_busca(resposta["texto"]))
+
+    def test_explica_horario_fora_do_funcionamento(self) -> None:
+        telefone = "5511999999999"
+        agente._estados_reserva[telefone] = {
+            "data_reserva": "2026-07-26",
+            "pessoas": 10,
+            "nome_cliente": "Rodrigo Teste",
+            "campo_pendente": "horario",
+            "etapa": "aguardando_horario",
+        }
+        payload = {
+            "resposta_cliente": "Qual horário você prefere?",
+            "reserva": {
+                "status": "em_coleta",
+                "data_reserva": "2026-07-26",
+                "horario": "04:00",
+                "pessoas": 10,
+            },
+            "confianca": 0.9,
+        }
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "GROQ_API_KEY": "teste",
+                    "RESERVA_HORARIO_INICIO": "10:00",
+                    "RESERVA_HORARIO_FIM": "23:00",
+                },
+            ),
+            patch.object(agente, "_chamar_groq", return_value=self._mock_groq(payload)),
+        ):
+            resposta = agente.processar_mensagem(
+                telefone,
+                "Por que 4h nao esta disponivel?",
+                nome_cliente="Rodrigo Teste",
+            )
+
+        texto_normalizado = agente._normalizar_busca(resposta["texto"])
+        self.assertFalse(resposta["reserva_confirmada"])
+        self.assertIn("funcionamento", texto_normalizado)
+        self.assertIn("10:00", resposta["texto"])
+        self.assertIn("23:00", resposta["texto"])
+        self.assertNotIn("horario", agente._estados_reserva[telefone])
+
+    def test_campos_validos_nao_sao_sobrescritos_em_outra_etapa(self) -> None:
+        telefone = "5511999999999"
+        agente._estados_reserva[telefone] = {
+            "data_reserva": "2026-07-26",
+            "horario": "20:00",
+            "nome_cliente": "Rodrigo Teste",
+            "campo_pendente": "pessoas",
+            "etapa": "aguardando_quantidade",
+        }
+        payload = {
+            "resposta_cliente": "Resumo errado.",
+            "reserva": {
+                "status": "em_coleta",
+                "data_reserva": "2026-07-28",
+                "horario": "22:00",
+                "pessoas": 29,
+            },
+            "confianca": 0.8,
+        }
+
+        with (
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 22)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste"}),
+            patch.object(agente, "_chamar_groq", return_value=self._mock_groq(payload)),
+        ):
+            resposta = agente.processar_mensagem(telefone, "29", nome_cliente="Rodrigo Teste")
+
+        estado = agente._estados_reserva[telefone]
+        self.assertEqual(estado["data_reserva"], "2026-07-26")
+        self.assertEqual(estado["horario"], "20:00")
+        self.assertEqual(estado["pessoas"], 29)
+        self.assertIn("26/07/2026", resposta["texto"])
+        self.assertIn("20:00", resposta["texto"])
+        self.assertNotIn("28/07/2026", resposta["texto"])
+        self.assertNotIn("22:00", resposta["texto"])
+
     def test_nao_confirma_estado_com_data_passada(self) -> None:
         telefone = "5511999999999"
         agente._estados_reserva[telefone] = {
@@ -179,7 +356,7 @@ class AgenteGuardrailsReservaTest(unittest.TestCase):
 
         self.assertFalse(resposta["reserva_confirmada"])
         self.assertNotIn("horario", agente._estados_reserva[telefone])
-        self.assertIn("horario nao esta disponivel", agente._normalizar_busca(resposta["texto"]))
+        self.assertIn("funcionamento", agente._normalizar_busca(resposta["texto"]))
 
     def test_numero_isolado_corrige_pessoas_sem_virar_horario(self) -> None:
         telefone = "5511999999999"
