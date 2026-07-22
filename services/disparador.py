@@ -529,6 +529,16 @@ def _monitorar_conversa(telefone: str, conversa: ConversaAtiva) -> None:
         _registrar_reserva_confirmada(telefone, conversa, resposta["dados_reserva"])
         agente.limpar_historico(telefone)
         remover_conversa_ativa(telefone)
+        return
+
+    if resposta.get("status_reserva") == "sem_interesse":
+        fluxo_reservas.finalizar_conversa(_conversa_banco(conversa), status="finalizada")
+        agente.limpar_historico(telefone)
+        remover_conversa_ativa(telefone)
+        logger.info("Conversa finalizada por recusa ao convite de reserva. telefone=%s", telefone)
+        return
+
+
 def _registrar_reserva_confirmada(
     telefone: str,
     conversa: ConversaAtiva,

@@ -154,28 +154,42 @@ def processar_resposta_cliente(
     perfil_cliente = _resolver_perfil_seguro(cliente)
     conversa_atual = conversa or buscar_conversa_ativa_por_telefone(telefone_limpo)
     if conversa_atual is None:
-        conversa_atual = buscar_conversa_por_telefone(telefone_limpo)
-        if conversa_atual is None:
-            conversa_atual = iniciar_conversa(cliente, origem="webhook", status="aguardando_humano")
-        logger.info("Mensagem recebida fora de fluxo ativo. Bot nao respondeu. telefone=%s", telefone_limpo)
-        registrar_mensagem(
-            conversa_atual,
-            remetente="cliente",
-            conteudo=mensagem_limpa,
-            provider_message_id=provider_message_id,
-            metadata=metadata_mensagem,
-        )
-        if str(conversa_atual.get("status") or "") not in STATUS_HUMANO:
-            atualizar_status_conversa(conversa_atual, status="aguardando_humano")
-        return {
-            "texto": "",
-            "reserva_confirmada": False,
-            "dados_reserva": {},
-            "status_reserva": "aguardando_humano",
-            "confianca": 1.0,
-        }
+        conversa_anterior = buscar_conversa_por_telefone(telefone_limpo)
+        if (
+            conversa_anterior is not None
+            and str(conversa_anterior.get("status") or "") == "finalizada"
+            and agente.mensagem_indica_interesse_reserva(mensagem_limpa)
+        ):
+            conversa_atual = iniciar_conversa(cliente, origem="webhook", status="bot_ativo")
+            logger.info("Cliente retomou interesse em reserva. Novo fluxo iniciado. telefone=%s", telefone_limpo)
+        else:
+            conversa_atual = conversa_anterior
+            if conversa_atual is None:
+                conversa_atual = iniciar_conversa(cliente, origem="webhook", status="aguardando_humano")
+            logger.info("Mensagem recebida fora de fluxo ativo. Bot nao respondeu. telefone=%s", telefone_limpo)
+            registrar_mensagem(
+                conversa_atual,
+                remetente="cliente",
+                conteudo=mensagem_limpa,
+                provider_message_id=provider_message_id,
+                metadata=metadata_mensagem,
+            )
+            if str(conversa_atual.get("status") or "") not in STATUS_HUMANO:
+                atualizar_status_conversa(conversa_atual, status="aguardando_humano")
+            return {
+                "texto": "",
+                "reserva_confirmada": False,
+                "dados_reserva": {},
+                "status_reserva": "aguardando_humano",
+                "confianca": 1.0,
+            }
 
     status_conversa = str(conversa_atual.get("status") or "")
+    if status_conversa == "finalizada" and agente.mensagem_indica_interesse_reserva(mensagem_limpa):
+        conversa_atual = iniciar_conversa(cliente, origem="webhook", status="bot_ativo")
+        status_conversa = "bot_ativo"
+        logger.info("Cliente retomou interesse em reserva. Novo fluxo iniciado. telefone=%s", telefone_limpo)
+
     if status_conversa in STATUS_HUMANO:
         logger.info(
             "Bot ignorou mensagem porque conversa esta em atendimento humano. telefone=%s status=%s",
@@ -251,6 +265,12 @@ def processar_resposta_cliente(
                 "confianca": resposta.get("confianca", 0),
             },
         )
+
+    if resposta.get("status_reserva") == "sem_interesse":
+        finalizar_conversa(conversa_atual, status="finalizada")
+        agente.limpar_historico(telefone_limpo)
+        logger.info("Conversa finalizada por recusa ao convite de reserva. telefone=%s", telefone_limpo)
+        return resposta
 
     if resposta["reserva_confirmada"]:
         registrar_reserva_confirmada(

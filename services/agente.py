@@ -13,6 +13,7 @@ from typing import Any, Final, Literal, TypedDict
 logger = logging.getLogger(__name__)
 
 FLAG_RESERVA_CONFIRMADA: Final[str] = "RESERVA_CONFIRMADA"
+MENSAGEM_RECUSA_RESERVA: Final[str] = "Tudo bem! 😊 Se quiser fazer uma reserva depois, é só chamar por aqui."
 MODELO_PADRAO: Final[str] = "llama-3.3-70b-versatile"
 MAX_HISTORICO_MENSAGENS: Final[int] = 12
 
@@ -124,6 +125,17 @@ def processar_mensagem(
             "confianca": 0.0,
         }
 
+    if _eh_recusa_reserva(mensagem_limpa):
+        logger.info("Cliente recusou convite de reserva. telefone=%s", telefone_limpo)
+        limpar_historico(telefone_limpo)
+        return {
+            "texto": MENSAGEM_RECUSA_RESERVA,
+            "reserva_confirmada": False,
+            "dados_reserva": {},
+            "status_reserva": "sem_interesse",
+            "confianca": 1.0,
+        }
+
     historico = _historicos.setdefault(telefone_limpo, [])
     historico.append({"role": "user", "content": mensagem_limpa})
     _limitar_historico(historico)
@@ -194,6 +206,16 @@ def aplicar_guardrails_reserva(
 
     if _nome_parece_valido(nome_cliente):
         estado["nome_cliente"] = nome_cliente.strip()
+
+    if _eh_recusa_reserva(mensagem_cliente):
+        _estados_reserva.pop(telefone_limpo, None)
+        return {
+            "texto": MENSAGEM_RECUSA_RESERVA,
+            "reserva_confirmada": False,
+            "dados_reserva": {},
+            "status_reserva": "sem_interesse",
+            "confianca": 1.0,
+        }
 
     if status_modelo == "cancelada" or _eh_cancelamento_cliente(mensagem_cliente):
         _estados_reserva.pop(telefone_limpo, None)
@@ -587,6 +609,46 @@ def _eh_confirmacao_cliente(texto: str) -> bool:
 def _eh_cancelamento_cliente(texto: str) -> bool:
     normalizado = _normalizar_busca(texto)
     return bool(re.search(r"\b(cancelar|cancela|desistir|nao quero mais)\b", normalizado))
+
+
+def _eh_recusa_reserva(texto: str) -> bool:
+    normalizado = _normalizar_busca(texto)
+    normalizado = re.sub(r"[^\w\s]", " ", normalizado)
+    normalizado = re.sub(r"\s+", " ", normalizado).strip()
+    if not normalizado:
+        return False
+
+    respostas_exatas = {
+        "n",
+        "nao",
+        "nao quero",
+        "agora nao",
+        "depois",
+        "mais tarde",
+        "obrigado nao",
+        "obrigada nao",
+        "nao obrigado",
+        "nao obrigada",
+        "nao tenho interesse",
+        "sem interesse",
+    }
+    if normalizado in respostas_exatas:
+        return True
+
+    return bool(
+        re.search(r"\b(?:agora|hoje|por enquanto)\s+nao\b", normalizado)
+        or re.search(r"\bnao\s+(?:quero|tenho interesse|vou querer|preciso)\b", normalizado)
+        or re.search(r"\bobrigad[ao]\s+nao\b", normalizado)
+    )
+
+
+def mensagem_indica_interesse_reserva(texto: str) -> bool:
+    normalizado = _normalizar_busca(texto)
+    return bool(
+        re.search(r"\b(quero|gostaria|queria|preciso|pode|vamos|bora)\s+(?:fazer\s+)?(?:uma\s+)?reserva(?:r)?\b", normalizado)
+        or re.search(r"\b(?:reservar|fazer reserva|mesa para|quero uma mesa)\b", normalizado)
+        or re.search(r"\b(mudei de ideia|pensando melhor|agora quero|reserva pra mim|reserva para mim)\b", normalizado)
+    )
 
 
 def _mensagem_indica_reserva(texto: str) -> bool:

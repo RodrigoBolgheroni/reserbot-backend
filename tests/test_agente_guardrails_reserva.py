@@ -21,6 +21,41 @@ class AgenteGuardrailsReservaTest(unittest.TestCase):
     def _mock_groq(self, payload: dict) -> str:
         return json.dumps(payload, ensure_ascii=False)
 
+    def test_recusa_convite_reserva_finaliza_sem_chamar_groq(self) -> None:
+        telefone = "5511999999999"
+        agente._estados_reserva[telefone] = {"campo_pendente": "data_reserva"}
+
+        with patch.dict(os.environ, {"GROQ_API_KEY": "teste"}), patch.object(agente, "_chamar_groq") as chamar_groq:
+            resposta = agente.processar_mensagem(telefone, "Não", nome_cliente="Rodrigo Teste")
+
+        self.assertFalse(resposta["reserva_confirmada"])
+        self.assertEqual(resposta["status_reserva"], "sem_interesse")
+        self.assertEqual(resposta["texto"], agente.MENSAGEM_RECUSA_RESERVA)
+        self.assertNotIn(telefone, agente._estados_reserva)
+        chamar_groq.assert_not_called()
+
+    def test_recusa_tem_prioridade_sobre_dados_do_modelo(self) -> None:
+        telefone = "5511999999999"
+        interpretacao = {
+            "texto": "Perfeito, para qual data voce quer fazer a reserva?",
+            "reserva_confirmada": False,
+            "dados_reserva": {"data_reserva": "2026-07-28", "horario": "20:00", "pessoas": 4},
+            "status_reserva": "em_coleta",
+            "confianca": 0.9,
+        }
+
+        resposta = agente.aplicar_guardrails_reserva(
+            telefone=telefone,
+            mensagem_cliente="Obrigado, não",
+            interpretacao=interpretacao,
+            nome_cliente="Rodrigo Teste",
+        )
+
+        self.assertFalse(resposta["reserva_confirmada"])
+        self.assertEqual(resposta["status_reserva"], "sem_interesse")
+        self.assertEqual(resposta["dados_reserva"], {})
+        self.assertNotIn(telefone, agente._estados_reserva)
+
     def test_sim_sem_horario_pergunta_horario_e_nao_confirma(self) -> None:
         telefone = "5511999999999"
         agente._estados_reserva[telefone] = {
