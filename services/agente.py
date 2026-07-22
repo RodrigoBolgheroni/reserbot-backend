@@ -205,6 +205,17 @@ def aplicar_guardrails_reserva(
             "confianca": interpretacao["confianca"],
         }
 
+    if _pergunta_data_disponivel(mensagem_cliente):
+        estado["aguardando_confirmacao"] = False
+        estado["campo_pendente"] = "data_reserva"
+        return {
+            "texto": "Consigo verificar a data que voce preferir. Me fala o dia que voce quer reservar.",
+            "reserva_confirmada": False,
+            "dados_reserva": _dados_reserva_do_estado(estado),
+            "status_reserva": "em_coleta",
+            "confianca": interpretacao["confianca"],
+        }
+
     if _deve_respeitar_nao_aplicavel(estado, mensagem_cliente, status_modelo):
         return {
             "texto": interpretacao["texto"],
@@ -224,6 +235,7 @@ def aplicar_guardrails_reserva(
             invalidos=invalidos,
         )
 
+    _remover_campos_invalidos_estado(estado, invalidos)
     if estado.get("campo_pendente") == "nome" and not confirmacao_cliente:
         nome_informado = _extrair_nome_cliente(mensagem_cliente)
         if nome_informado:
@@ -283,10 +295,11 @@ def dados_reserva_obrigatorios_ok(
 ) -> bool:
     nome = str(dados.get("nome_cliente") or nome_cliente or "").strip()
     telefone_limpo = str(telefone or "").strip()
+    pessoas = _pessoas_json(dados.get("pessoas"))
     return bool(
-        dados.get("data_reserva")
-        and dados.get("horario")
-        and dados.get("pessoas")
+        _data_reserva_valida(str(dados.get("data_reserva") or ""))
+        and _horario_reserva_valido(str(dados.get("horario") or ""))
+        and pessoas is not None
         and nome
         and telefone_limpo
     )
@@ -388,14 +401,17 @@ def _atualizar_estado_reserva(
     if horario_usuario and not _horario_reserva_valido(horario_usuario):
         invalidos.add("horario")
 
+    if _mensagem_tem_sinal_data(mensagem_cliente) and not dados_usuario.get("data_reserva"):
+        invalidos.add("data_reserva")
+
     if _pode_aceitar_dado_modelo("data_reserva", mensagem_cliente, estado):
-        _definir_data_estado(estado, dados_modelo.get("data_reserva"))
+        _definir_data_estado(estado, dados_modelo.get("data_reserva"), invalidos=invalidos)
     if _pode_aceitar_dado_modelo("horario", mensagem_cliente, estado):
         _definir_horario_estado(estado, dados_modelo.get("horario"), invalidos=invalidos)
     if _pode_aceitar_dado_modelo("pessoas", mensagem_cliente, estado):
         _definir_pessoas_estado(estado, dados_modelo.get("pessoas"), invalidos=invalidos)
 
-    _definir_data_estado(estado, dados_usuario.get("data_reserva"))
+    _definir_data_estado(estado, dados_usuario.get("data_reserva"), invalidos=invalidos)
     _definir_horario_estado(estado, dados_usuario.get("horario"), invalidos=invalidos)
     _definir_pessoas_estado(estado, dados_usuario.get("pessoas"), invalidos=invalidos)
 
@@ -404,9 +420,30 @@ def _atualizar_estado_reserva(
         estado["observacoes"] = observacoes
 
 
-def _definir_data_estado(estado: EstadoReserva, valor: Any) -> None:
-    if isinstance(valor, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", valor.strip()):
-        estado["data_reserva"] = valor.strip()
+def _definir_data_estado(estado: EstadoReserva, valor: Any, *, invalidos: set[str]) -> None:
+    if not isinstance(valor, str) or not valor.strip():
+        return
+    data_texto = valor.strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", data_texto):
+        return
+    if not _data_reserva_valida(data_texto):
+        invalidos.add("data_reserva")
+        return
+    estado["data_reserva"] = data_texto
+
+
+def _remover_campos_invalidos_estado(estado: EstadoReserva, invalidos: set[str]) -> None:
+    data_estado = str(estado.get("data_reserva") or "")
+    if data_estado and not _data_reserva_valida(data_estado):
+        estado.pop("data_reserva", None)
+        invalidos.add("data_reserva")
+    horario_estado = str(estado.get("horario") or "")
+    if horario_estado and not _horario_reserva_valido(horario_estado):
+        estado.pop("horario", None)
+        invalidos.add("horario")
+    if estado.get("pessoas") and _pessoas_json(estado.get("pessoas")) is None:
+        estado.pop("pessoas", None)
+        invalidos.add("pessoas")
 
 
 def _definir_horario_estado(estado: EstadoReserva, valor: Any, *, invalidos: set[str]) -> None:
@@ -456,11 +493,11 @@ def _deve_respeitar_nao_aplicavel(estado: EstadoReserva, mensagem_cliente: str, 
 
 def _campos_obrigatorios_faltantes(estado: EstadoReserva, telefone: str) -> list[str]:
     faltantes: list[str] = []
-    if not estado.get("data_reserva"):
+    if not _data_reserva_valida(str(estado.get("data_reserva") or "")):
         faltantes.append("data_reserva")
-    if not estado.get("horario"):
+    if not _horario_reserva_valido(str(estado.get("horario") or "")):
         faltantes.append("horario")
-    if not estado.get("pessoas"):
+    if _pessoas_json(estado.get("pessoas")) is None:
         faltantes.append("pessoas")
     if not estado.get("nome_cliente"):
         faltantes.append("nome_cliente")
@@ -490,6 +527,8 @@ def _primeiro_campo_pendente(invalidos: list[str], estado: EstadoReserva, telefo
 
 
 def _mensagem_campo_invalido(campo: str, estado: EstadoReserva, telefone: str) -> str:
+    if campo == "data_reserva":
+        return "Essa data já passou. Me fala uma data a partir de hoje para eu verificar a reserva."
     if campo == "horario":
         return "Esse horario nao esta disponivel. Qual horario voce prefere?"
     if campo == "pessoas":
@@ -553,11 +592,20 @@ def _eh_cancelamento_cliente(texto: str) -> bool:
 def _mensagem_indica_reserva(texto: str) -> bool:
     normalizado = _normalizar_busca(texto)
     return bool(
-        re.search(r"\b(reserva|reservar|mesa|pessoas|pessoa|convidados|lugares|horario|dia|confirmar)\b", normalizado)
+        re.search(r"\b(reserva|reservar|mesa|pessoas|pessoa|convidados|lugares|horario|dia|data|disponivel|disponibilidade|confirmar)\b", normalizado)
         or _eh_confirmacao_cliente(texto)
         or _mensagem_tem_sinal_data(texto)
         or _mensagem_tem_sinal_horario(texto)
         or _mensagem_tem_sinal_pessoas(texto)
+    )
+
+
+def _pergunta_data_disponivel(texto: str) -> bool:
+    normalizado = _normalizar_busca(texto)
+    return bool(
+        re.search(r"\bqual(?:\s+\w+){0,4}\s+(?:data|dia)(?:\s+\w+){0,4}\s+disponivel\b", normalizado)
+        or re.search(r"\b(?:data|dia)(?:\s+\w+){0,4}\s+disponivel\b", normalizado)
+        or re.search(r"\btem(?:\s+\w+){0,4}\s+(?:data|dia)(?:\s+\w+){0,4}\s+disponivel\b", normalizado)
     )
 
 
@@ -610,6 +658,14 @@ def _normalizar_busca(texto: str) -> str:
     return "".join(char for char in texto_normalizado if unicodedata.category(char) != "Mn").strip()
 
 
+def _data_reserva_valida(valor: str) -> bool:
+    try:
+        data_reserva = date.fromisoformat(str(valor or "")[:10])
+    except ValueError:
+        return False
+    return data_reserva >= _hoje()
+
+
 def _horario_reserva_valido(horario: str) -> bool:
     if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", horario):
         return False
@@ -628,6 +684,10 @@ def _horario_para_minutos(horario: str) -> int | None:
     if not match:
         return None
     return int(match.group(1)) * 60 + int(match.group(2))
+
+
+def _hoje() -> date:
+    return date.today()
 
 
 def _resposta_contingencia() -> str:
@@ -661,7 +721,7 @@ def _chamar_groq(mensagens: Sequence[Mensagem], modelo: str) -> str:
 
 def _mensagem_sistema(nome_cliente: str, *, perfil_cliente: Mapping[str, Any] | None = None) -> Mensagem:
     restaurante = os.getenv("NOME_RESTAURANTE", "o restaurante").strip()
-    hoje = date.today().strftime("%d/%m/%Y")
+    hoje = _hoje().strftime("%d/%m/%Y")
     nome = nome_cliente.strip() or "cliente"
     perfil_nome = str((perfil_cliente or {}).get("nome") or "").strip()
     perfil_prompt = str((perfil_cliente or {}).get("prompt_ia") or "").strip()
@@ -773,7 +833,11 @@ def _pessoas_json(valor: Any) -> int | None:
 
 
 def _dados_reserva_minimos(dados: DadosReserva) -> bool:
-    return bool(dados.get("data_reserva") and dados.get("horario") and dados.get("pessoas"))
+    return dados_reserva_obrigatorios_ok(
+        dados,
+        nome_cliente=str(dados.get("nome_cliente") or "cliente"),
+        telefone="telefone",
+    )
 
 
 def _confianca(valor: Any) -> float:
@@ -803,7 +867,7 @@ def _extrair_data(texto: str) -> str | None:
         dia = int(match.group(1))
         mes = int(match.group(2))
         ano_raw = match.group(3)
-        ano = date.today().year
+        ano = _hoje().year
         if ano_raw:
             ano = int(ano_raw)
             if ano < 100:
@@ -813,7 +877,7 @@ def _extrair_data(texto: str) -> str | None:
 
     match_dia = re.search(r"\bdia\s+(\d{1,2})\b", texto, flags=re.IGNORECASE)
     if match_dia:
-        hoje = date.today()
+        hoje = _hoje()
         dia = int(match_dia.group(1))
         return _formatar_data_futura(dia, hoje.month, hoje.year)
 
@@ -822,7 +886,7 @@ def _extrair_data(texto: str) -> str | None:
 
 def _extrair_data_relativa(texto: str) -> str | None:
     texto_normalizado = _normalizar_busca(texto)
-    hoje = date.today()
+    hoje = _hoje()
 
     if re.search(r"\bhoje\b", texto_normalizado):
         return hoje.isoformat()
@@ -848,7 +912,7 @@ def _extrair_data_mes_extenso(texto: str) -> str | None:
     if mes is None:
         return None
 
-    return _formatar_data_futura(dia, mes, date.today().year)
+    return _formatar_data_futura(dia, mes, _hoje().year)
 
 
 def _formatar_data_futura(dia: int, mes: int, ano: int) -> str | None:
@@ -857,12 +921,8 @@ def _formatar_data_futura(dia: int, mes: int, ano: int) -> str | None:
     except ValueError:
         return None
 
-    hoje = date.today()
-    if data_reserva < hoje and ano == hoje.year:
-        try:
-            data_reserva = date(ano + 1, mes, dia)
-        except ValueError:
-            return None
+    if data_reserva < _hoje():
+        return None
 
     return data_reserva.isoformat()
 

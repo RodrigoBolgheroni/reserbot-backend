@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import unittest
+from datetime import date
 from unittest.mock import patch
 
 from services import agente, fluxo_reservas
@@ -46,6 +47,84 @@ class AgenteGuardrailsReservaTest(unittest.TestCase):
         self.assertEqual(resposta["status_reserva"], "em_coleta")
         self.assertNotIn("horario", resposta["dados_reserva"])
         self.assertIn("falta o horario", agente._normalizar_busca(resposta["texto"]))
+
+    def test_data_passada_rejeitada_e_nao_entra_no_estado(self) -> None:
+        telefone = "5511999999999"
+        payload = {
+            "resposta_cliente": "Perfeito, tenho a data. Qual horario voce prefere?",
+            "reserva": {
+                "status": "em_coleta",
+                "data_reserva": "2026-07-21",
+                "horario": None,
+                "pessoas": None,
+            },
+            "confianca": 0.9,
+        }
+
+        with (
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 22)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste"}),
+            patch.object(agente, "_chamar_groq", return_value=self._mock_groq(payload)),
+        ):
+            resposta = agente.processar_mensagem(telefone, "dia 21/07", nome_cliente="Rodrigo Teste")
+
+        self.assertFalse(resposta["reserva_confirmada"])
+        self.assertNotIn("data_reserva", agente._estados_reserva[telefone])
+        self.assertIn("essa data ja passou", agente._normalizar_busca(resposta["texto"]))
+
+    def test_dia_mes_passado_nao_e_assumido_como_proximo_ano(self) -> None:
+        with patch.object(agente, "_hoje", return_value=date(2026, 7, 22)):
+            self.assertIsNone(agente._extrair_data("dia 21/07"))
+            self.assertEqual(agente._extrair_data("dia 23/07"), "2026-07-23")
+
+    def test_pergunta_qual_data_tem_disponivel_pede_preferencia(self) -> None:
+        telefone = "5511999999999"
+        payload = {
+            "resposta_cliente": "Temos algumas datas disponiveis.",
+            "reserva": {"status": "nao_aplicavel"},
+            "confianca": 0.5,
+        }
+
+        with patch.dict(os.environ, {"GROQ_API_KEY": "teste"}), patch.object(agente, "_chamar_groq", return_value=self._mock_groq(payload)):
+            resposta = agente.processar_mensagem(telefone, "Qual data tem disponivel?", nome_cliente="Rodrigo Teste")
+
+        self.assertFalse(resposta["reserva_confirmada"])
+        self.assertEqual(
+            resposta["texto"],
+            "Consigo verificar a data que voce preferir. Me fala o dia que voce quer reservar.",
+        )
+
+    def test_nao_confirma_estado_com_data_passada(self) -> None:
+        telefone = "5511999999999"
+        agente._estados_reserva[telefone] = {
+            "data_reserva": "2026-07-21",
+            "horario": "12:00",
+            "pessoas": 10,
+            "nome_cliente": "Rodrigo Teste",
+            "aguardando_confirmacao": True,
+            "campo_pendente": "confirmacao",
+        }
+        payload = {
+            "resposta_cliente": "Reserva confirmada.",
+            "reserva": {
+                "status": "confirmada",
+                "data_reserva": "2026-07-21",
+                "horario": "12:00",
+                "pessoas": 10,
+            },
+            "confianca": 1,
+        }
+
+        with (
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 22)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste"}),
+            patch.object(agente, "_chamar_groq", return_value=self._mock_groq(payload)),
+        ):
+            resposta = agente.processar_mensagem(telefone, "Sim", nome_cliente="Rodrigo Teste")
+
+        self.assertFalse(resposta["reserva_confirmada"])
+        self.assertNotIn("data_reserva", agente._estados_reserva[telefone])
+        self.assertIn("essa data ja passou", agente._normalizar_busca(resposta["texto"]))
 
     def test_horario_invalido_nao_entra_no_estado(self) -> None:
         telefone = "5511999999999"
@@ -139,6 +218,20 @@ class AgenteGuardrailsReservaTest(unittest.TestCase):
             conversa={"id": "conversa-1"},
             dados_reserva={"data_reserva": "2026-07-28", "pessoas": 10},
         )
+
+        self.assertFalse(resultado)
+        inserir_supabase.assert_not_called()
+        adicionar_local.assert_not_called()
+
+    @patch.object(fluxo_reservas.supabase, "inserir")
+    @patch.object(fluxo_reservas.dados, "adicionar_reserva")
+    def test_fluxo_nao_salva_reserva_com_data_passada(self, adicionar_local, inserir_supabase) -> None:
+        with patch.object(agente, "_hoje", return_value=date(2026, 7, 22)):
+            resultado = fluxo_reservas.registrar_reserva_confirmada(
+                cliente={"id": "cliente-1", "telefone": "5511999999999", "nome": "Rodrigo Teste"},
+                conversa={"id": "conversa-1"},
+                dados_reserva={"data_reserva": "2026-07-21", "horario": "12:00", "pessoas": 10},
+            )
 
         self.assertFalse(resultado)
         inserir_supabase.assert_not_called()
