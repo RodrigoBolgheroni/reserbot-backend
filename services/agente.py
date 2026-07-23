@@ -254,6 +254,14 @@ def _processar_mensagem_sem_lock(
             "confianca": 0.0,
         }
 
+    estado_antes = _serializar_estado_reserva(_estados_reserva.get(telefone_limpo, {}))
+    logger.info(
+        "DIAG_RESERVA mensagem_recebida telefone=%s texto_bruto=%r estado_antes=%s",
+        telefone_limpo,
+        mensagem_limpa,
+        json.dumps(estado_antes, ensure_ascii=False, sort_keys=True),
+    )
+
     if _eh_recusa_reserva(mensagem_limpa):
         logger.info("Cliente recusou convite de reserva. telefone=%s", telefone_limpo)
         limpar_historico(telefone_limpo)
@@ -274,21 +282,36 @@ def _processar_mensagem_sem_lock(
         texto_modelo = _resposta_contingencia()
     else:
         try:
+            mensagens_groq = [
+                _mensagem_sistema(nome_cliente, perfil_cliente=perfil_cliente),
+                _mensagem_contexto_reserva(telefone_limpo),
+                *historico,
+            ]
+            logger.info(
+                "DIAG_RESERVA historico_enviado_ia telefone=%s mensagens=%s",
+                telefone_limpo,
+                json.dumps(mensagens_groq, ensure_ascii=False),
+            )
             texto_modelo = _chamar_groq(
-                mensagens=[
-                    _mensagem_sistema(nome_cliente, perfil_cliente=perfil_cliente),
-                    _mensagem_contexto_reserva(telefone_limpo),
-                    *historico,
-                ],
+                mensagens=mensagens_groq,
                 modelo=os.getenv("GROQ_MODEL", MODELO_PADRAO),
             )
         except Exception:
             logger.exception("Falha ao processar mensagem com Groq.")
             texto_modelo = _resposta_contingencia()
+    logger.info("DIAG_RESERVA json_bruto_ia telefone=%s resposta=%s", telefone_limpo, texto_modelo)
 
     interpretacao = interpretar_resposta_modelo(
         texto_modelo=texto_modelo,
         mensagem_cliente=mensagem_limpa,
+    )
+    logger.info(
+        "DIAG_RESERVA interpretacao_ia telefone=%s intencao=%s dados_confirmados=%s dados_mencionados=%s correcoes=%s",
+        telefone_limpo,
+        interpretacao.get("intencao", ""),
+        json.dumps(interpretacao.get("dados_confirmados", {}), ensure_ascii=False, sort_keys=True),
+        json.dumps(interpretacao.get("dados_mencionados", {}), ensure_ascii=False, sort_keys=True),
+        json.dumps(interpretacao.get("correcoes", {}), ensure_ascii=False, sort_keys=True),
     )
     resposta_segura = aplicar_guardrails_reserva(
         telefone=telefone_limpo,
@@ -306,6 +329,15 @@ def _processar_mensagem_sem_lock(
 
     if reserva_confirmada:
         limpar_historico(telefone_limpo)
+
+    estado_depois = _serializar_estado_reserva(_estados_reserva.get(telefone_limpo, {}))
+    logger.info(
+        "DIAG_RESERVA resposta_final telefone=%s texto=%r status=%s estado_depois=%s",
+        telefone_limpo,
+        texto_cliente,
+        resposta_segura["status_reserva"],
+        json.dumps(estado_depois, ensure_ascii=False, sort_keys=True),
+    )
 
     return {
         "texto": texto_cliente,
@@ -480,6 +512,7 @@ def aplicar_guardrails_reserva(
         estado["nome_cliente"] = nome_cliente.strip()
 
     _atualizar_contexto_conversacional_estado(estado, interpretacao)
+    data_clara_promovivel = _mensagem_tem_data_clara_promovivel(mensagem_cliente, estado, interpretacao)
 
     intencao_conversacional = _intencao_conversacional(mensagem_cliente)
     categoria_pergunta_restaurante = _categoria_pergunta_restaurante(mensagem_cliente)
@@ -489,6 +522,7 @@ def aplicar_guardrails_reserva(
         not intencao_conversacional
         and intencao_modelo in INTENCOES_CONVERSACIONAIS_IA
         and not _interpretacao_tem_dados_reserva(interpretacao)
+        and not data_clara_promovivel
     ):
         intencao_conversacional = intencao_modelo
 
@@ -633,6 +667,12 @@ def aplicar_guardrails_reserva(
         campo = _primeiro_campo_pendente(list(invalidos), estado, telefone_limpo)
         _definir_campo_pendente(estado, campo)
         texto = _mensagem_validacao_falhou(campo, estado, telefone_limpo, interpretacao, mensagem_cliente=mensagem_cliente)
+        logger.info(
+            "DIAG_RESERVA resposta_sobrescrita motivo=validacao_invalida campo=%s texto_ia=%r texto_final=%r",
+            campo,
+            interpretacao["texto"],
+            texto,
+        )
         status_reserva = "aguardando_humano" if _deve_encaminhar_humano_por_tentativas(estado, campo) else "em_coleta"
         return {
             "texto": texto,
@@ -648,6 +688,13 @@ def aplicar_guardrails_reserva(
         texto = _texto_modelo_para_pedir_campo(interpretacao["texto"], campo, estado, mensagem_cliente)
         if not texto:
             texto = _mensagem_pedir_campo(campo, estado)
+            logger.info(
+                "DIAG_RESERVA resposta_sobrescrita motivo=modelo_nao_retomou_campo_necessario campo=%s texto_ia=%r texto_final=%r faltantes=%s",
+                campo,
+                interpretacao["texto"],
+                texto,
+                faltantes,
+            )
         status_reserva = "aguardando_humano" if _deve_encaminhar_humano_por_tentativas(estado, campo) else "em_coleta"
         return {
             "texto": texto,
@@ -966,6 +1013,26 @@ def _atualizar_estado_reserva(
     dados_modelo_confirmados.update(correcoes_confirmadas)
     contrato_novo = bool(interpretacao.get("contrato_novo"))
     usar_fallback_extracao = deve_avancar and not mensagem_eh_conversa and (not dados_modelo_confirmados or not contrato_novo)
+    data_parser = _extrair_data(
+        mensagem_cliente,
+        permitir_dia_isolado=campo_pendente == "data_reserva" or not estado.get("data_reserva"),
+    )
+    logger.info(
+        "DIAG_RESERVA parser_data texto=%r campo_pendente=%s resultado=%s deve_avancar=%s contrato_novo=%s mensagem_eh_conversa=%s",
+        mensagem_cliente,
+        campo_pendente,
+        data_parser,
+        deve_avancar,
+        contrato_novo,
+        mensagem_eh_conversa,
+    )
+    data_promovida = _deve_promover_data_clara(mensagem_cliente, data_parser, estado, interpretacao)
+    if data_promovida:
+        dados_modelo_confirmados["data_reserva"] = data_parser  # type: ignore[typeddict-item]
+        logger.info(
+            "DIAG_RESERVA dados_confirmados_promovidos campo=data_reserva valor=%s motivo=data_clara_sem_data_no_estado",
+            data_parser,
+        )
     dados_usuario = (
         _extrair_dados_reserva_contextual(
             mensagem_cliente,
@@ -1007,7 +1074,7 @@ def _atualizar_estado_reserva(
     ):
         invalidos.add("data_reserva")
 
-    if _pode_aplicar_dado_confirmado("data_reserva", estado, interpretacao, mensagem_cliente):
+    if data_promovida or _pode_aplicar_dado_confirmado("data_reserva", estado, interpretacao, mensagem_cliente):
         _definir_data_estado(
             estado,
             dados_modelo_confirmados.get("data_reserva"),
@@ -1055,9 +1122,16 @@ def _definir_data_estado(
         return
     data_texto = valor.strip()
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", data_texto):
+        logger.info("DIAG_RESERVA validacao_data valor=%r valido=false motivo=formato_invalido fonte=%s", valor, fonte)
         return
     if not _data_reserva_valida(data_texto):
         invalidos.add("data_reserva")
+        logger.info(
+            "DIAG_RESERVA validacao_data valor=%s valido=false motivo=data_passada_ou_invalida hoje=%s fonte=%s",
+            data_texto,
+            _hoje().isoformat(),
+            fonte,
+        )
         logger.info(
             "Data de reserva rejeitada: original=%r interpretada=%s salva=%s fonte=%s.",
             valor_original,
@@ -1068,6 +1142,12 @@ def _definir_data_estado(
         return
     data_anterior = str(estado.get("data_reserva") or "")
     if data_anterior and data_anterior != data_texto and not permitir_sobrescrever:
+        logger.info(
+            "DIAG_RESERVA validacao_data valor=%s valido=true aplicada=false motivo=nao_sobrescrever data_anterior=%s fonte=%s",
+            data_texto,
+            data_anterior,
+            fonte,
+        )
         logger.info(
             "Data de reserva mantida sem alteracao: original=%r interpretada=%s salva=%s fonte=%s.",
             valor_original,
@@ -1080,6 +1160,7 @@ def _definir_data_estado(
     if valor_original:
         estado["data_reserva_original"] = valor_original.strip()
     _limpar_tentativas_campo(estado, "data_reserva")
+    logger.info("DIAG_RESERVA validacao_data valor=%s valido=true aplicada=true fonte=%s", data_texto, fonte)
     logger.info(
         "Data de reserva registrada: original=%r interpretada=%s salva=%s fonte=%s.",
         valor_original,
@@ -1214,6 +1295,45 @@ def _pode_aplicar_dado_confirmado(
     if bool(interpretacao.get("deve_avancar_estado")):
         return True
     return campo == campo_aguardado and _normalizar_intencao_ia(str(interpretacao.get("intencao") or "")) == "fornecimento_dados"
+
+
+def _deve_promover_data_clara(
+    mensagem_cliente: str,
+    data_parser: str | None,
+    estado: Mapping[str, Any],
+    interpretacao: Mapping[str, Any],
+) -> bool:
+    if not data_parser or estado.get("data_reserva"):
+        return False
+    dados_confirmados = interpretacao.get("dados_confirmados")
+    if isinstance(dados_confirmados, Mapping) and any(dados_confirmados.get(chave) for chave in ("data", "data_reserva", "dia")):
+        return False
+    if not _data_reserva_valida(data_parser):
+        logger.info("DIAG_RESERVA validacao_data_promovida valor=%s valido=false motivo=data_passada_ou_invalida", data_parser)
+        return False
+    normalizado = _normalizar_busca(mensagem_cliente)
+    if _pergunta_data_disponivel(mensagem_cliente) or (
+        "?" in mensagem_cliente and re.search(r"\b(qual|quais|tem|disponivel|disponiveis)\b", normalizado)
+    ):
+        return False
+    if not _mensagem_tem_sinal_data(mensagem_cliente):
+        return False
+    campo = _campo_aguardado(estado)
+    if campo and campo not in {"data_reserva", "confirmacao"}:
+        return False
+    return True
+
+
+def _mensagem_tem_data_clara_promovivel(
+    mensagem_cliente: str,
+    estado: Mapping[str, Any],
+    interpretacao: Mapping[str, Any],
+) -> bool:
+    data_parser = _extrair_data(
+        mensagem_cliente,
+        permitir_dia_isolado=_campo_aguardado(estado) == "data_reserva" or not estado.get("data_reserva"),
+    )
+    return _deve_promover_data_clara(mensagem_cliente, data_parser, estado, interpretacao)
 
 
 def _pode_aceitar_dado_modelo(

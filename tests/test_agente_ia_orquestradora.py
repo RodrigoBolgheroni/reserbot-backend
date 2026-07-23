@@ -321,6 +321,119 @@ class AgenteIAOrquestradoraTest(unittest.TestCase):
         self.assertEqual(resposta["texto"], payload["resposta"])
         self.assertNotIn("me manda so", agente._normalizar_busca(resposta["texto"]))
 
+    def test_incidente_real_data_repetida_nao_e_perdida(self) -> None:
+        telefone = "5511990010030"
+        payloads = [
+            {
+                "resposta": "Sem problema. Quando decidir, me chama por aqui que eu continuo a reserva com voce.",
+                "intencao": "comentario",
+                "dados_confirmados": {},
+                "dados_mencionados": {},
+                "acao": "responder",
+                "deve_avancar_estado": False,
+                "campo_sugerido": "data",
+                "confianca": 0.9,
+            },
+            {
+                "resposta": "Certo, para qual data você quer fazer a reserva?",
+                "intencao": "comentario",
+                "dados_confirmados": {},
+                "dados_mencionados": {"data": "2026-07-30"},
+                "acao": "responder",
+                "deve_avancar_estado": False,
+                "campo_sugerido": "data",
+                "confianca": 0.8,
+            },
+            {
+                "resposta": "Desculpa, tenho o dia 30/07 anotado. Qual horário você prefere?",
+                "intencao": "comentario",
+                "dados_confirmados": {},
+                "dados_mencionados": {},
+                "acao": "responder",
+                "deve_avancar_estado": False,
+                "campo_sugerido": "horario",
+                "confianca": 0.9,
+            },
+            {
+                "resposta": "Sim, dia 30/07 está anotado. Agora só falta o horário.",
+                "intencao": "comentario",
+                "dados_confirmados": {},
+                "dados_mencionados": {"data": "2026-07-30"},
+                "acao": "responder",
+                "deve_avancar_estado": False,
+                "campo_sugerido": "horario",
+                "confianca": 0.9,
+            },
+            {
+                "resposta": "Dia 30/07 continua anotado. Qual horário fica melhor?",
+                "intencao": "comentario",
+                "dados_confirmados": {},
+                "dados_mencionados": {"data": "2026-07-30"},
+                "acao": "responder",
+                "deve_avancar_estado": False,
+                "campo_sugerido": "horario",
+                "confianca": 0.9,
+            },
+        ]
+
+        respostas_modelo = [self._json(payload) for payload in payloads]
+        mensagens = [
+            "Quero reservar, mas ainda estou vendo com o pessoal",
+            "Acho que dia 30/07 é bom",
+            "Ja falei",
+            "Acho que dia 30/07",
+            "30/07",
+        ]
+        respostas: list[agente.RespostaAgente] = []
+
+        with (
+            self.assertLogs("services.agente", level="INFO") as logs,
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 22)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste", "RESERVA_HORARIO_INICIO": "10:00", "RESERVA_HORARIO_FIM": "23:59"}),
+            patch.object(agente, "_chamar_groq", side_effect=respostas_modelo),
+        ):
+            for mensagem in mensagens:
+                respostas.append(agente.processar_mensagem(telefone, mensagem, nome_cliente="Rodrigo Teste"))
+
+        estado_apos_segunda = respostas[1]["dados_reserva"]
+        texto_apos_segunda = agente._normalizar_busca(respostas[1]["texto"])
+        self.assertEqual(estado_apos_segunda["data_reserva"], "2026-07-30")
+        self.assertEqual(agente._estados_reserva[telefone]["data_reserva"], "2026-07-30")
+        self.assertEqual(agente._estados_reserva[telefone]["campo_pendente"], "horario")
+        self.assertIn("horario", texto_apos_segunda)
+        self.assertNotIn("qual data", texto_apos_segunda)
+        self.assertNotIn("algum dia", texto_apos_segunda)
+        self.assertNotIn("formato dia", agente._normalizar_busca(" ".join(resposta["texto"] for resposta in respostas)))
+        self.assertTrue(any("dados_confirmados_promovidos campo=data_reserva valor=2026-07-30" in linha for linha in logs.output))
+
+    def test_parser_data_aceita_frases_obvias(self) -> None:
+        with patch.object(agente, "_hoje", return_value=date(2026, 7, 22)):
+            self.assertEqual(agente._extrair_data("dia 30/07", permitir_dia_isolado=True), "2026-07-30")
+            self.assertEqual(agente._extrair_data("acho que dia 30/07", permitir_dia_isolado=True), "2026-07-30")
+            self.assertEqual(agente._extrair_data("30/07 é bom", permitir_dia_isolado=True), "2026-07-30")
+            self.assertEqual(agente._extrair_data("pode ser 30/07", permitir_dia_isolado=True), "2026-07-30")
+            self.assertEqual(agente._extrair_data("talvez 30/07", permitir_dia_isolado=True), "2026-07-30")
+            self.assertEqual(agente._extrair_data("dia 30", permitir_dia_isolado=True), "2026-07-30")
+
+    def test_ia_informar_data_confirmada_e_salva_sem_regex(self) -> None:
+        telefone = "5511990010031"
+        agente._estados_reserva[telefone] = {"campo_pendente": "data_reserva", "etapa": "aguardando_data"}
+        payload = {
+            "resposta": "Perfeito, dia 30/07. Qual horário fica melhor?",
+            "intencao": "informar_data",
+            "dados_confirmados": {"data": "2026-07-30"},
+            "dados_mencionados": {},
+            "correcoes": {},
+            "acao": "continuar_conversa",
+            "campo_sugerido": "horario",
+            "confianca": 0.95,
+        }
+
+        resposta = self._processar(telefone, "isso", payload)
+
+        self.assertEqual(resposta["dados_reserva"]["data_reserva"], "2026-07-30")
+        self.assertEqual(agente._estados_reserva[telefone]["campo_pendente"], "horario")
+
 
 if __name__ == "__main__":
     unittest.main()

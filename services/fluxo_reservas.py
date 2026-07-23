@@ -353,6 +353,13 @@ def _carregar_estado_reserva_conversa(conversa: Mapping[str, Any], telefone: str
     metadata = _metadata_conversa(conversa)
     estado = metadata.get("estado_reserva")
     conversa_id = str(conversa.get("id") or "")
+    logger.info(
+        "DIAG_RESERVA estado_carregado_antes telefone=%s conversa_id=%s metadata_estado=%s cache_memoria=%s",
+        telefone,
+        conversa_id,
+        estado if isinstance(estado, Mapping) else {},
+        agente.obter_estado_reserva(telefone),
+    )
     if isinstance(estado, Mapping):
         agente.definir_estado_reserva(telefone, {**dict(estado), "conversa_id": conversa_id})
         logger.info("Estado de reserva carregado da conversa %s para telefone=%s.", conversa_id, telefone)
@@ -377,6 +384,13 @@ def _salvar_estado_reserva_conversa(
     metadata["estado_reserva"] = estado
     metadata["dados_reserva"] = dict(resposta.get("dados_reserva") or {})
     metadata["status_reserva"] = resposta.get("status_reserva", "")
+    logger.info(
+        "DIAG_RESERVA estado_salvo_depois telefone=%s conversa_id=%s estado=%s status_reserva=%s",
+        telefone,
+        conversa.get("id", ""),
+        estado,
+        resposta.get("status_reserva", ""),
+    )
     _atualizar_metadata_conversa(conversa, metadata)
 
 
@@ -516,6 +530,13 @@ def processar_mensagem_webhook(mensagem: MensagemRecebida) -> ResultadoWebhook:
         }
 
     conversa = buscar_conversa_ativa_por_telefone(telefone)
+    logger.info(
+        "DIAG_RESERVA webhook_mensagem_vinculo telefone=%s provider_message_id=%s conversa_ativa_id=%s conversa_status=%s",
+        telefone,
+        mensagem.get("provider_message_id", ""),
+        (conversa or {}).get("id", ""),
+        (conversa or {}).get("status", ""),
+    )
     raw = mensagem.get("raw") if isinstance(mensagem.get("raw"), Mapping) else {}
     metadata = {
         "provider": "cloud",
@@ -722,6 +743,14 @@ def buscar_conversa_por_telefone(telefone: str, *, statuses: set[str] | None = N
     conversas = [item for item in dados if isinstance(item, dict)]
     if not conversas:
         return None
+    if statuses and len(conversas) > 1:
+        logger.warning(
+            "DIAG_RESERVA multiplas_conversas_ativas telefone=%s total=%s ids=%s statuses=%s",
+            telefone_limpo,
+            len(conversas),
+            [item.get("id") for item in conversas],
+            sorted(statuses),
+        )
 
     return dict(max(conversas, key=lambda item: str(item.get("data_inicio") or "")))
 
