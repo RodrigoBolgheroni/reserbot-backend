@@ -24,10 +24,14 @@ class FluxoCoexistenciaTest(unittest.TestCase):
         }
         fluxo_reservas.agente._historicos.clear()
         fluxo_reservas.agente._estados_reserva.clear()
+        fluxo_reservas._debounce_lotes.clear()
+        fluxo_reservas._provider_ids_pendentes.clear()
 
     def tearDown(self) -> None:
         fluxo_reservas.agente._historicos.clear()
         fluxo_reservas.agente._estados_reserva.clear()
+        fluxo_reservas._debounce_lotes.clear()
+        fluxo_reservas._provider_ids_pendentes.clear()
 
     @patch.object(fluxo_reservas, "_mensagem_ja_processada", return_value=False)
     @patch.object(fluxo_reservas, "registrar_mensagem")
@@ -373,6 +377,122 @@ class FluxoCoexistenciaTest(unittest.TestCase):
         self.assertEqual(chamada["mensagem_cliente"], "Olá\nQuero sim")
         self.assertEqual(chamada["provider_message_id"], "wamid.ola")
         self.assertEqual(len(chamada["metadata_mensagem"]["mensagens_agrupadas"]), 2)
+
+    @patch.object(fluxo_reservas, "_mensagem_ja_processada", return_value=False)
+    @patch.object(fluxo_reservas, "registrar_mensagem")
+    @patch.object(fluxo_reservas, "buscar_conversa_por_telefone")
+    @patch.object(fluxo_reservas, "buscar_conversa_ativa_por_telefone")
+    @patch.object(fluxo_reservas, "processar_resposta_cliente")
+    def test_debounce_em_webhooks_separados_gera_uma_chamada_ao_agente(
+        self,
+        processar,
+        buscar_ativa,
+        buscar_por_telefone,
+        registrar,
+        _ja_processada,
+    ) -> None:
+        class TimerFake:
+            def __init__(self, intervalo, funcao, args=()):
+                self.funcao = funcao
+                self.args = args
+                self.cancelado = False
+
+            def start(self):
+                return None
+
+            def cancel(self):
+                self.cancelado = True
+
+        conversa = {"id": "conv-1", "status": "bot_ativo", "cliente_telefone": "5511999999999"}
+        buscar_ativa.return_value = conversa
+        buscar_por_telefone.return_value = conversa
+        processar.return_value = {
+            "texto": "Claro, qual dia voce prefere?",
+            "reserva_confirmada": False,
+            "dados_reserva": {},
+            "status_reserva": "em_coleta",
+            "confianca": 0.9,
+        }
+
+        with (
+            patch.dict(os.environ, {"WHATSAPP_DEBOUNCE_SECONDS": "3"}),
+            patch.object(fluxo_reservas.threading, "Timer", TimerFake),
+        ):
+            primeira = fluxo_reservas.processar_mensagem_webhook(
+                {
+                    "telefone": "5511999999999",
+                    "texto": "Ola",
+                    "remetente": "Rodrigo",
+                    "timestamp": "2026-07-22T20:00:00+00:00",
+                    "provider_message_id": "wamid.ola",
+                }
+            )
+            segunda = fluxo_reservas.processar_mensagem_webhook(
+                {
+                    "telefone": "5511999999999",
+                    "texto": "Quero sim",
+                    "remetente": "Rodrigo",
+                    "timestamp": "2026-07-22T20:00:02+00:00",
+                    "provider_message_id": "wamid.quero",
+                }
+            )
+            fluxo_reservas._processar_lote_debounce("5511999999999")
+
+        self.assertEqual(primeira["status"], "debounce_pendente")
+        self.assertEqual(segunda["status"], "debounce_pendente")
+        self.assertEqual(registrar.call_count, 2)
+        processar.assert_called_once()
+        chamada = processar.call_args.kwargs
+        self.assertEqual(chamada["mensagem_cliente"], "Ola\nQuero sim")
+        self.assertEqual(chamada["provider_message_id"], "wamid.ola")
+        self.assertEqual(len(chamada["metadata_mensagem"]["mensagens_agrupadas"]), 2)
+
+    @patch.object(fluxo_reservas, "_mensagem_ja_processada", return_value=False)
+    @patch.object(fluxo_reservas, "registrar_mensagem")
+    @patch.object(fluxo_reservas, "buscar_conversa_por_telefone")
+    @patch.object(fluxo_reservas, "buscar_conversa_ativa_por_telefone")
+    @patch.object(fluxo_reservas, "processar_resposta_cliente")
+    def test_provider_message_id_duplicado_pendente_nao_gera_novo_processamento(
+        self,
+        processar,
+        buscar_ativa,
+        buscar_por_telefone,
+        registrar,
+        _ja_processada,
+    ) -> None:
+        class TimerFake:
+            def __init__(self, intervalo, funcao, args=()):
+                self.funcao = funcao
+                self.args = args
+
+            def start(self):
+                return None
+
+            def cancel(self):
+                return None
+
+        conversa = {"id": "conv-1", "status": "bot_ativo", "cliente_telefone": "5511999999999"}
+        buscar_ativa.return_value = conversa
+        buscar_por_telefone.return_value = conversa
+
+        mensagem = {
+            "telefone": "5511999999999",
+            "texto": "Ola",
+            "remetente": "Rodrigo",
+            "timestamp": "2026-07-22T20:00:00+00:00",
+            "provider_message_id": "wamid.duplicada",
+        }
+        with (
+            patch.dict(os.environ, {"WHATSAPP_DEBOUNCE_SECONDS": "3"}),
+            patch.object(fluxo_reservas.threading, "Timer", TimerFake),
+        ):
+            primeira = fluxo_reservas.processar_mensagem_webhook(mensagem)
+            segunda = fluxo_reservas.processar_mensagem_webhook(mensagem)
+
+        self.assertEqual(primeira["status"], "debounce_pendente")
+        self.assertEqual(segunda["status"], "duplicada_pendente")
+        self.assertEqual(registrar.call_count, 1)
+        processar.assert_not_called()
 
 
 if __name__ == "__main__":

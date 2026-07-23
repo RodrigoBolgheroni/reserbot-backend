@@ -62,6 +62,7 @@ _cache_lock = threading.RLock()
 _cache_config: ConfigRestaurante | None = None
 _cache_expira_em = 0.0
 _cache_assinatura = ""
+_cache_ultimo_hit = False
 
 
 @dataclass(frozen=True)
@@ -131,11 +132,19 @@ class ConfigRestaurante:
 
 
 def obter_config() -> ConfigRestaurante:
-    global _cache_config, _cache_expira_em, _cache_assinatura
+    global _cache_config, _cache_expira_em, _cache_assinatura, _cache_ultimo_hit
     assinatura = _assinatura_cache()
     agora = time.monotonic()
     with _cache_lock:
         if _cache_config is not None and _cache_assinatura == assinatura and agora < _cache_expira_em:
+            _cache_ultimo_hit = True
+            logger.info(
+                "Configuracao restaurante cache_hit source=%s estabelecimento_id=%s espacos=%s faqs=%s",
+                _cache_config.fonte,
+                _cache_config.estabelecimento_id,
+                len(_cache_config.espacos),
+                len([faq for faq in _cache_config.faq_conteudos if faq.ativo]),
+            )
             return _cache_config
 
         config = _carregar_config_sem_cache()
@@ -143,15 +152,30 @@ def obter_config() -> ConfigRestaurante:
         _cache_config = config
         _cache_assinatura = assinatura
         _cache_expira_em = time.monotonic() + ttl
+        _cache_ultimo_hit = False
+        logger.info(
+            "Configuracao restaurante cache_miss source=%s estabelecimento_id=%s ttl=%s espacos=%s faqs=%s",
+            config.fonte,
+            config.estabelecimento_id,
+            int(ttl),
+            len(config.espacos),
+            len([faq for faq in config.faq_conteudos if faq.ativo]),
+        )
         return config
 
 
 def limpar_cache_config() -> None:
     with _cache_lock:
-        global _cache_config, _cache_expira_em, _cache_assinatura
+        global _cache_config, _cache_expira_em, _cache_assinatura, _cache_ultimo_hit
         _cache_config = None
         _cache_expira_em = 0.0
         _cache_assinatura = ""
+        _cache_ultimo_hit = False
+
+
+def ultimo_cache_hit() -> bool:
+    with _cache_lock:
+        return _cache_ultimo_hit
 
 
 def _carregar_config_sem_cache() -> ConfigRestaurante:

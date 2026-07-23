@@ -102,6 +102,24 @@ def carregar_configuracao_bruta() -> ResultadoConfigBruta:
         erros_parciais=erros_parciais,
     )
 
+    logger.info(
+        "Configuracao estruturada consultada no Supabase: tabelas=%s estabelecimento_id=%s "
+        "horarios=%s configuracoes_reserva=%s espacos=%s faq_conteudos=%s erros_parciais=%s",
+        [
+            TABELA_ESTABELECIMENTOS,
+            TABELA_HORARIOS_FUNCIONAMENTO,
+            TABELA_CONFIGURACOES_RESERVA,
+            TABELA_ESPACOS,
+            TABELA_FAQ_CONTEUDOS,
+        ],
+        estabelecimento_id,
+        len(horarios),
+        len(configuracoes),
+        len(espacos),
+        len(faq_conteudos),
+        len(erros_parciais),
+    )
+
     return {
         "ok": True,
         "estabelecimento": estabelecimento,

@@ -270,13 +270,24 @@ def _log_config_restaurante_processamento(config: config_restaurante.ConfigResta
     )
     logger.info(
         "Config restaurante carregada para agente: source=%s estabelecimento_id=%s "
-        "configuracoes_reserva=%s taxa_valor=%s quantidade_minima=%s horarios_permitidos=%s",
+        "configuracoes_reserva=%s taxa_valor=%s quantidade_minima=%s horarios_permitidos=%s "
+        "espacos=%s faqs_ativas=%s cache_hit=%s tabelas_consultadas=%s",
         config.fonte,
         config.estabelecimento_id,
         possui_configuracao_reserva,
         _taxa_para_log(config.taxa_valor),
         config.quantidade_minima_reserva,
         list(config.horarios_permitidos_reserva),
+        len([espaco for espaco in config.espacos if espaco.ativo]),
+        len([faq for faq in config.faq_conteudos if faq.ativo]),
+        config_restaurante.ultimo_cache_hit(),
+        [
+            "estabelecimentos",
+            "horarios_funcionamento",
+            "configuracoes_reserva",
+            "espacos",
+            "faq_conteudos",
+        ],
     )
 
 
@@ -328,7 +339,12 @@ def _processar_mensagem_sem_lock(
     else:
         try:
             mensagens_groq = [
-                _mensagem_sistema(nome_cliente, perfil_cliente=perfil_cliente),
+                _mensagem_sistema(
+                    nome_cliente,
+                    perfil_cliente=perfil_cliente,
+                    telefone=telefone_limpo,
+                    mensagem_cliente=mensagem_limpa,
+                ),
                 _mensagem_contexto_reserva(telefone_limpo),
                 *historico,
             ]
@@ -643,7 +659,7 @@ def _corrigir_texto_por_configuracao_estruturada(
             return _texto_reserva_estruturada(config), motivos
         return _texto_taxa_reserva_config(config), motivos
     if "horarios_reserva_fora_config" in motivos:
-        return _texto_horarios_reserva_config(config), motivos
+        return _corrigir_horarios_reserva_config(texto_limpo, config), motivos
     if "quantidade_minima_contradita" in motivos:
         return _texto_quantidade_minima_config(config), motivos
     if "politica_cancelamento_contradita" in motivos:
@@ -719,30 +735,170 @@ def _texto_inventa_horario_reserva(
     normalizado: str,
     config: config_restaurante.ConfigRestaurante,
 ) -> bool:
-    if not re.search(
-        r"\b(reserva|reservar|mesa|horarios? aceitos|horarios? para reserva|horarios? de reserva|"
-        r"qual horario|horario que voce prefere|horario voce prefere|horario disponivel)\b",
+    analise = _analisar_guardrail_horarios_reserva(texto, config)
+    logger.info(
+        "Guardrail horarios reserva: horarios_detectados=%s horarios_invalidos=%s "
+        "contexto_semantico=%s motivo_exato=%s guardrail_aplicado=%s",
+        analise["horarios_detectados"],
+        analise["horarios_invalidos"],
+        analise["contexto_semantico"],
+        analise["motivo_exato"],
+        analise["guardrail_aplicado"],
+    )
+    return bool(analise["guardrail_aplicado"])
+
+
+def _analisar_guardrail_horarios_reserva(
+    texto: str,
+    config: config_restaurante.ConfigRestaurante,
+) -> dict[str, Any]:
+    permitidos = set(config.horarios_permitidos_reserva)
+    ocorrencias = _ocorrencias_horarios_texto(texto)
+    detectados: list[str] = []
+    invalidos: list[str] = []
+    contextos: list[str] = []
+    motivos: list[str] = []
+
+    for ocorrencia in ocorrencias:
+        horario = str(ocorrencia["horario"])
+        if horario not in detectados:
+            detectados.append(horario)
+        contexto = _classificar_contexto_horario_resposta(
+            str(ocorrencia["sentenca"]),
+            contexto_local=str(ocorrencia.get("contexto_local") or ""),
+        )
+        contextos.append(f"{horario}:{contexto}")
+        if horario in permitidos:
+            continue
+        if contexto == "quantidade":
+            motivos.append(f"{horario}:numero_quantidade")
+            continue
+        if contexto == "rejeicao":
+            motivos.append(f"{horario}:horario_rejeitado_pelo_bot")
+            continue
+        if contexto == "mencao_cliente":
+            motivos.append(f"{horario}:mencao_sem_oferta")
+            continue
+        if contexto != "operacional":
+            motivos.append(f"{horario}:contexto_nao_operacional")
+            continue
+        invalidos.append(horario)
+        motivos.append(f"{horario}:oferta_aceite_confirmacao_fora_config")
+
+    return {
+        "horarios_detectados": detectados,
+        "horarios_invalidos": invalidos,
+        "contexto_semantico": contextos,
+        "motivo_exato": motivos or ["sem_horario_concreto"],
+        "guardrail_aplicado": bool(invalidos),
+    }
+
+
+def _classificar_contexto_horario_resposta(sentenca: str, *, contexto_local: str = "") -> str:
+    normalizado = _normalizar_busca(sentenca)
+    local = _normalizar_busca(contexto_local)
+    if re.search(
+        r"\b(pessoa|pessoas|convidado|convidados|grupo|grupos|quantidade|"
+        r"capacidade|limite|minimo|maximo|maxima|varia|variar|serao|vao|aproximad[ao]s?)\b",
+        local,
+    ):
+        return "quantidade"
+    if re.search(
+        r"\b(nao|nunca|indisponivel|fora|rejeit|nao consigo|nao temos|nao aceitamos|"
+        r"nao e aceito|nao esta entre|nao faz parte|nao atendemos|fica fora)\b",
         normalizado,
     ):
-        return False
+        return "rejeicao"
+    if re.search(
+        r"\b(voce mencionou|voce falou|voce disse|cliente mencionou|cliente falou|"
+        r"se chegar|sair do trabalho|sai do trabalho|chegaria|mencionou|citado|citou)\b",
+        normalizado,
+    ):
+        return "mencao_cliente"
+    if re.search(
+        r"\b(horarios?\s+(?:aceitos|permitidos|disponiveis|disponivel|para reserva|de reserva|sao)|"
+        r"temos\s+(?:horario|mesa|vaga|disponibilidade)|"
+        r"(?:aceitamos|permitimos|trabalhamos)\b|"
+        r"pode(?:mos)?\s+(?:reservar|confirmar|marcar)|"
+        r"posso\s+(?:reservar|confirmar|marcar)|"
+        r"vou\s+(?:confirmar|reservar|marcar)|"
+        r"(?:confirmar|confirmado|confirmada|reservar|reserva|mesa|ficou|fica)\s+(?:para|as|a|no horario)|"
+        r"(?:recomendo|sugiro)\b)\b",
+        normalizado,
+    ):
+        return "operacional"
+    return "mencao"
 
-    horarios_citados = _horarios_citados_no_texto(texto)
-    if not horarios_citados:
-        return False
-    permitidos = set(config.horarios_permitidos_reserva)
-    return any(horario not in permitidos for horario in horarios_citados)
+
+def _corrigir_horarios_reserva_config(texto: str, config: config_restaurante.ConfigRestaurante) -> str:
+    correcao = _texto_horarios_reserva_config(config)
+    partes = re.split(r"(?<=[.!?])\s+", texto.strip())
+    if len(partes) <= 1:
+        return correcao
+
+    corrigidas: list[str] = []
+    correcao_adicionada = False
+    for parte in partes:
+        if _analisar_guardrail_horarios_reserva(parte, config)["guardrail_aplicado"]:
+            if not correcao_adicionada:
+                corrigidas.append(correcao)
+                correcao_adicionada = True
+            continue
+        corrigidas.append(parte)
+    return " ".join(parte for parte in corrigidas if parte.strip()) or correcao
+
+
+def _ocorrencias_horarios_texto(texto: str) -> list[dict[str, Any]]:
+    normalizado = _normalizar_busca(texto)
+    ocorrencias: list[dict[str, Any]] = []
+    vistos: set[tuple[int, str]] = set()
+
+    padroes = (
+        (r"\b([01]?\d|2[0-3])\s*[:h]\s*([0-5]\d)\b", True),
+        (r"\b([01]?\d|2[0-3])h\b", False),
+        (r"\b([01]?\d|2[0-3])\s+horas?\b", False),
+        (r"\b(?:as|a|das|de|entre|ate)\s+([01]?\d|2[0-3])\b", False),
+    )
+    for padrao, tem_minuto in padroes:
+        for match in re.finditer(padrao, normalizado):
+            hora = int(match.group(1))
+            minuto = int(match.group(2)) if tem_minuto and match.lastindex and match.group(2) else 0
+            horario = f"{hora:02d}:{minuto:02d}"
+            chave = (match.start(), horario)
+            if chave in vistos:
+                continue
+            vistos.add(chave)
+            inicio = normalizado.rfind(".", 0, match.start())
+            inicio = max(inicio, normalizado.rfind("!", 0, match.start()), normalizado.rfind("?", 0, match.start()))
+            fim_candidatos = [
+                pos
+                for pos in (
+                    normalizado.find(".", match.end()),
+                    normalizado.find("!", match.end()),
+                    normalizado.find("?", match.end()),
+                )
+                if pos != -1
+            ]
+            fim = min(fim_candidatos) if fim_candidatos else len(normalizado)
+            sentenca = normalizado[inicio + 1 : fim].strip()
+            contexto_local = normalizado[max(0, match.start() - 24) : min(len(normalizado), match.end() + 24)]
+            ocorrencias.append(
+                {
+                    "horario": horario,
+                    "sentenca": sentenca,
+                    "contexto_local": contexto_local,
+                    "inicio": match.start(),
+                    "fim": match.end(),
+                }
+            )
+    ocorrencias.sort(key=lambda item: int(item["inicio"]))
+    return ocorrencias
 
 
 def _horarios_citados_no_texto(texto: str) -> list[str]:
     encontrados: list[str] = []
-    for match in re.finditer(r"\b([01]?\d|2[0-3])\s*[:h]\s*([0-5]\d)\b", texto, flags=re.IGNORECASE):
-        horario = f"{int(match.group(1)):02d}:{int(match.group(2)):02d}"
-        if horario not in encontrados:
-            encontrados.append(horario)
-
-    normalizado = _normalizar_busca(texto)
-    for match in re.finditer(r"\b(?:as|a|das|de|entre|ate|e)\s+([01]?\d|2[0-3])h?\b", normalizado):
-        horario = f"{int(match.group(1)):02d}:00"
+    for ocorrencia in _ocorrencias_horarios_texto(texto):
+        horario = str(ocorrencia["horario"])
         if horario not in encontrados:
             encontrados.append(horario)
     return encontrados
@@ -909,6 +1065,61 @@ def aplicar_guardrails_reserva(
             "confianca": interpretacao["confianca"],
         }
 
+    if _pergunta_sobre_horario_indisponivel(mensagem_cliente, estado) and _mensagem_pede_explicacao_horario(mensagem_cliente):
+        estado["aguardando_confirmacao"] = False
+        _definir_campo_pendente(estado, "horario")
+        texto = ""
+        if bool(interpretacao.get("contrato_novo")):
+            texto = _texto_modelo_para_intencao(
+                interpretacao["texto"],
+                "pergunta_restaurante",
+                estado=estado,
+                faltantes=_campos_obrigatorios_faltantes(estado, telefone_limpo),
+            )
+        if not texto:
+            texto = _mensagem_horario_fora_funcionamento(estado)
+            _log_resposta_substituida(
+                texto_ia=interpretacao["texto"],
+                texto_final=texto,
+                funcao="aplicar_guardrails_reserva.pergunta_horario_indisponivel",
+                motivo="texto_ia_vazio_ou_inseguro",
+            )
+        return {
+            "texto": texto,
+            "reserva_confirmada": False,
+            "dados_reserva": _dados_reserva_do_estado(estado),
+            "status_reserva": "em_coleta",
+            "confianca": max(interpretacao["confianca"], 0.8),
+        }
+
+    invalidos_pre = _atualizar_estado_e_recalcular(
+        estado,
+        telefone=telefone_limpo,
+        mensagem_cliente=mensagem_cliente,
+        interpretacao=interpretacao,
+        confirmacao_cliente=confirmacao_cliente,
+        aguardava_confirmacao=aguardava_confirmacao,
+    )
+    if invalidos_pre:
+        campo = _primeiro_campo_pendente(list(invalidos_pre), estado, telefone_limpo)
+        _definir_campo_pendente(estado, campo)
+        dados_estado = _dados_reserva_do_estado(estado)
+        texto = _mensagem_validacao_falhou(campo, estado, telefone_limpo, interpretacao, mensagem_cliente=mensagem_cliente)
+        _log_resposta_substituida(
+            texto_ia=interpretacao["texto"],
+            texto_final=texto,
+            funcao="aplicar_guardrails_reserva.validacao_pre_conversacional",
+            motivo=f"validacao_invalida:{campo}",
+        )
+        status_reserva = "aguardando_humano" if _deve_encaminhar_humano_por_tentativas(estado, campo) else "em_coleta"
+        return {
+            "texto": texto,
+            "reserva_confirmada": False,
+            "dados_reserva": dados_estado,
+            "status_reserva": status_reserva,
+            "confianca": interpretacao["confianca"],
+        }
+
     if intencao_conversacional:
         return _responder_intencao_conversacional(
             intencao=intencao_conversacional,
@@ -932,33 +1143,6 @@ def aplicar_guardrails_reserva(
             mensagem_cliente=mensagem_cliente,
             confianca=max(interpretacao["confianca"], 0.9),
         )
-
-    if _pergunta_sobre_horario_indisponivel(mensagem_cliente, estado) and _mensagem_pede_explicacao_horario(mensagem_cliente):
-        estado["aguardando_confirmacao"] = False
-        _definir_campo_pendente(estado, "horario")
-        texto = ""
-        if bool(interpretacao.get("contrato_novo")):
-            texto = _texto_modelo_para_intencao(
-                interpretacao["texto"],
-                "pergunta_restaurante",
-                estado=estado,
-                faltantes=_campos_obrigatorios_faltantes(estado, telefone_limpo),
-            )
-        if not texto:
-            texto = _mensagem_horario_fora_funcionamento()
-            _log_resposta_substituida(
-                texto_ia=interpretacao["texto"],
-                texto_final=texto,
-                funcao="aplicar_guardrails_reserva.pergunta_horario_indisponivel",
-                motivo="texto_ia_vazio_ou_inseguro",
-            )
-        return {
-            "texto": texto,
-            "reserva_confirmada": False,
-            "dados_reserva": _dados_reserva_do_estado(estado),
-            "status_reserva": "em_coleta",
-            "confianca": max(interpretacao["confianca"], 0.8),
-        }
 
     if _pergunta_data_disponivel(mensagem_cliente):
         estado["aguardando_confirmacao"] = False
@@ -997,17 +1181,6 @@ def aplicar_guardrails_reserva(
         }
 
     invalidos: set[str] = set()
-    if not (confirmacao_cliente and aguardava_confirmacao):
-        estado["aguardando_confirmacao"] = False
-        _atualizar_estado_reserva(
-            estado,
-            mensagem_cliente=mensagem_cliente,
-            dados_modelo=interpretacao["dados_reserva"],
-            invalidos=invalidos,
-            interpretacao=interpretacao,
-        )
-
-    _remover_campos_invalidos_estado(estado, invalidos)
     if _campo_aguardado(estado) == "nome_cliente" and not confirmacao_cliente:
         nome_informado = _extrair_nome_cliente(mensagem_cliente)
         if nome_informado:
@@ -1117,6 +1290,42 @@ def aplicar_guardrails_reserva(
         "status_reserva": "aguardando_confirmacao",
         "confianca": max(interpretacao["confianca"], 0.8),
     }
+
+
+def _atualizar_estado_e_recalcular(
+    estado: EstadoReserva,
+    *,
+    telefone: str,
+    mensagem_cliente: str,
+    interpretacao: Mapping[str, Any],
+    confirmacao_cliente: bool,
+    aguardava_confirmacao: bool,
+) -> set[str]:
+    invalidos: set[str] = set()
+    if not (confirmacao_cliente and aguardava_confirmacao):
+        estado["aguardando_confirmacao"] = False
+        _atualizar_estado_reserva(
+            estado,
+            mensagem_cliente=mensagem_cliente,
+            dados_modelo=interpretacao["dados_reserva"],
+            invalidos=invalidos,
+            interpretacao=interpretacao,
+        )
+
+    _remover_campos_invalidos_estado(estado, invalidos)
+    _recalcular_campo_pendente(estado, telefone)
+    return invalidos
+
+
+def _recalcular_campo_pendente(estado: EstadoReserva, telefone: str) -> None:
+    faltantes = _campos_obrigatorios_faltantes(estado, telefone)
+    if faltantes:
+        _definir_campo_pendente(estado, faltantes[0])
+        estado["aguardando_confirmacao"] = False
+        estado["cliente_autorizou_confirmacao"] = False
+        return
+    _definir_campo_pendente(estado, "confirmacao")
+    estado["aguardando_confirmacao"] = True
 
 
 def dados_reserva_obrigatorios_ok(
@@ -1407,7 +1616,11 @@ def _atualizar_estado_reserva(
 ) -> None:
     campo_pendente = _campo_aguardado(estado)
     intencao_modelo = _normalizar_intencao_ia(str(interpretacao.get("intencao") or ""))
-    mensagem_eh_conversa = intencao_modelo in INTENCOES_CONVERSACIONAIS_IA or bool(_intencao_conversacional(mensagem_cliente))
+    mensagem_eh_conversa = (
+        intencao_modelo in INTENCOES_CONVERSACIONAIS_IA
+        or bool(_intencao_conversacional(mensagem_cliente))
+        or bool(_categoria_pergunta_restaurante(mensagem_cliente))
+    )
     deve_avancar = bool(interpretacao.get("deve_avancar_estado")) or _mensagem_indica_correcao(mensagem_cliente, interpretacao)
     dados_confirmados = _dados_reserva_de_json(dict(interpretacao.get("dados_confirmados") or {}))
     correcoes_confirmadas = _dados_reserva_de_json(dict(interpretacao.get("correcoes") or {}))
@@ -1802,9 +2015,32 @@ def _pode_aplicar_dado_confirmado(
 
     if not tem_dado and not tem_correcao:
         return False
+    if campo == "pessoas" and tem_dado and not tem_correcao and _mensagem_quantidade_incerta(mensagem_cliente):
+        logger.info(
+            "DIAG_RESERVA dado_confirmado_ignorado campo=pessoas motivo=quantidade_aproximada_ou_incerta",
+        )
+        return False
+    valor_novo = _valor_campo_interpretacao(campo, interpretacao)
+    valor_atual = estado.get(campo)
+    correcao = _mensagem_indica_correcao(mensagem_cliente, interpretacao)
+    if valor_atual not in (None, "", []) and valor_novo not in (None, "", []) and str(valor_atual) != str(valor_novo):
+        if not (correcao and _mensagem_suporta_campo_reserva(campo, mensagem_cliente, interpretacao)):
+            logger.info(
+                "DIAG_RESERVA dado_confirmado_ignorado campo=%s valor_estado=%r valor_modelo=%r motivo=sem_correcao_explicita",
+                campo,
+                valor_atual,
+                valor_novo,
+            )
+            return False
     contrato_novo = bool(interpretacao.get("contrato_novo"))
     campo_aguardado = _campo_aguardado(estado)
     intencao = _normalizar_intencao_ia(str(interpretacao.get("intencao") or ""))
+    if _categoria_pergunta_restaurante(mensagem_cliente) and not _mensagem_suporta_campo_reserva(campo, mensagem_cliente, interpretacao):
+        logger.info(
+            "DIAG_RESERVA dado_confirmado_ignorado campo=%s motivo=pergunta_restaurante_sem_sinal_do_campo",
+            campo,
+        )
+        return False
     if tem_dado and campo == campo_aguardado and intencao in {"fornecimento_dados", "correcao"}:
         return True
     if tem_dado and campo == "horario" and campo_aguardado == "horario" and _mensagem_tem_sinal_horario(mensagem_cliente):
@@ -1817,7 +2053,7 @@ def _pode_aplicar_dado_confirmado(
         if campo_aguardado in {"data_reserva", "horario", "pessoas", "nome_cliente"}:
             return campo == campo_aguardado
         return not estado.get(campo)
-    if _mensagem_indica_correcao(mensagem_cliente, interpretacao) or tem_correcao:
+    if (correcao or tem_correcao) and _mensagem_suporta_campo_reserva(campo, mensagem_cliente, interpretacao):
         return True
     if bool(interpretacao.get("deve_avancar_estado")):
         return True
@@ -1922,6 +2158,44 @@ def _mensagem_confirma_horario(mensagem_cliente: str, campo_aguardado: str) -> b
         palavras = re.findall(r"\w+", normalizado)
         return 1 <= len(palavras) <= 4 and _extrair_horario(mensagem_cliente, permitir_numero_isolado=True) is not None
     return False
+
+
+def _valor_campo_interpretacao(campo: str, interpretacao: Mapping[str, Any]) -> Any:
+    dados_confirmados = interpretacao.get("dados_confirmados")
+    correcoes = interpretacao.get("correcoes")
+    chaves = {
+        "data_reserva": ("data_reserva", "data", "dia"),
+        "horario": ("horario", "hora"),
+        "pessoas": ("pessoas", "quantidade", "quantidade_pessoas"),
+        "nome_cliente": ("nome_cliente", "nome"),
+    }.get(campo, (campo,))
+    for origem in (correcoes, dados_confirmados):
+        if not isinstance(origem, Mapping):
+            continue
+        for chave in chaves:
+            valor = origem.get(chave)
+            if valor not in (None, "", []):
+                return valor
+    return None
+
+
+def _mensagem_suporta_campo_reserva(campo: str, mensagem_cliente: str, interpretacao: Mapping[str, Any]) -> bool:
+    correcoes = interpretacao.get("correcoes")
+    if isinstance(correcoes, Mapping) and any(valor not in (None, "", [], {}) for valor in correcoes.values()):
+        if campo == "data_reserva":
+            return _mensagem_tem_sinal_data(mensagem_cliente)
+        if campo == "horario":
+            return _mensagem_tem_sinal_horario(mensagem_cliente)
+        if campo == "pessoas":
+            return _mensagem_tem_sinal_pessoas(mensagem_cliente)
+        return True
+    if campo == "data_reserva":
+        return _mensagem_tem_sinal_data(mensagem_cliente)
+    if campo == "horario":
+        return _mensagem_tem_sinal_horario(mensagem_cliente)
+    if campo == "pessoas":
+        return _mensagem_tem_sinal_pessoas(mensagem_cliente)
+    return True
 
 
 def _pode_aceitar_dado_modelo(
@@ -3156,7 +3430,12 @@ def _pergunta_data_disponivel(texto: str) -> bool:
 def _mensagem_tem_sinal_data(texto: str) -> bool:
     normalizado = _normalizar_busca(texto)
     return bool(
-        re.search(r"\b(hoje|amanha|dia\s+\d{1,2}|\d{1,2}[/-]\d{1,2})\b", normalizado)
+        re.search(
+            r"\b(hoje|amanha|dia\s+\d{1,2}|\d{1,2}[/-]\d{1,2}|"
+            r"segunda(?: feira)?|terca(?: feira)?|quarta(?: feira)?|quinta(?: feira)?|"
+            r"sexta(?: feira)?|sabado|domingo|proxim[ao]\s+(?:segunda|terca|quarta|quinta|sexta|sabado|domingo))\b",
+            normalizado,
+        )
         or re.search(r"\b\d{1,2}\s+de\s+[a-z]{3,}\b", normalizado)
     )
 
@@ -3174,6 +3453,19 @@ def _mensagem_tem_sinal_horario(texto: str) -> bool:
 
 def _mensagem_tem_sinal_pessoas(texto: str) -> bool:
     return _extrair_pessoas_solicitadas(texto, permitir_numero_isolado=False) is not None
+
+
+def _mensagem_quantidade_incerta(texto: str) -> bool:
+    normalizado = _normalizar_busca(texto)
+    if not re.search(r"\b(pessoa|pessoas|convidado|convidados|grupo|grupos|serao|vao|somos|quantidade)\b", normalizado):
+        return False
+    if re.search(r"\b(pode\s+colocar|coloca|coloque|considera|considere|anota|anote)\b.{0,40}\b\d{1,4}\b.{0,30}\bpor enquanto\b", normalizado):
+        return False
+    return bool(
+        re.search(r"\b(acho|umas|uns|aproximadamente|aproximado|aproximada|talvez|ainda nao sei|pode variar|variar entre)\b", normalizado)
+        or re.search(r"\bentre\s+\d{1,4}\s+(?:e|ou)\s+\d{1,4}\b", normalizado)
+        or re.search(r"\b\d{1,4}\s*,\s*\d{1,4}\s+ou\s+\d{1,4}\b", normalizado)
+    )
 
 
 def _mensagem_parece_numero_isolado(texto: str) -> bool:
@@ -3276,7 +3568,13 @@ def _horario_para_minutos(horario: str) -> int | None:
 
 
 def _hoje() -> date:
-    return date.today()
+    try:
+        from zoneinfo import ZoneInfo
+
+        timezone_nome = _config_restaurante_atual().timezone
+        return datetime.now(ZoneInfo(timezone_nome)).date()
+    except Exception:
+        return date.today()
 
 
 def _resposta_contingencia() -> str:
@@ -3381,11 +3679,201 @@ def _chamar_groq(mensagens: Sequence[Mensagem], modelo: str, *, response_format_
     return conteudo.strip()
 
 
-def _mensagem_sistema(nome_cliente: str, *, perfil_cliente: Mapping[str, Any] | None = None) -> Mensagem:
+def _contexto_espacos_restaurante(config: config_restaurante.ConfigRestaurante) -> str:
+    partes: list[str] = []
+    for espaco in config.espacos:
+        if not espaco.ativo:
+            continue
+        capacidade = (
+            f"capacidade maxima {espaco.capacidade_maxima}"
+            if espaco.capacidade_maxima is not None
+            else "capacidade maxima indefinida"
+        )
+        preferencia = "permite preferencia de local" if espaco.permite_preferencia else "nao permite preferencia de local"
+        detalhes = [espaco.nome, capacidade, preferencia]
+        if espaco.descricao:
+            detalhes.append(espaco.descricao)
+        if espaco.regras:
+            detalhes.append(f"regras: {espaco.regras}")
+        partes.append("; ".join(detalhes))
+    return " | ".join(partes)
+
+
+def _selecionar_faqs_relevantes(
+    *,
+    config: config_restaurante.ConfigRestaurante,
+    mensagem_cliente: str,
+    estado: Mapping[str, Any],
+    historico: Sequence[Mapping[str, str]],
+    limite: int = 5,
+) -> list[config_restaurante.FaqConteudo]:
+    faqs_ativas = [faq for faq in config.faq_conteudos if faq.ativo]
+    if not faqs_ativas:
+        logger.info("FAQs relevantes selecionadas: total_ativas=0 selecionadas=0 metodo=busca_lexica")
+        return []
+
+    consulta = _texto_consulta_faq(mensagem_cliente, estado, historico)
+    tokens_consulta = _tokens_busca_faq(consulta)
+    if not tokens_consulta:
+        logger.info(
+            "FAQs relevantes selecionadas: total_ativas=%s selecionadas=0 metodo=busca_lexica motivo=consulta_vazia",
+            len(faqs_ativas),
+        )
+        return []
+
+    pontuadas: list[tuple[int, int, config_restaurante.FaqConteudo]] = []
+    for indice, faq in enumerate(faqs_ativas):
+        score = _pontuar_faq(faq, tokens_consulta)
+        if score > 0:
+            pontuadas.append((score, -indice, faq))
+
+    pontuadas.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    selecionadas = [faq for _, _, faq in pontuadas[: max(1, min(limite, 5))]]
+    logger.info(
+        "FAQs relevantes selecionadas: total_ativas=%s selecionadas=%s titulos=%s metodo=busca_lexica",
+        len(faqs_ativas),
+        len(selecionadas),
+        [faq.titulo for faq in selecionadas],
+    )
+    return selecionadas
+
+
+def _texto_consulta_faq(
+    mensagem_cliente: str,
+    estado: Mapping[str, Any],
+    historico: Sequence[Mapping[str, str]],
+) -> str:
+    partes = [mensagem_cliente]
+    for chave in ("assunto_atual", "pergunta_aberta", "resumo_conversa", "ultima_intencao"):
+        valor = str(estado.get(chave) or "").strip()
+        if valor:
+            partes.append(valor)
+    for mensagem in list(historico)[-4:]:
+        if mensagem.get("role") == "user":
+            partes.append(str(mensagem.get("content") or ""))
+    return " ".join(partes)
+
+
+def _tokens_busca_faq(texto: str, *, expandir: bool = True) -> set[str]:
+    stopwords = {
+        "a",
+        "as",
+        "ao",
+        "aos",
+        "da",
+        "das",
+        "de",
+        "do",
+        "dos",
+        "e",
+        "em",
+        "na",
+        "nas",
+        "no",
+        "nos",
+        "o",
+        "os",
+        "ou",
+        "para",
+        "por",
+        "qual",
+        "quais",
+        "que",
+        "quanto",
+        "se",
+        "tem",
+        "ter",
+        "um",
+        "uma",
+        "uns",
+        "umas",
+        "voce",
+        "voces",
+    }
+    normalizado = _normalizar_busca(texto)
+    brutos = re.findall(r"[a-z0-9]{2,}", normalizado)
+    tokens: set[str] = set()
+    for token in brutos:
+        singular = _singular_simples(token)
+        if token not in stopwords:
+            tokens.add(token)
+        if singular not in stopwords:
+            tokens.add(singular)
+    if expandir:
+        tokens.update(_sinonimos_faq(tokens))
+    return {token for token in tokens if len(token) >= 2}
+
+
+def _singular_simples(token: str) -> str:
+    if len(token) > 4 and token.endswith("oes"):
+        return token[:-3] + "ao"
+    if len(token) > 4 and token.endswith("ais"):
+        return token[:-3] + "al"
+    if len(token) > 3 and token.endswith("s"):
+        return token[:-1]
+    return token
+
+
+def _sinonimos_faq(tokens: set[str]) -> set[str]:
+    grupos = [
+        {"quadra", "quadras", "locacao", "locar", "alugar", "aluguel", "esporte", "esportes", "volei", "futebol", "beach", "day", "use"},
+        {"bolo", "decoracao", "decorar", "aniversario", "utensilios", "lista"},
+        {"entrada", "entrar", "valor", "valores", "preco", "precos", "custa", "crianca", "criancas"},
+        {"gympass"},
+        {"salao", "areia", "espaco", "espacos", "local", "preferencia"},
+        {"estacionamento", "estacionar", "carro", "vaga"},
+    ]
+    expandidos: set[str] = set()
+    for grupo in grupos:
+        if tokens & grupo:
+            expandidos.update(grupo)
+    return expandidos
+
+
+def _pontuar_faq(faq: config_restaurante.FaqConteudo, tokens_consulta: set[str]) -> int:
+    tokens_categoria = _tokens_busca_faq(faq.categoria, expandir=False)
+    tokens_titulo = _tokens_busca_faq(faq.titulo, expandir=False)
+    tokens_tags = _tokens_busca_faq(" ".join(faq.tags), expandir=False)
+    tokens_conteudo = _tokens_busca_faq(faq.conteudo, expandir=False)
+    score = 0
+    score += 5 * len(tokens_consulta & tokens_titulo)
+    score += 5 * len(tokens_consulta & tokens_tags)
+    score += 4 * len(tokens_consulta & tokens_categoria)
+    score += len(tokens_consulta & tokens_conteudo)
+    return score
+
+
+def _contexto_faqs_relevantes(faqs: Sequence[config_restaurante.FaqConteudo]) -> str:
+    partes: list[str] = []
+    for faq in faqs:
+        tags = f" tags: {', '.join(faq.tags)}" if faq.tags else ""
+        partes.append(f"{faq.categoria} - {faq.titulo}: {faq.conteudo}{tags}")
+    return " | ".join(partes)
+
+
+def _mensagem_sistema(
+    nome_cliente: str,
+    *,
+    perfil_cliente: Mapping[str, Any] | None = None,
+    telefone: str = "",
+    mensagem_cliente: str = "",
+) -> Mensagem:
     config = _config_restaurante_atual()
     restaurante = config.nome
     hoje = _hoje().strftime("%d/%m/%Y")
     nome = nome_cliente.strip() or "cliente"
+    telefone_limpo = telefone.strip()
+    estado = _estados_reserva.get(telefone_limpo, {}) if telefone_limpo else {}
+    historico = _historicos.get(telefone_limpo, []) if telefone_limpo else []
+    espacos_contexto = _contexto_espacos_restaurante(config)
+    faqs_selecionadas = _selecionar_faqs_relevantes(
+        config=config,
+        mensagem_cliente=mensagem_cliente,
+        estado=estado,
+        historico=historico,
+        limite=5,
+    )
+    faqs_contexto = _contexto_faqs_relevantes(faqs_selecionadas)
     perfil_nome = str((perfil_cliente or {}).get("nome") or "").strip()
     perfil_prompt = str((perfil_cliente or {}).get("prompt_ia") or "").strip()
     instrucao_perfil = ""
@@ -3398,9 +3886,7 @@ def _mensagem_sistema(nome_cliente: str, *, perfil_cliente: Mapping[str, Any] | 
         if perfil_prompt:
             instrucao_perfil += f"Orientacao especifica do perfil: {perfil_prompt}\n"
 
-    return {
-        "role": "system",
-        "content": (
+    conteudo = (
             f"Você é a atendente virtual do {restaurante}. "
             f"Está conversando com {nome}. "
             "Responda sempre em português do Brasil. "
@@ -3465,6 +3951,8 @@ def _mensagem_sistema(nome_cliente: str, *, perfil_cliente: Mapping[str, Any] | 
             f"- Instrucoes de reserva: {config.regras_reservas_imediatas}\n"
             f"- Estacionamento: {config.estacionamento}\n"
             f"- Aniversarios: {config.aniversario}\n"
+            f"- Espacos ativos: {espacos_contexto or 'Nenhum espaco estruturado cadastrado.'}\n"
+            f"- FAQs relevantes para a mensagem atual: {faqs_contexto or 'Nenhuma FAQ especifica selecionada para esta mensagem.'}\n"
             "Se o cliente fizer uma pergunta normal sobre o restaurante, responda e retome o campo da reserva que faltava. "
             "Se o cliente perguntar como voce sabe uma informacao, explique que os dados foram cadastrados pela equipe no sistema. "
             "Nunca diga que um horario esta disponivel sem uma agenda real integrada; diga que atende dentro do funcionamento e vai verificar a solicitacao. "
@@ -3488,7 +3976,22 @@ def _mensagem_sistema(nome_cliente: str, *, perfil_cliente: Mapping[str, Any] | 
             '"confianca":0.0}. '
             "Use status confirmada apenas quando data, horário, pessoas e confirmação do cliente estiverem claros. "
             f"Data de hoje: {hoje}."
-        ),
+    )
+    logger.info(
+        "Contexto Groq montado: telefone=%s source=%s estabelecimento_id=%s espacos=%s faqs_total_ativas=%s "
+        "faqs_selecionadas=%s faq_titulos=%s metodo=busca_lexica titulo_tags_categoria_conteudo tamanho_aproximado=%s",
+        telefone_limpo,
+        config.fonte,
+        config.estabelecimento_id,
+        len([espaco for espaco in config.espacos if espaco.ativo]),
+        len([faq for faq in config.faq_conteudos if faq.ativo]),
+        len(faqs_selecionadas),
+        [faq.titulo for faq in faqs_selecionadas],
+        len(conteudo),
+    )
+    return {
+        "role": "system",
+        "content": conteudo,
     }
 
 
@@ -3620,6 +4123,26 @@ def _extrair_data_relativa(texto: str) -> str | None:
 
     if re.search(r"\bamanha\b", texto_normalizado):
         return (hoje + timedelta(days=1)).isoformat()
+
+    dias_semana = {
+        "segunda": 0,
+        "terca": 1,
+        "quarta": 2,
+        "quinta": 3,
+        "sexta": 4,
+        "sabado": 5,
+        "domingo": 6,
+    }
+    match_dia_semana = re.search(
+        r"\b(?P<proxima>proxim[ao]\s+)?(?P<dia>segunda|terca|quarta|quinta|sexta|sabado|domingo)(?:\s+feira)?\b",
+        texto_normalizado,
+    )
+    if match_dia_semana:
+        dia_semana = dias_semana[match_dia_semana.group("dia")]
+        dias_ate = (dia_semana - hoje.weekday()) % 7
+        if match_dia_semana.group("proxima") and dias_ate == 0:
+            dias_ate = 7
+        return (hoje + timedelta(days=dias_ate)).isoformat()
 
     return None
 

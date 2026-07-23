@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any, TypedDict
@@ -21,6 +22,7 @@ TABELA_DISPAROS_PADRAO = "disparos_mensagens"
 STATUS_BOT_ATIVO = {"bot_ativo", "aberta", "aguardando_cliente", "em_atendimento"}
 STATUS_HUMANO = {"humano", "aguardando_humano", "finalizada"}
 STATUS_CONVERSA_PERMITIDOS = STATUS_BOT_ATIVO | STATUS_HUMANO | {"erro"}
+DEBOUNCE_SECONDS_ENV = "WHATSAPP_DEBOUNCE_SECONDS"
 PADROES_PEDIDO_HUMANO = (
     r"\batendente\b",
     r"\bhumano\b",
@@ -31,6 +33,9 @@ PADROES_PEDIDO_HUMANO = (
     r"cancelar\s+bot",
     r"n[aã]o\s+quero\s+bot",
 )
+_debounce_lock = threading.RLock()
+_debounce_lotes: dict[str, dict[str, Any]] = {}
+_provider_ids_pendentes: set[str] = set()
 
 
 class ResultadoWebhook(TypedDict, total=False):
@@ -518,6 +523,117 @@ def _timestamp_segundos(valor: Any) -> float | None:
         return None
 
 
+def _deve_enfileirar_debounce(mensagem: Mapping[str, Any], raw: Mapping[str, Any]) -> bool:
+    if raw.get("coalesced") or raw.get("debounce_processado"):
+        return False
+    if _janela_debounce_segundos() <= 0:
+        return False
+    provider_message_id = str(mensagem.get("provider_message_id") or "").strip()
+    if provider_message_id and _mensagem_ja_processada(provider_message_id):
+        return False
+    return True
+
+
+def _enfileirar_mensagem_debounce(mensagem: MensagemRecebida) -> ResultadoWebhook:
+    telefone = str(mensagem.get("telefone") or "").strip()
+    provider_message_id = str(mensagem.get("provider_message_id") or "").strip()
+    janela = _janela_debounce_segundos()
+    if provider_message_id:
+        with _debounce_lock:
+            if provider_message_id in _provider_ids_pendentes:
+                logger.info("Mensagem de webhook ja esta pendente no debounce: %s", provider_message_id)
+                return {
+                    "ok": True,
+                    "telefone": telefone,
+                    "status": "duplicada_pendente",
+                    "resposta_enviada": False,
+                }
+
+    conversa = buscar_conversa_ativa_por_telefone(telefone) or buscar_conversa_por_telefone(telefone)
+    if conversa is not None:
+        registrar_mensagem(
+            conversa,
+            remetente="cliente",
+            conteudo=str(mensagem.get("texto") or ""),
+            provider_message_id="",
+            metadata={
+                "provider": "cloud",
+                "debounce_pending": True,
+                "provider_message_id_original": provider_message_id,
+                "timestamp_provider": mensagem.get("timestamp", ""),
+                "remetente_whatsapp": mensagem.get("remetente", ""),
+            },
+        )
+
+    with _debounce_lock:
+        lote = _debounce_lotes.get(telefone)
+        if lote is None:
+            lote = {"mensagens": [], "timer": None, "processando": False}
+            _debounce_lotes[telefone] = lote
+        timer_antigo = lote.get("timer")
+        if isinstance(timer_antigo, threading.Timer):
+            timer_antigo.cancel()
+        lote["mensagens"].append(dict(mensagem))
+        if provider_message_id:
+            _provider_ids_pendentes.add(provider_message_id)
+        timer = threading.Timer(janela, _processar_lote_debounce, args=(telefone,))
+        timer.daemon = True
+        lote["timer"] = timer
+        timer.start()
+
+    logger.info(
+        "Mensagem enfileirada para debounce: telefone=%s provider_message_id=%s janela=%s.",
+        telefone,
+        provider_message_id,
+        janela,
+    )
+    return {
+        "ok": True,
+        "telefone": telefone,
+        "status": "debounce_pendente",
+        "resposta_enviada": False,
+    }
+
+
+def _processar_lote_debounce(telefone: str) -> None:
+    with _debounce_lock:
+        lote = _debounce_lotes.get(telefone)
+        if not lote or lote.get("processando"):
+            return
+        lote["processando"] = True
+        mensagens = [dict(item) for item in lote.get("mensagens", []) if isinstance(item, Mapping)]
+        _debounce_lotes.pop(telefone, None)
+
+    if not mensagens:
+        return
+
+    for mensagem in mensagens:
+        provider_message_id = str(mensagem.get("provider_message_id") or "").strip()
+        if provider_message_id:
+            _provider_ids_pendentes.discard(provider_message_id)
+
+    mensagem_agrupada = _montar_mensagem_agrupada(mensagens)
+    raw = mensagem_agrupada.get("raw") if isinstance(mensagem_agrupada.get("raw"), Mapping) else {}
+    mensagem_agrupada["raw"] = {**dict(raw), "debounce_processado": True}
+    logger.info(
+        "Processando lote debounce: telefone=%s mensagens=%s.",
+        telefone,
+        len(mensagens),
+    )
+    try:
+        processar_mensagem_webhook(mensagem_agrupada)
+    except Exception:
+        logger.exception("Falha ao processar lote debounce telefone=%s.", telefone)
+
+
+def _janela_debounce_segundos() -> float:
+    try:
+        valor = float(os.getenv(DEBOUNCE_SECONDS_ENV, "0"))
+    except ValueError:
+        return 0.0
+    return max(0.0, min(valor, 15.0))
+
+
 def processar_mensagem_webhook(mensagem: MensagemRecebida) -> ResultadoWebhook:
     telefone = str(mensagem.get("telefone") or "").strip()
     texto = str(mensagem.get("texto") or "").strip()
@@ -529,6 +645,10 @@ def processar_mensagem_webhook(mensagem: MensagemRecebida) -> ResultadoWebhook:
             "erro": "mensagem sem telefone ou texto",
         }
 
+    raw = mensagem.get("raw") if isinstance(mensagem.get("raw"), Mapping) else {}
+    if _deve_enfileirar_debounce(mensagem, raw):
+        return _enfileirar_mensagem_debounce(mensagem)
+
     conversa = buscar_conversa_ativa_por_telefone(telefone)
     logger.info(
         "DIAG_RESERVA webhook_mensagem_vinculo telefone=%s provider_message_id=%s conversa_ativa_id=%s conversa_status=%s",
@@ -537,7 +657,6 @@ def processar_mensagem_webhook(mensagem: MensagemRecebida) -> ResultadoWebhook:
         (conversa or {}).get("id", ""),
         (conversa or {}).get("status", ""),
     )
-    raw = mensagem.get("raw") if isinstance(mensagem.get("raw"), Mapping) else {}
     metadata = {
         "provider": "cloud",
         "timestamp_provider": mensagem.get("timestamp", ""),
