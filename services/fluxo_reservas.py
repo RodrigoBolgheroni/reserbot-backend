@@ -32,6 +32,13 @@ PADROES_PEDIDO_HUMANO = (
     r"quero\s+falar\s+com\s+(?:um\s+)?funcion[aá]rio",
     r"cancelar\s+bot",
     r"n[aã]o\s+quero\s+bot",
+    r"^\s*pare\s*$",
+    r"\bpare\s+agora\b",
+    r"^\s*para\s*$",
+    r"\bpara\s+agora\b",
+    r"n[aã]o\s+responda",
+    r"\bdenunciar\b",
+    r"vou\s+denunciar",
 )
 _debounce_lock = threading.RLock()
 _debounce_lotes: dict[str, dict[str, Any]] = {}

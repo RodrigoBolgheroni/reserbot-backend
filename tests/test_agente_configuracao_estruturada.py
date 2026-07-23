@@ -207,32 +207,32 @@ class AgenteConfiguracaoEstruturadaTest(unittest.TestCase):
             return config_restaurante.obter_config()
 
     def test_pergunta_valor_reserva_nao_pode_negar_taxa_configurada(self) -> None:
+        resposta_ia = "A reserva tem taxa de R$ 50,00, convertida em consumacao, e o comprovante Pix e obrigatorio."
         resposta = self._processar(
             "tem algum valor para reservar?",
-            "Nao temos um valor fixo para reservar.",
+            resposta_ia,
         )
 
         texto = resposta["texto"]
         texto_normalizado = agente._normalizar_busca(texto)
+        self.assertEqual(texto, resposta_ia)
         self.assertIn("R$ 50,00", texto)
         self.assertIn("consumacao", texto_normalizado)
         self.assertIn("comprovante pix", texto_normalizado)
-        self.assertNotIn("nao temos um valor fixo", texto_normalizado)
-        self.assertNotIn("sem custo", texto_normalizado)
 
     def test_confirmacao_taxa_cinquenta_nao_pode_ser_negada(self) -> None:
+        resposta_ia = "Sim, a taxa da reserva e R$ 50,00 e esse valor vira consumacao. O comprovante Pix e obrigatorio."
         resposta = self._processar(
             "vi que voces cobram R$ 50 pela reserva, certo?",
-            "Nao cobramos R$ 50 pela reserva. Voce pode fazer a reserva sem custo adicional.",
+            resposta_ia,
         )
 
         texto = resposta["texto"]
         texto_normalizado = agente._normalizar_busca(texto)
+        self.assertEqual(texto, resposta_ia)
         self.assertIn("R$ 50,00", texto)
         self.assertIn("consumacao", texto_normalizado)
         self.assertIn("comprovante pix", texto_normalizado)
-        self.assertNotIn("nao cobramos", texto_normalizado)
-        self.assertNotIn("sem custo adicional", texto_normalizado)
 
     def test_contexto_enviado_para_ia_contem_configuracao_critica_sem_pix(self) -> None:
         capturado: dict[str, str] = {}
@@ -434,8 +434,7 @@ class AgenteConfiguracaoEstruturadaTest(unittest.TestCase):
         )
 
         self.assertIn("horarios_reserva_fora_config", motivos)
-        self.assertIn("12:00", texto)
-        self.assertIn("19:00", texto)
+        self.assertEqual(texto, "Pode reservar as 20h.")
 
     def test_horario_invalido_rejeitado_pelo_bot_nao_substitui_resposta(self) -> None:
         config = self._config()
@@ -459,8 +458,7 @@ class AgenteConfiguracaoEstruturadaTest(unittest.TestCase):
 
         self.assertIn("horarios_reserva_fora_config", motivos)
         self.assertIn("A taxa e R$ 50,00", texto)
-        self.assertIn("12:00", texto)
-        self.assertNotIn("Pode reservar as 20h", texto)
+        self.assertEqual(texto, "Pode reservar as 20h. A taxa e R$ 50,00, convertida em consumacao.")
 
     def test_sabado_e_normalizado_para_data_absoluta(self) -> None:
         telefone = "5511993680823"

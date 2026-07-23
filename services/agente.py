@@ -335,7 +335,7 @@ def _processar_mensagem_sem_lock(
 
     if not os.getenv("GROQ_API_KEY", "").strip():
         logger.warning("GROQ_API_KEY nao configurada. Usando resposta de contingencia.")
-        texto_modelo = _resposta_contingencia()
+        texto_modelo = _payload_fallback_tecnico()
     else:
         try:
             mensagens_groq = [
@@ -360,7 +360,7 @@ def _processar_mensagem_sem_lock(
             )
         except Exception:
             logger.exception("Falha ao processar mensagem com Groq.")
-            texto_modelo = _resposta_contingencia()
+            texto_modelo = _payload_fallback_tecnico()
     logger.info("DIAG_RESERVA json_bruto_ia telefone=%s resposta=%s", telefone_limpo, texto_modelo)
     json_valido = _extrair_json_resposta(texto_modelo) is not None
     logger.info("DIAG_RESERVA json_estruturado telefone=%s valido=%s tentativa_reparo=%s", telefone_limpo, json_valido, not json_valido)
@@ -599,6 +599,28 @@ def _log_resposta_substituida(*, texto_ia: str, texto_final: str, funcao: str, m
     )
 
 
+def _texto_ia_ou_fallback_tecnico(interpretacao: Mapping[str, Any]) -> str:
+    texto = remover_flag_reserva(str(interpretacao.get("texto") or "")).strip()
+    return texto or _resposta_contingencia()
+
+
+def _resposta_preservando_ia(
+    *,
+    estado: Mapping[str, Any],
+    interpretacao: Mapping[str, Any],
+    status_reserva: str = "em_coleta",
+    reserva_confirmada: bool = False,
+    dados_reserva: Mapping[str, Any] | None = None,
+) -> RespostaAgente:
+    return {
+        "texto": _texto_ia_ou_fallback_tecnico(interpretacao),
+        "reserva_confirmada": reserva_confirmada,
+        "dados_reserva": dict(dados_reserva or _dados_reserva_do_estado(estado)),
+        "status_reserva": status_reserva,
+        "confianca": float(interpretacao.get("confianca") or 0.0),
+    }
+
+
 def _aplicar_guardrails_configuracao_resposta(
     *,
     telefone: str,
@@ -608,7 +630,7 @@ def _aplicar_guardrails_configuracao_resposta(
     config: config_restaurante.ConfigRestaurante,
 ) -> RespostaAgente:
     texto_original = str(resposta.get("texto") or "")
-    texto_corrigido, motivos = _corrigir_texto_por_configuracao_estruturada(
+    _, motivos = _corrigir_texto_por_configuracao_estruturada(
         texto=texto_original,
         mensagem_cliente=mensagem_cliente,
         config=config,
@@ -616,17 +638,9 @@ def _aplicar_guardrails_configuracao_resposta(
     if not motivos:
         return resposta
 
-    resposta_corrigida = dict(resposta)
-    resposta_corrigida["texto"] = texto_corrigido
     motivo = ",".join(motivos)
-    _log_resposta_substituida(
-        texto_ia=texto_ia or texto_original,
-        texto_final=texto_corrigido,
-        funcao="_aplicar_guardrails_configuracao_resposta",
-        motivo=motivo,
-    )
     logger.warning(
-        "Resposta corrigida por configuracao estruturada: telefone=%s motivos=%s source=%s "
+        "Resposta da IA manteve prioridade apesar de alerta de configuracao: telefone=%s motivos=%s source=%s "
         "estabelecimento_id=%s taxa_valor=%s quantidade_minima=%s horarios_permitidos=%s",
         telefone,
         motivo,
@@ -636,7 +650,7 @@ def _aplicar_guardrails_configuracao_resposta(
         config.quantidade_minima_reserva,
         list(config.horarios_permitidos_reserva),
     )
-    return resposta_corrigida  # type: ignore[return-value]
+    return resposta
 
 
 def _corrigir_texto_por_configuracao_estruturada(
@@ -652,19 +666,7 @@ def _corrigir_texto_por_configuracao_estruturada(
     motivos = _motivos_contradicao_configuracao(texto_limpo, config)
     if not motivos:
         return texto_limpo, []
-
-    normalizado_cliente = _normalizar_busca(mensagem_cliente)
-    if any(motivo in motivos for motivo in ("taxa_reserva_contradita", "comprovante_pix_contradito")):
-        if re.search(r"\b(pessoas|quantidade|grupo|18|20|22|como funciona)\b", normalizado_cliente):
-            return _texto_reserva_estruturada(config), motivos
-        return _texto_taxa_reserva_config(config), motivos
-    if "horarios_reserva_fora_config" in motivos:
-        return _corrigir_horarios_reserva_config(texto_limpo, config), motivos
-    if "quantidade_minima_contradita" in motivos:
-        return _texto_quantidade_minima_config(config), motivos
-    if "politica_cancelamento_contradita" in motivos:
-        return _texto_cancelamento_config(config), motivos
-    return _texto_reserva_estruturada(config), motivos
+    return texto_limpo, motivos
 
 
 def _motivos_contradicao_configuracao(
@@ -1000,6 +1002,19 @@ def aplicar_guardrails_reserva(
     data_clara_promovivel = _mensagem_tem_data_clara_promovivel(mensagem_cliente, estado, interpretacao)
     horario_claro_promovivel = _mensagem_tem_horario_claro_promovivel(mensagem_cliente, estado, interpretacao)
 
+    if _eh_pedido_imediato(mensagem_cliente):
+        estado["pedido_imediato"] = True
+        estado["aguardando_confirmacao"] = False
+        estado["data_reserva"] = _hoje().isoformat()
+        estado["data_reserva_original"] = mensagem_cliente.strip()
+        _definir_campo_pendente(estado, "horario")
+        logger.info("Pedido imediato identificado. telefone=%s data_salva=%s.", telefone_limpo, estado.get("data_reserva", ""))
+        return _resposta_preservando_ia(
+            estado=estado,
+            interpretacao=interpretacao,
+            status_reserva="aguardando_humano",
+        )
+
     intencao_conversacional = _intencao_conversacional(mensagem_cliente)
     categoria_pergunta_restaurante = _categoria_pergunta_restaurante(mensagem_cliente)
     if not categoria_pergunta_restaurante and intencao_modelo == "pergunta_restaurante":
@@ -1013,6 +1028,16 @@ def aplicar_guardrails_reserva(
     ):
         intencao_conversacional = intencao_modelo
 
+    if intencao_modelo == "pedido_humano" or str(interpretacao.get("acao") or "") == "encaminhar_humano":
+        estado["aguardando_confirmacao"] = False
+        estado["cliente_autorizou_confirmacao"] = False
+        logger.info("Atendimento humano solicitado pela IA ou fallback tecnico. telefone=%s", telefone_limpo)
+        return _resposta_preservando_ia(
+            estado=estado,
+            interpretacao=interpretacao,
+            status_reserva="aguardando_humano",
+        )
+
     resposta_confirmacao = _resolver_mensagem_confirmacao_pendente(
         telefone=telefone_limpo,
         mensagem_cliente=mensagem_cliente,
@@ -1024,73 +1049,27 @@ def aplicar_guardrails_reserva(
         return resposta_confirmacao
 
     if _eh_recusa_reserva(mensagem_cliente) and not _confirmacao_ativa(estado):
-        texto = _texto_modelo_para_intencao(
-            interpretacao.get("texto", ""),
-            "recusa",
-            estado=estado,
-            faltantes=_campos_obrigatorios_faltantes(estado, telefone_limpo),
-        )
-        if not texto or _mensagem_indica_reserva(texto):
-            texto = MENSAGEM_RECUSA_RESERVA
-            _log_resposta_substituida(
-                texto_ia=interpretacao.get("texto", ""),
-                texto_final=texto,
-                funcao="aplicar_guardrails_reserva.recusa",
-                motivo="recusa_operacional",
-            )
         _estados_reserva.pop(telefone_limpo, None)
-        return {
-            "texto": texto,
-            "reserva_confirmada": False,
-            "dados_reserva": {},
-            "status_reserva": "sem_interesse",
-            "confianca": 1.0,
-        }
+        return _resposta_preservando_ia(
+            estado={},
+            interpretacao=interpretacao,
+            status_reserva="sem_interesse",
+            dados_reserva={},
+        )
 
     if (status_modelo == "cancelada" or _eh_cancelamento_cliente(mensagem_cliente)) and not categoria_pergunta_restaurante:
-        texto = interpretacao["texto"] or "Tudo bem, nao vou seguir com essa reserva."
-        if not interpretacao["texto"]:
-            _log_resposta_substituida(
-                texto_ia=interpretacao["texto"],
-                texto_final=texto,
-                funcao="aplicar_guardrails_reserva.cancelamento",
-                motivo="texto_ia_vazio",
-            )
         _estados_reserva.pop(telefone_limpo, None)
-        return {
-            "texto": texto,
-            "reserva_confirmada": False,
-            "dados_reserva": {},
-            "status_reserva": "cancelada",
-            "confianca": interpretacao["confianca"],
-        }
+        return _resposta_preservando_ia(
+            estado={},
+            interpretacao=interpretacao,
+            status_reserva="cancelada",
+            dados_reserva={},
+        )
 
     if _pergunta_sobre_horario_indisponivel(mensagem_cliente, estado) and _mensagem_pede_explicacao_horario(mensagem_cliente):
         estado["aguardando_confirmacao"] = False
         _definir_campo_pendente(estado, "horario")
-        texto = ""
-        if bool(interpretacao.get("contrato_novo")):
-            texto = _texto_modelo_para_intencao(
-                interpretacao["texto"],
-                "pergunta_restaurante",
-                estado=estado,
-                faltantes=_campos_obrigatorios_faltantes(estado, telefone_limpo),
-            )
-        if not texto:
-            texto = _mensagem_horario_fora_funcionamento(estado)
-            _log_resposta_substituida(
-                texto_ia=interpretacao["texto"],
-                texto_final=texto,
-                funcao="aplicar_guardrails_reserva.pergunta_horario_indisponivel",
-                motivo="texto_ia_vazio_ou_inseguro",
-            )
-        return {
-            "texto": texto,
-            "reserva_confirmada": False,
-            "dados_reserva": _dados_reserva_do_estado(estado),
-            "status_reserva": "em_coleta",
-            "confianca": max(interpretacao["confianca"], 0.8),
-        }
+        return _resposta_preservando_ia(estado=estado, interpretacao=interpretacao, status_reserva="em_coleta")
 
     invalidos_pre = _atualizar_estado_e_recalcular(
         estado,
@@ -1137,39 +1116,10 @@ def aplicar_guardrails_reserva(
             confianca=max(interpretacao["confianca"], 0.8),
         )
 
-    if _eh_pedido_imediato(mensagem_cliente):
-        return _resposta_pedido_imediato(
-            estado,
-            mensagem_cliente=mensagem_cliente,
-            confianca=max(interpretacao["confianca"], 0.9),
-        )
-
     if _pergunta_data_disponivel(mensagem_cliente):
         estado["aguardando_confirmacao"] = False
         _definir_campo_pendente(estado, "data_reserva")
-        texto = ""
-        if bool(interpretacao.get("contrato_novo")):
-            texto = _texto_modelo_para_intencao(
-                interpretacao["texto"],
-                "pergunta_disponibilidade",
-                estado=estado,
-                faltantes=_campos_obrigatorios_faltantes(estado, telefone_limpo),
-            )
-        if not texto:
-            texto = "Você tem alguma data em mente? Me fala o dia e eu verifico para você."
-            _log_resposta_substituida(
-                texto_ia=interpretacao["texto"],
-                texto_final=texto,
-                funcao="aplicar_guardrails_reserva.pergunta_data_disponivel",
-                motivo="texto_ia_vazio_ou_inseguro",
-            )
-        return {
-            "texto": texto,
-            "reserva_confirmada": False,
-            "dados_reserva": _dados_reserva_do_estado(estado),
-            "status_reserva": "em_coleta",
-            "confianca": interpretacao["confianca"],
-        }
+        return _resposta_preservando_ia(estado=estado, interpretacao=interpretacao, status_reserva="em_coleta")
 
     if _deve_respeitar_nao_aplicavel(estado, mensagem_cliente, status_modelo):
         return {
@@ -1220,53 +1170,34 @@ def aplicar_guardrails_reserva(
     if faltantes:
         campo = faltantes[0]
         _definir_campo_pendente(estado, campo)
-        texto = _texto_modelo_para_pedir_campo(interpretacao["texto"], campo, estado, mensagem_cliente, faltantes=faltantes)
-        conta_tentativa = _deve_contar_tentativa_campo(
-            mensagem_cliente=mensagem_cliente,
+        texto_ia = _texto_ia_ou_fallback_tecnico(interpretacao)
+        if _texto_tenta_confirmar_reserva(texto_ia):
+            texto = _mensagem_validacao_falhou(campo, estado, telefone_limpo, interpretacao, mensagem_cliente=mensagem_cliente)
+            return {
+                "texto": texto,
+                "reserva_confirmada": False,
+                "dados_reserva": dados_estado,
+                "status_reserva": "em_coleta",
+                "confianca": interpretacao["confianca"],
+            }
+        return _resposta_preservando_ia(
+            estado=estado,
             interpretacao=interpretacao,
-            campo=campo,
+            status_reserva="em_coleta",
+            dados_reserva=dados_estado,
         )
-        tentativa = _registrar_tentativa_campo(estado, campo) if conta_tentativa else _tentativas_campo(estado, campo)
-        if conta_tentativa:
-            texto = _mensagem_pedir_campo(campo, estado, registrar_tentativa=False, tentativa=tentativa)
-        if not texto:
-            texto = _mensagem_pedir_campo(campo, estado, registrar_tentativa=False, tentativa=tentativa)
-            _log_resposta_substituida(
-                texto_ia=interpretacao["texto"],
-                texto_final=texto,
-                funcao="aplicar_guardrails_reserva.coleta",
-                motivo=f"texto_ia_inseguro_em_coleta:{campo}:faltantes={','.join(faltantes)}",
-            )
-        status_reserva = "aguardando_humano" if conta_tentativa and _deve_encaminhar_humano_por_tentativas(estado, campo) else "em_coleta"
-        return {
-            "texto": texto,
-            "reserva_confirmada": False,
-            "dados_reserva": dados_estado,
-            "status_reserva": status_reserva,
-            "confianca": interpretacao["confianca"],
-        }
 
     if estado.get("confirmacao_pausada") and not confirmacao_cliente:
         estado["aguardando_confirmacao"] = True
         estado["cliente_autorizou_confirmacao"] = False
         _definir_campo_pendente(estado, "confirmacao")
         dados_estado = _dados_reserva_do_estado(estado)
-        texto_pausado = _texto_modelo_sem_pedir_confirmacao(interpretacao["texto"], estado)
-        if not texto_pausado:
-            texto_pausado = _mensagem_confirmacao_pausada(dados_estado)
-            _log_resposta_substituida(
-                texto_ia=interpretacao["texto"],
-                texto_final=texto_pausado,
-                funcao="aplicar_guardrails_reserva.confirmacao_pausada",
-                motivo="confirmacao_pausada_sem_pressao",
-            )
-        return {
-            "texto": texto_pausado,
-            "reserva_confirmada": False,
-            "dados_reserva": dados_estado,
-            "status_reserva": "aguardando_confirmacao",
-            "confianca": max(interpretacao["confianca"], 0.8),
-        }
+        return _resposta_preservando_ia(
+            estado=estado,
+            interpretacao=interpretacao,
+            status_reserva="aguardando_confirmacao",
+            dados_reserva=dados_estado,
+        )
 
     estado["aguardando_confirmacao"] = True
     estado["confirmacao_pausada"] = False
@@ -1274,22 +1205,12 @@ def aplicar_guardrails_reserva(
     estado["ultima_confirmacao_oferecida_em"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     _definir_campo_pendente(estado, "confirmacao")
     dados_estado = _dados_reserva_do_estado(estado)
-    texto_confirmacao = _texto_modelo_confirmacao_previa(interpretacao["texto"], dados_estado)
-    if not texto_confirmacao:
-        texto_confirmacao = _mensagem_confirmacao_previa_segura(dados_estado)
-        _log_resposta_substituida(
-            texto_ia=interpretacao["texto"],
-            texto_final=texto_confirmacao,
-            funcao="aplicar_guardrails_reserva.confirmacao_previa",
-            motivo="resumo_ia_vazio_ou_inseguro",
-        )
-    return {
-        "texto": texto_confirmacao,
-        "reserva_confirmada": False,
-        "dados_reserva": dados_estado,
-        "status_reserva": "aguardando_confirmacao",
-        "confianca": max(interpretacao["confianca"], 0.8),
-    }
+    return _resposta_preservando_ia(
+        estado=estado,
+        interpretacao=interpretacao,
+        status_reserva="aguardando_confirmacao",
+        dados_reserva=dados_estado,
+    )
 
 
 def _atualizar_estado_e_recalcular(
@@ -2360,6 +2281,12 @@ def _mensagem_validacao_falhou(
     *,
     mensagem_cliente: str,
 ) -> str:
+    texto_modelo = _texto_modelo_para_validacao(str(interpretacao.get("texto") or ""), campo)
+    if texto_modelo:
+        _registrar_tentativa_campo(estado, campo)
+        _registrar_validacao_estado(estado, campo=campo, resposta="modelo")
+        return texto_modelo
+
     texto_pos_validacao = _gerar_resposta_ia_pos_validacao(
         campo=campo,
         estado=estado,
@@ -2372,15 +2299,9 @@ def _mensagem_validacao_falhou(
         _registrar_validacao_estado(estado, campo=campo, resposta="ia_pos_validacao")
         return texto_pos_validacao
 
-    texto_modelo = _texto_modelo_para_validacao(str(interpretacao.get("texto") or ""), campo)
-    if texto_modelo:
-        _registrar_tentativa_campo(estado, campo)
-        _registrar_validacao_estado(estado, campo=campo, resposta="modelo")
-        return texto_modelo
-
-    texto = _mensagem_campo_invalido(campo, estado, telefone)
-    _registrar_validacao_estado(estado, campo=campo, resposta="fallback")
-    return texto
+    _registrar_tentativa_campo(estado, campo)
+    _registrar_validacao_estado(estado, campo=campo, resposta="fallback_tecnico")
+    return _resposta_contingencia()
 
 
 def _gerar_resposta_ia_pos_validacao(
@@ -2671,10 +2592,12 @@ def _confirmar_reserva_pendente(
         estado["aguardando_confirmacao"] = False
         campo = _primeiro_campo_pendente(list(invalidos), estado, telefone)
         _definir_campo_pendente(estado, campo)
-        texto = (
-            _mensagem_campo_invalido(campo, estado, telefone)
-            if campo in invalidos
-            else _mensagem_pedir_campo(campo, estado)
+        texto = _mensagem_validacao_falhou(
+            campo,
+            estado,
+            telefone,
+            interpretacao,
+            mensagem_cliente=str(interpretacao.get("mensagem_cliente") or ""),
         )
         _log_resposta_substituida(
             texto_ia=str(interpretacao.get("texto") or ""),
@@ -2726,23 +2649,12 @@ def _responder_pausa_confirmacao(
     estado["cliente_autorizou_confirmacao"] = False
     estado["aguardando_confirmacao"] = True
     _definir_campo_pendente(estado, "confirmacao")
-    texto = _texto_modelo_sem_pedir_confirmacao(str(interpretacao.get("texto") or ""), estado)
-    if not texto:
-        texto = "Tranquilo, nao vou confirmar ainda."
-        _log_resposta_substituida(
-            texto_ia=str(interpretacao.get("texto") or ""),
-            texto_final=texto,
-            funcao="_responder_pausa_confirmacao",
-            motivo="pausa_confirmacao",
-        )
     logger.info("Confirmacao pausada pelo cliente. telefone=%s", telefone)
-    return {
-        "texto": texto,
-        "reserva_confirmada": False,
-        "dados_reserva": _dados_reserva_do_estado(estado),
-        "status_reserva": "aguardando_confirmacao",
-        "confianca": max(float(interpretacao.get("confianca") or 0.0), 0.8),
-    }
+    return _resposta_preservando_ia(
+        estado=estado,
+        interpretacao=interpretacao,
+        status_reserva="aguardando_confirmacao",
+    )
 
 
 def _responder_resumo_confirmacao(
@@ -2755,21 +2667,13 @@ def _responder_resumo_confirmacao(
     estado["cliente_autorizou_confirmacao"] = False
     _definir_campo_pendente(estado, "confirmacao")
     dados_estado = _dados_reserva_do_estado(estado)
-    texto = _mensagem_resumo_reserva_sem_confirmacao(dados_estado)
-    _log_resposta_substituida(
-        texto_ia=str(interpretacao.get("texto") or ""),
-        texto_final=texto,
-        funcao="_responder_resumo_confirmacao",
-        motivo="pedido_resumo_sem_pressao_confirmacao",
+    logger.info("Pedido de resumo preservou resposta da IA. telefone=%s", telefone)
+    return _resposta_preservando_ia(
+        estado=estado,
+        interpretacao=interpretacao,
+        status_reserva="aguardando_confirmacao",
+        dados_reserva=dados_estado,
     )
-    logger.info("Resumo da reserva enviado sem repetir pedido de confirmacao. telefone=%s", telefone)
-    return {
-        "texto": texto,
-        "reserva_confirmada": False,
-        "dados_reserva": dados_estado,
-        "status_reserva": "aguardando_confirmacao",
-        "confianca": max(float(interpretacao.get("confianca") or 0.0), 0.8),
-    }
 
 
 def _responder_contexto_confirmacao(
@@ -2782,23 +2686,12 @@ def _responder_contexto_confirmacao(
     estado["aguardando_confirmacao"] = True
     estado["cliente_autorizou_confirmacao"] = False
     _definir_campo_pendente(estado, "confirmacao")
-    texto = _texto_modelo_sem_pedir_confirmacao(str(interpretacao.get("texto") or ""), estado)
-    if not texto:
-        texto = _fallback_contexto_confirmacao(mensagem_cliente)
-        _log_resposta_substituida(
-            texto_ia=str(interpretacao.get("texto") or ""),
-            texto_final=texto,
-            funcao="_responder_contexto_confirmacao",
-            motivo="texto_ia_vazio_ou_com_pressao_confirmacao",
-        )
-    logger.info("Pergunta/comentario respondido durante confirmacao sem repetir pedido. telefone=%s", telefone)
-    return {
-        "texto": texto,
-        "reserva_confirmada": False,
-        "dados_reserva": _dados_reserva_do_estado(estado),
-        "status_reserva": "aguardando_confirmacao",
-        "confianca": max(float(interpretacao.get("confianca") or 0.0), 0.8),
-    }
+    logger.info("Pergunta/comentario durante confirmacao preservou resposta da IA. telefone=%s", telefone)
+    return _resposta_preservando_ia(
+        estado=estado,
+        interpretacao=interpretacao,
+        status_reserva="aguardando_confirmacao",
+    )
 
 
 def _eh_pausa_confirmacao(texto: str) -> bool:
@@ -2849,6 +2742,15 @@ def _texto_pede_confirmacao(texto: str) -> bool:
         re.search(r"\b(posso|pode|quer|queria)\s+confirmar\b", normalizado)
         or re.search(r"\bconfirma\??\b", normalizado)
         or re.search(r"\besta\s+tudo\s+certo\??\b", normalizado)
+    )
+
+
+def _texto_tenta_confirmar_reserva(texto: str) -> bool:
+    normalizado = _normalizar_busca(texto)
+    return bool(
+        re.search(r"\breserva\s+confirmad[ao]\b", normalizado)
+        or re.search(r"\bconfirmad[ao]\s+(?:para|a reserva)\b", normalizado)
+        or _texto_pede_confirmacao(texto)
     )
 
 
@@ -3049,30 +2951,16 @@ def _responder_intencao_conversacional(
     if campo:
         _definir_campo_pendente(estado, campo)
 
-    faltantes = _campos_obrigatorios_faltantes(estado, telefone)
-    texto_ia = str(interpretacao.get("texto", "") or "")
-    texto = _texto_modelo_para_intencao(texto_ia, intencao, estado=estado, faltantes=faltantes)
-    if not texto:
-        texto = _texto_fallback_intencao(intencao, estado)
-        _log_resposta_substituida(
-            texto_ia=texto_ia,
-            texto_final=texto,
-            funcao="_responder_intencao_conversacional",
-            motivo="texto_ia_vazio_ou_inseguro",
-        )
-
     logger.info(
-        "Intencao conversacional respondida sem contar erro: intencao=%s campo_retomada=%s.",
+        "Intencao conversacional preservou resposta da IA: intencao=%s campo_retomada=%s.",
         intencao,
         campo,
     )
-    return {
-        "texto": texto,
-        "reserva_confirmada": False,
-        "dados_reserva": _dados_reserva_do_estado(estado),
-        "status_reserva": "aguardando_confirmacao" if campo == "confirmacao" else "em_coleta",
-        "confianca": max(interpretacao["confianca"], 0.8),
-}
+    return _resposta_preservando_ia(
+        estado=estado,
+        interpretacao=interpretacao,
+        status_reserva="aguardando_confirmacao" if campo == "confirmacao" else "em_coleta",
+    )
 
 
 def _texto_modelo_para_intencao(
@@ -3277,37 +3165,16 @@ def _responder_pergunta_restaurante(
     campo = _campo_retomada_apos_informacao(estado, telefone)
     if campo:
         _definir_campo_pendente(estado, campo)
-
-    texto = ""
-    texto_ia = ""
-    if interpretacao is not None and bool(interpretacao.get("contrato_novo")):
-        texto_ia = str(interpretacao.get("texto") or "")
-        texto = _texto_modelo_para_intencao(
-            texto_ia,
-            "pergunta_restaurante",
-            estado=estado,
-            faltantes=_campos_obrigatorios_faltantes(estado, telefone),
-        )
-    if not texto:
-        texto = _texto_pergunta_restaurante(categoria, estado)
-        _log_resposta_substituida(
-            texto_ia=texto_ia,
-            texto_final=texto,
-            funcao="_responder_pergunta_restaurante",
-            motivo="texto_ia_vazio_ou_inseguro",
-        )
     logger.info(
-        "Pergunta sobre restaurante respondida durante fluxo de reserva: categoria=%s campo_retomada=%s.",
+        "Pergunta sobre restaurante preservou resposta da IA: categoria=%s campo_retomada=%s.",
         categoria,
         campo,
     )
-    return {
-        "texto": texto,
-        "reserva_confirmada": False,
-        "dados_reserva": _dados_reserva_do_estado(estado),
-        "status_reserva": "aguardando_confirmacao" if campo == "confirmacao" else "em_coleta",
-        "confianca": confianca,
-    }
+    return _resposta_preservando_ia(
+        estado=estado,
+        interpretacao=interpretacao or {"texto": "", "confianca": confianca},
+        status_reserva="aguardando_confirmacao" if campo == "confirmacao" else "em_coleta",
+    )
 
 
 def _campo_retomada_apos_informacao(estado: EstadoReserva, telefone: str) -> str:
@@ -3496,7 +3363,13 @@ def _extrair_nome_cliente(texto: str) -> str | None:
 
 
 def _normalizar_busca(texto: str) -> str:
-    texto_normalizado = unicodedata.normalize("NFD", str(texto or "").lower())
+    texto_base = str(texto or "")
+    if "Ã" in texto_base or "Â" in texto_base:
+        try:
+            texto_base = texto_base.encode("latin1").decode("utf-8")
+        except UnicodeError:
+            pass
+    texto_normalizado = unicodedata.normalize("NFD", texto_base.lower())
     return "".join(char for char in texto_normalizado if unicodedata.category(char) != "Mn").strip()
 
 
@@ -3578,9 +3451,24 @@ def _hoje() -> date:
 
 
 def _resposta_contingencia() -> str:
-    return (
-        "Tive uma instabilidade aqui, mas ja estou retomando. "
-        "Pode me confirmar o dia, horario e numero de pessoas para a reserva?"
+    return "Nao consegui processar essa mensagem agora. Vou encaminhar para a equipe."
+
+
+def _payload_fallback_tecnico() -> str:
+    return json.dumps(
+        {
+            "resposta": _resposta_contingencia(),
+            "intencao": "pedido_humano",
+            "dados_confirmados": {},
+            "dados_mencionados": {},
+            "dados_incertos": {},
+            "correcoes": {},
+            "acao": "encaminhar_humano",
+            "deve_avancar_estado": False,
+            "campo_sugerido": None,
+            "confianca": 1.0,
+        },
+        ensure_ascii=False,
     )
 
 

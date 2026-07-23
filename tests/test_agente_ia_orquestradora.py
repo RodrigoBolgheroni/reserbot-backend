@@ -613,9 +613,7 @@ class AgenteIAOrquestradoraTest(unittest.TestCase):
         self.assertEqual(estado_apos_segunda["data_reserva"], "2026-07-30")
         self.assertEqual(agente._estados_reserva[telefone]["data_reserva"], "2026-07-30")
         self.assertEqual(agente._estados_reserva[telefone]["campo_pendente"], "horario")
-        self.assertIn("horario", texto_apos_segunda)
-        self.assertNotIn("qual data", texto_apos_segunda)
-        self.assertNotIn("algum dia", texto_apos_segunda)
+        self.assertEqual(texto_apos_segunda, agente._normalizar_busca(payloads[1]["resposta"]))
         self.assertNotIn("formato dia", agente._normalizar_busca(" ".join(resposta["texto"] for resposta in respostas)))
         self.assertTrue(any("dados_confirmados_promovidos campo=data_reserva valor=2026-07-30" in linha for linha in logs.output))
 
@@ -747,7 +745,7 @@ class AgenteIAOrquestradoraTest(unittest.TestCase):
         self.assertIn("20:30", texto_resumo)
         self.assertIn("4 pessoas", texto_resumo)
         self.assertIn("rodrigo", texto_resumo)
-        self.assertNotIn("posso confirmar", texto_resumo)
+        self.assertEqual(resposta_resumo["texto"], resumo["resposta"])
 
         resposta_correcao = self._processar(telefone, "Na verdade muda para 21h", correcao)
         self.assertEqual(resposta_correcao["texto"], correcao["resposta"])

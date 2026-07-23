@@ -139,6 +139,39 @@ class FluxoCoexistenciaTest(unittest.TestCase):
         registrar.assert_called_once()
 
     @patch.object(fluxo_reservas, "_mensagem_ja_processada", return_value=False)
+    @patch.object(fluxo_reservas, "registrar_mensagem")
+    @patch.object(fluxo_reservas, "atualizar_status_conversa")
+    @patch.object(fluxo_reservas, "buscar_conversa_ativa_por_telefone")
+    @patch.object(fluxo_reservas.clientes_supabase, "buscar_cliente_por_telefone")
+    @patch.object(fluxo_reservas.agente, "processar_mensagem")
+    @patch.object(fluxo_reservas.whatsapp, "enviar_com_resultado")
+    def test_pare_agora_interrompe_sem_chamar_ia(
+        self,
+        enviar,
+        processar,
+        buscar_cliente,
+        buscar_ativa,
+        atualizar,
+        registrar,
+        _ja_processada,
+    ) -> None:
+        conversa = {"id": "conv-1", "cliente_telefone": "5511999999999", "status": "bot_ativo"}
+        buscar_cliente.return_value = {"id": "cliente-1", "telefone": "5511999999999", "nome": "Cliente"}
+        buscar_ativa.return_value = conversa
+
+        resposta = fluxo_reservas.processar_resposta_cliente(
+            telefone="5511999999999",
+            mensagem_cliente="pare agora",
+            provider_message_id="wamid.pare",
+        )
+
+        self.assertEqual(resposta["status_reserva"], "humano")
+        atualizar.assert_called_once_with(conversa, status="humano")
+        processar.assert_not_called()
+        enviar.assert_not_called()
+        registrar.assert_called_once()
+
+    @patch.object(fluxo_reservas, "_mensagem_ja_processada", return_value=False)
     @patch.object(fluxo_reservas, "registrar_reserva_confirmada")
     @patch.object(fluxo_reservas, "registrar_mensagem")
     @patch.object(fluxo_reservas, "finalizar_conversa")
