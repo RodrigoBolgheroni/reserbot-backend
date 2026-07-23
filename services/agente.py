@@ -92,12 +92,21 @@ class ResultadoReservaEstruturada(TypedDict):
     texto: str
     reserva_confirmada: bool
     dados_reserva: DadosReserva
+    dados_confirmados: DadosReserva
+    dados_mencionados: DadosReserva
+    dados_incertos: dict[str, Any]
     status_reserva: str
     confianca: float
     intencao: str
     acao: str
     proximo_campo: str
+    deve_avancar_estado: bool
     correcoes: dict[str, Any]
+    assunto_atual: str
+    pergunta_aberta: str
+    tom_cliente: str
+    resumo_conversa: str
+    contrato_novo: bool
 
 
 class EstadoReserva(TypedDict, total=False):
@@ -117,6 +126,14 @@ class EstadoReserva(TypedDict, total=False):
     ultimo_texto_bot: str
     ultimo_campo_perguntado: str
     ultima_intencao: str
+    assunto_atual: str
+    pergunta_aberta: str
+    tom_cliente: str
+    resumo_conversa: str
+    dados_confirmados: dict[str, Any]
+    dados_mencionados: dict[str, Any]
+    dados_incertos: dict[str, Any]
+    confirmacao_pendente: dict[str, Any]
     validacoes: list[dict[str, Any]]
     updated_at: str
     versao: int
@@ -146,6 +163,7 @@ INTENCOES_CONVERSACIONAIS_IA: Final[set[str]] = {
     "pergunta_fonte",
     "pergunta_restaurante",
     "pergunta_disponibilidade",
+    "pergunta_contextual",
     "duvida",
 }
 MAPA_CAMPO_IA: Final[dict[str, str]] = {
@@ -178,6 +196,14 @@ CHAVES_ESTADO_PERSISTIDO: Final[set[str]] = {
     "ultimo_texto_bot",
     "ultimo_campo_perguntado",
     "ultima_intencao",
+    "assunto_atual",
+    "pergunta_aberta",
+    "tom_cliente",
+    "resumo_conversa",
+    "dados_confirmados",
+    "dados_mencionados",
+    "dados_incertos",
+    "confirmacao_pendente",
     "validacoes",
     "updated_at",
     "versao",
@@ -354,6 +380,9 @@ def _normalizar_estado_reserva_persistido(estado: Mapping[str, Any] | None) -> E
                 and str(total).isdigit()
             }
             continue
+        if chave in {"dados_confirmados", "dados_mencionados", "dados_incertos", "confirmacao_pendente"} and isinstance(valor, Mapping):
+            normalizado[chave] = dict(valor)  # type: ignore[literal-required]
+            continue
         if chave == "validacoes" and isinstance(valor, list):
             normalizado["validacoes"] = [dict(item) for item in valor if isinstance(item, Mapping)][-10:]
             continue
@@ -394,9 +423,19 @@ def _mensagem_contexto_reserva(telefone: str) -> Mensagem:
     dados = _dados_reserva_do_estado(estado)
     campo = _campo_retomada_apos_informacao(estado, telefone) if estado else "data_reserva"
     payload = {
+        "dados_confirmados": estado.get("dados_confirmados") or dados,
+        "dados_mencionados_nao_confirmados": estado.get("dados_mencionados", {}),
+        "dados_incertos": estado.get("dados_incertos", {}),
         "dados_reserva_ja_coletados": dados,
-        "campo_que_ainda_falta": campo,
-        "etapa_interna": estado.get("etapa", ""),
+        "campo_sugerido": campo,
+        "campo_pendente_orientativo": estado.get("campo_pendente", ""),
+        "etapa_interna_orientativa": estado.get("etapa", ""),
+        "ultima_intencao": estado.get("ultima_intencao", ""),
+        "assunto_atual": estado.get("assunto_atual", ""),
+        "pergunta_aberta": estado.get("pergunta_aberta", ""),
+        "resumo_conversa": estado.get("resumo_conversa", ""),
+        "tom_cliente": estado.get("tom_cliente", ""),
+        "validacoes_backend": estado.get("validacoes", []),
     }
     return {
         "role": "system",
@@ -404,8 +443,9 @@ def _mensagem_contexto_reserva(telefone: str) -> Mensagem:
             "Contexto interno da conversa atual. Use isto para responder de forma natural, "
             "sem repetir perguntas ja feitas e sem perder dados coletados: "
             f"{json.dumps(payload, ensure_ascii=False)}. "
-            "Antes de pedir o campo faltante, responda ao significado da mensagem do cliente. "
-            "Se o cliente fizer uma pergunta ou comentario, isso nao e erro."
+            "O campo pendente e apenas uma orientacao, nao uma ordem. "
+            "Antes de extrair dados, entenda o significado da mensagem. "
+            "Dados mencionados nao sao dados confirmados."
         ),
     }
 
@@ -438,6 +478,8 @@ def aplicar_guardrails_reserva(
 
     if _nome_parece_valido(nome_cliente):
         estado["nome_cliente"] = nome_cliente.strip()
+
+    _atualizar_contexto_conversacional_estado(estado, interpretacao)
 
     intencao_conversacional = _intencao_conversacional(mensagem_cliente)
     categoria_pergunta_restaurante = _categoria_pergunta_restaurante(mensagem_cliente)
@@ -483,6 +525,7 @@ def aplicar_guardrails_reserva(
             categoria=categoria_pergunta_restaurante,
             telefone=telefone_limpo,
             estado=estado,
+            interpretacao=interpretacao,
             confianca=max(interpretacao["confianca"], 0.8),
         )
 
@@ -496,8 +539,12 @@ def aplicar_guardrails_reserva(
     if _pergunta_sobre_horario_indisponivel(mensagem_cliente, estado) and _mensagem_pede_explicacao_horario(mensagem_cliente):
         estado["aguardando_confirmacao"] = False
         _definir_campo_pendente(estado, "horario")
+        texto = ""
+        if bool(interpretacao.get("contrato_novo")):
+            texto = _texto_modelo_para_intencao(interpretacao["texto"], "pergunta_restaurante")
+        texto = texto or _mensagem_horario_fora_funcionamento()
         return {
-            "texto": _mensagem_horario_fora_funcionamento(),
+            "texto": texto,
             "reserva_confirmada": False,
             "dados_reserva": _dados_reserva_do_estado(estado),
             "status_reserva": "em_coleta",
@@ -507,8 +554,12 @@ def aplicar_guardrails_reserva(
     if _pergunta_data_disponivel(mensagem_cliente):
         estado["aguardando_confirmacao"] = False
         _definir_campo_pendente(estado, "data_reserva")
+        texto = ""
+        if bool(interpretacao.get("contrato_novo")):
+            texto = _texto_modelo_para_intencao(interpretacao["texto"], "pergunta_disponibilidade")
+        texto = texto or "Você tem alguma data em mente? Me fala o dia e eu verifico para você."
         return {
-            "texto": "Você tem alguma data em mente? Me fala o dia e eu verifico para você.",
+            "texto": texto,
             "reserva_confirmada": False,
             "dados_reserva": _dados_reserva_do_estado(estado),
             "status_reserva": "em_coleta",
@@ -581,7 +632,7 @@ def aplicar_guardrails_reserva(
     if invalidos:
         campo = _primeiro_campo_pendente(list(invalidos), estado, telefone_limpo)
         _definir_campo_pendente(estado, campo)
-        texto = _mensagem_validacao_falhou(campo, estado, telefone_limpo, interpretacao)
+        texto = _mensagem_validacao_falhou(campo, estado, telefone_limpo, interpretacao, mensagem_cliente=mensagem_cliente)
         status_reserva = "aguardando_humano" if _deve_encaminhar_humano_por_tentativas(estado, campo) else "em_coleta"
         return {
             "texto": texto,
@@ -609,8 +660,11 @@ def aplicar_guardrails_reserva(
     estado["aguardando_confirmacao"] = True
     _definir_campo_pendente(estado, "confirmacao")
     dados_estado = _dados_reserva_do_estado(estado)
+    texto_confirmacao = _texto_modelo_confirmacao_previa(interpretacao["texto"], dados_estado)
+    if not texto_confirmacao:
+        texto_confirmacao = _mensagem_confirmacao_previa_segura(dados_estado)
     return {
-        "texto": _mensagem_confirmacao_previa_segura(dados_estado),
+        "texto": texto_confirmacao,
         "reserva_confirmada": False,
         "dados_reserva": dados_estado,
         "status_reserva": "aguardando_confirmacao",
@@ -709,12 +763,21 @@ def interpretar_resposta_modelo(
             "texto": texto_cliente,
             "reserva_confirmada": contem_flag_reserva(texto_modelo),
             "dados_reserva": extrair_dados_reserva(mensagem_cliente, texto_cliente),
+            "dados_confirmados": {},
+            "dados_mencionados": {},
+            "dados_incertos": {},
             "status_reserva": "confirmada" if contem_flag_reserva(texto_modelo) else "em_coleta",
             "confianca": 0.5 if contem_flag_reserva(texto_modelo) else 0.0,
             "intencao": "",
             "acao": "",
             "proximo_campo": "",
+            "deve_avancar_estado": False,
             "correcoes": {},
+            "assunto_atual": "",
+            "pergunta_aberta": "",
+            "tom_cliente": "",
+            "resumo_conversa": "",
+            "contrato_novo": False,
         }
 
     reserva = payload.get("reserva")
@@ -729,14 +792,23 @@ def interpretar_resposta_modelo(
         status = "aguardando_humano"
     if acao in {"continuar_conversa", "continuar_reserva"} and status == "nao_aplicavel":
         status = "em_coleta"
+    contrato_novo = _payload_usa_contrato_novo(payload)
     dados_reserva = _dados_reserva_de_json(reserva_dict)
     dados_extraidos = payload.get("dados_extraidos")
     if isinstance(dados_extraidos, dict):
         dados_reserva.update(_dados_extraidos_de_json(dados_extraidos))
+    dados_confirmados = _dados_reserva_de_json(payload.get("dados_confirmados") if isinstance(payload.get("dados_confirmados"), dict) else {})
+    dados_mencionados = _dados_reserva_de_json(payload.get("dados_mencionados") if isinstance(payload.get("dados_mencionados"), dict) else {})
+    if not dados_confirmados and dados_reserva and _payload_antigo_deve_confirmar_dados(payload):
+        dados_confirmados = dict(dados_reserva)
+    if dados_confirmados:
+        dados_reserva.update(dados_confirmados)
+    dados_incertos_payload = payload.get("dados_incertos")
+    dados_incertos = dict(dados_incertos_payload) if isinstance(dados_incertos_payload, Mapping) else {}
     texto_cliente = str(
         payload.get("resposta_natural")
-        or payload.get("resposta_cliente")
         or payload.get("resposta")
+        or payload.get("resposta_cliente")
         or payload.get("texto")
         or ""
     ).strip()
@@ -753,12 +825,21 @@ def interpretar_resposta_modelo(
         "texto": texto_cliente,
         "reserva_confirmada": reserva_confirmada,
         "dados_reserva": dados_reserva,
+        "dados_confirmados": dados_confirmados,
+        "dados_mencionados": dados_mencionados,
+        "dados_incertos": dados_incertos,
         "status_reserva": status,
         "confianca": _confianca(payload.get("confianca") or reserva_dict.get("confianca")),
         "intencao": _normalizar_intencao_ia(str(payload.get("intencao") or "")),
         "acao": acao,
-        "proximo_campo": _normalizar_campo_ia(str(payload.get("proximo_campo") or "")),
+        "proximo_campo": _normalizar_campo_ia(str(payload.get("campo_sugerido") or payload.get("proximo_campo") or "")),
+        "deve_avancar_estado": _bool_payload(payload.get("deve_avancar_estado"), padrao=_payload_antigo_deve_confirmar_dados(payload)),
         "correcoes": correcoes,
+        "assunto_atual": str(payload.get("assunto_atual") or "").strip(),
+        "pergunta_aberta": str(payload.get("pergunta_aberta") or "").strip(),
+        "tom_cliente": str(payload.get("tom_cliente") or "").strip(),
+        "resumo_conversa": str(payload.get("resumo_conversa") or "").strip(),
+        "contrato_novo": contrato_novo,
     }
 
 
@@ -795,6 +876,49 @@ def _dados_extraidos_de_json(dados: Mapping[str, Any]) -> DadosReserva:
     return reserva
 
 
+def _payload_antigo_deve_confirmar_dados(payload: Mapping[str, Any]) -> bool:
+    if "dados_confirmados" in payload or "dados_mencionados" in payload:
+        return False
+    acao = str(payload.get("acao") or "").strip().lower()
+    intencao = _normalizar_intencao_ia(str(payload.get("intencao") or ""))
+    return bool(
+        acao in {"continuar_conversa", "continuar_reserva", "confirmar_reserva", "confirmar"}
+        or intencao in {"fornecimento_dados", "correcao"}
+        or not intencao
+    )
+
+
+def _payload_usa_contrato_novo(payload: Mapping[str, Any]) -> bool:
+    return any(
+        chave in payload
+        for chave in (
+            "dados_confirmados",
+            "dados_mencionados",
+            "dados_incertos",
+            "deve_avancar_estado",
+            "campo_sugerido",
+            "assunto_atual",
+            "pergunta_aberta",
+            "tom_cliente",
+            "resumo_conversa",
+        )
+    )
+
+
+def _bool_payload(valor: Any, *, padrao: bool) -> bool:
+    if isinstance(valor, bool):
+        return valor
+    if isinstance(valor, str):
+        normalizado = _normalizar_busca(valor)
+        if normalizado in {"true", "sim", "1", "yes"}:
+            return True
+        if normalizado in {"false", "nao", "0", "no"}:
+            return False
+    if valor is None:
+        return padrao
+    return bool(valor)
+
+
 def _normalizar_intencao_ia(valor: str) -> str:
     normalizado = _normalizar_busca(valor).replace(" ", "_")
     mapa = {
@@ -805,6 +929,10 @@ def _normalizar_intencao_ia(valor: str) -> str:
         "informar_data": "fornecimento_dados",
         "informar_horario": "fornecimento_dados",
         "informar_quantidade": "fornecimento_dados",
+        "pergunta_contextual": "pergunta_contextual",
+        "corrigir_horario": "correcao",
+        "corrigir_data": "correcao",
+        "corrigir_quantidade": "correcao",
         "pergunta_sobre_restaurante": "pergunta_restaurante",
         "pergunta_sobre_disponibilidade": "pergunta_disponibilidade",
         "sem_interesse": "recusa",
@@ -830,33 +958,48 @@ def _atualizar_estado_reserva(
     campo_pendente = _campo_aguardado(estado)
     intencao_modelo = _normalizar_intencao_ia(str(interpretacao.get("intencao") or ""))
     mensagem_eh_conversa = intencao_modelo in INTENCOES_CONVERSACIONAIS_IA or bool(_intencao_conversacional(mensagem_cliente))
-    dados_usuario = _extrair_dados_reserva_contextual(
-        mensagem_cliente,
-        "",
-        campo_aguardado=campo_pendente,
+    deve_avancar = bool(interpretacao.get("deve_avancar_estado")) or _mensagem_indica_correcao(mensagem_cliente, interpretacao)
+    dados_confirmados = _dados_reserva_de_json(dict(interpretacao.get("dados_confirmados") or {}))
+    correcoes_confirmadas = _dados_reserva_de_json(dict(interpretacao.get("correcoes") or {}))
+    dados_modelo_confirmados: DadosReserva = {}
+    dados_modelo_confirmados.update(dados_confirmados)  # type: ignore[arg-type]
+    dados_modelo_confirmados.update(correcoes_confirmadas)
+    contrato_novo = bool(interpretacao.get("contrato_novo"))
+    usar_fallback_extracao = deve_avancar and not mensagem_eh_conversa and (not dados_modelo_confirmados or not contrato_novo)
+    dados_usuario = (
+        _extrair_dados_reserva_contextual(
+            mensagem_cliente,
+            "",
+            campo_aguardado=campo_pendente,
+        )
+        if usar_fallback_extracao
+        else {}
     )
 
-    pessoas_solicitadas = _extrair_pessoas_solicitadas(
-        mensagem_cliente,
-        permitir_numero_isolado=campo_pendente == "pessoas",
-    )
-    if pessoas_solicitadas is not None:
-        if 1 <= pessoas_solicitadas <= _limite_pessoas_reserva():
-            dados_usuario["pessoas"] = pessoas_solicitadas
-        else:
-            invalidos.add("pessoas")
+    if usar_fallback_extracao:
+        pessoas_solicitadas = _extrair_pessoas_solicitadas(
+            mensagem_cliente,
+            permitir_numero_isolado=campo_pendente == "pessoas",
+        )
+        if pessoas_solicitadas is not None:
+            if 1 <= pessoas_solicitadas <= _limite_pessoas_reserva():
+                dados_usuario["pessoas"] = pessoas_solicitadas
+            else:
+                invalidos.add("pessoas")
 
-    horario_usuario = _extrair_horario(
-        mensagem_cliente,
-        permitir_numero_isolado=campo_pendente == "horario",
-    )
-    if horario_usuario and not _horario_reserva_valido(horario_usuario):
-        invalidos.add("horario")
+        horario_usuario = _extrair_horario(
+            mensagem_cliente,
+            permitir_numero_isolado=campo_pendente == "horario",
+        )
+        if horario_usuario and not _horario_reserva_valido(horario_usuario):
+            invalidos.add("horario")
 
     tem_sinal_data = _mensagem_tem_sinal_data(mensagem_cliente) or (
         campo_pendente == "data_reserva" and _mensagem_parece_numero_isolado(mensagem_cliente)
     )
     if (
+        usar_fallback_extracao
+        and
         campo_pendente in {"", "data_reserva"}
         and tem_sinal_data
         and not mensagem_eh_conversa
@@ -864,19 +1007,23 @@ def _atualizar_estado_reserva(
     ):
         invalidos.add("data_reserva")
 
-    if _pode_aceitar_dado_modelo("data_reserva", mensagem_cliente, estado, interpretacao):
+    if _pode_aplicar_dado_confirmado("data_reserva", estado, interpretacao, mensagem_cliente):
         _definir_data_estado(
             estado,
-            dados_modelo.get("data_reserva"),
+            dados_modelo_confirmados.get("data_reserva"),
             invalidos=invalidos,
             valor_original=mensagem_cliente,
-            fonte="modelo",
+            fonte="ia_confirmado",
             permitir_sobrescrever=_mensagem_indica_correcao(mensagem_cliente, interpretacao),
         )
-    if _pode_aceitar_dado_modelo("horario", mensagem_cliente, estado, interpretacao):
-        _definir_horario_estado(estado, dados_modelo.get("horario"), invalidos=invalidos)
-    if _pode_aceitar_dado_modelo("pessoas", mensagem_cliente, estado, interpretacao):
-        _definir_pessoas_estado(estado, dados_modelo.get("pessoas"), invalidos=invalidos)
+    if _pode_aplicar_dado_confirmado("horario", estado, interpretacao, mensagem_cliente):
+        _definir_horario_estado(estado, dados_modelo_confirmados.get("horario"), invalidos=invalidos)
+    if _pode_aplicar_dado_confirmado("pessoas", estado, interpretacao, mensagem_cliente):
+        _definir_pessoas_estado(estado, dados_modelo_confirmados.get("pessoas"), invalidos=invalidos)
+    if _pode_aplicar_dado_confirmado("nome_cliente", estado, interpretacao, mensagem_cliente) and _nome_parece_valido(
+        str(dados_modelo_confirmados.get("nome_cliente") or "")
+    ):
+        estado["nome_cliente"] = str(dados_modelo_confirmados.get("nome_cliente")).strip()
 
     _definir_data_estado(
         estado,
@@ -889,9 +1036,10 @@ def _atualizar_estado_reserva(
     _definir_horario_estado(estado, dados_usuario.get("horario"), invalidos=invalidos)
     _definir_pessoas_estado(estado, dados_usuario.get("pessoas"), invalidos=invalidos)
 
-    observacoes = str(dados_modelo.get("observacoes") or dados_usuario.get("observacoes") or "").strip()
+    observacoes = str(dados_modelo_confirmados.get("observacoes") or dados_usuario.get("observacoes") or "").strip()
     if observacoes:
         estado["observacoes"] = observacoes
+    _sincronizar_dados_confirmados_estado(estado)
 
 
 def _definir_data_estado(
@@ -1030,6 +1178,44 @@ def _deve_encaminhar_humano_por_tentativas(estado: Mapping[str, Any], campo: str
     return _tentativas_campo(estado, campo) >= 3
 
 
+def _pode_aplicar_dado_confirmado(
+    campo: str,
+    estado: EstadoReserva,
+    interpretacao: Mapping[str, Any],
+    mensagem_cliente: str,
+) -> bool:
+    dados_confirmados = interpretacao.get("dados_confirmados")
+    correcoes = interpretacao.get("correcoes")
+    tem_dado = isinstance(dados_confirmados, Mapping) and dados_confirmados.get(campo) not in (None, "", [])
+    if not tem_dado and campo == "data_reserva" and isinstance(dados_confirmados, Mapping):
+        tem_dado = dados_confirmados.get("data") not in (None, "", [])
+    if not tem_dado and campo == "pessoas" and isinstance(dados_confirmados, Mapping):
+        tem_dado = dados_confirmados.get("quantidade") not in (None, "", [])
+    tem_correcao = isinstance(correcoes, Mapping) and correcoes.get(campo) not in (None, "", [])
+    if not tem_correcao and campo == "horario" and isinstance(correcoes, Mapping):
+        tem_correcao = correcoes.get("hora") not in (None, "", [])
+    if not tem_correcao and campo == "pessoas" and isinstance(correcoes, Mapping):
+        tem_correcao = correcoes.get("quantidade") not in (None, "", [])
+
+    if not tem_dado and not tem_correcao:
+        return False
+    contrato_novo = bool(interpretacao.get("contrato_novo"))
+    campo_aguardado = _campo_aguardado(estado)
+    if not contrato_novo:
+        if _mensagem_indica_correcao(mensagem_cliente, interpretacao):
+            return campo == campo_aguardado or (
+                campo == "horario" and _mensagem_tem_sinal_horario(mensagem_cliente)
+            )
+        if campo_aguardado in {"data_reserva", "horario", "pessoas", "nome_cliente"}:
+            return campo == campo_aguardado
+        return not estado.get(campo)
+    if _mensagem_indica_correcao(mensagem_cliente, interpretacao) or tem_correcao:
+        return True
+    if bool(interpretacao.get("deve_avancar_estado")):
+        return True
+    return campo == campo_aguardado and _normalizar_intencao_ia(str(interpretacao.get("intencao") or "")) == "fornecimento_dados"
+
+
 def _pode_aceitar_dado_modelo(
     campo: str,
     mensagem_cliente: str,
@@ -1063,6 +1249,44 @@ def _pode_aceitar_dado_modelo(
     if campo == "pessoas":
         return not estado.get("pessoas") and _mensagem_tem_sinal_pessoas(mensagem_cliente)
     return False
+
+
+def _atualizar_contexto_conversacional_estado(estado: EstadoReserva, interpretacao: Mapping[str, Any]) -> None:
+    for chave in ("assunto_atual", "pergunta_aberta", "tom_cliente", "resumo_conversa"):
+        valor = str(interpretacao.get(chave) or "").strip()
+        if valor:
+            estado[chave] = valor  # type: ignore[literal-required]
+
+    intencao = _normalizar_intencao_ia(str(interpretacao.get("intencao") or ""))
+    if intencao:
+        estado["ultima_intencao"] = intencao
+
+    dados_mencionados = interpretacao.get("dados_mencionados")
+    if isinstance(dados_mencionados, Mapping) and dados_mencionados:
+        estado["dados_mencionados"] = _mesclar_dict_contexto(dict(estado.get("dados_mencionados") or {}), dict(dados_mencionados))
+
+    dados_incertos = interpretacao.get("dados_incertos")
+    if isinstance(dados_incertos, Mapping) and dados_incertos:
+        estado["dados_incertos"] = _mesclar_dict_contexto(dict(estado.get("dados_incertos") or {}), dict(dados_incertos))
+
+    dados_confirmados = interpretacao.get("dados_confirmados")
+    if isinstance(dados_confirmados, Mapping) and dados_confirmados:
+        estado["dados_confirmados"] = _mesclar_dict_contexto(dict(estado.get("dados_confirmados") or {}), dict(dados_confirmados))
+
+
+def _mesclar_dict_contexto(anterior: dict[str, Any], novo: dict[str, Any]) -> dict[str, Any]:
+    mesclado = dict(anterior)
+    for chave, valor in novo.items():
+        if valor not in (None, "", [], {}):
+            mesclado[str(chave)] = valor
+    return mesclado
+
+
+def _sincronizar_dados_confirmados_estado(estado: EstadoReserva) -> None:
+    confirmados = dict(estado.get("dados_confirmados") or {})
+    for campo, valor in _dados_reserva_do_estado(estado).items():
+        confirmados[campo] = valor
+    estado["dados_confirmados"] = confirmados
 
 
 def _deve_respeitar_nao_aplicavel(estado: EstadoReserva, mensagem_cliente: str, status_modelo: str) -> bool:
@@ -1148,7 +1372,21 @@ def _mensagem_validacao_falhou(
     estado: EstadoReserva,
     telefone: str,
     interpretacao: Mapping[str, Any],
+    *,
+    mensagem_cliente: str,
 ) -> str:
+    texto_pos_validacao = _gerar_resposta_ia_pos_validacao(
+        campo=campo,
+        estado=estado,
+        telefone=telefone,
+        interpretacao=interpretacao,
+        mensagem_cliente=mensagem_cliente,
+    )
+    if texto_pos_validacao:
+        _registrar_tentativa_campo(estado, campo)
+        _registrar_validacao_estado(estado, campo=campo, resposta="ia_pos_validacao")
+        return texto_pos_validacao
+
     texto_modelo = _texto_modelo_para_validacao(str(interpretacao.get("texto") or ""), campo)
     if texto_modelo:
         _registrar_tentativa_campo(estado, campo)
@@ -1158,6 +1396,93 @@ def _mensagem_validacao_falhou(
     texto = _mensagem_campo_invalido(campo, estado, telefone)
     _registrar_validacao_estado(estado, campo=campo, resposta="fallback")
     return texto
+
+
+def _gerar_resposta_ia_pos_validacao(
+    *,
+    campo: str,
+    estado: EstadoReserva,
+    telefone: str,
+    interpretacao: Mapping[str, Any],
+    mensagem_cliente: str,
+) -> str:
+    if not _usa_contrato_novo(interpretacao):
+        return ""
+    if not os.getenv("GROQ_API_KEY", "").strip():
+        return ""
+
+    resultado_validacao = _resultado_validacao(campo, estado)
+    try:
+        texto_modelo = _chamar_groq(
+            mensagens=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Voce e a atendente virtual do restaurante. O backend validou um dado informado pelo cliente "
+                        "e ele nao pode ser usado. Responda de forma natural, curta, sem parecer formulario, "
+                        "explicando o motivo e retomando a conversa. Responda somente JSON valido com a chave resposta."
+                    ),
+                },
+                _mensagem_contexto_reserva(telefone),
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "mensagem_cliente": mensagem_cliente,
+                            "resposta_inicial_ia": interpretacao.get("texto", ""),
+                            "campo_invalido": campo,
+                            "resultado_validacao_backend": resultado_validacao,
+                            "dados_confirmados_atuais": _dados_reserva_do_estado(estado),
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            modelo=os.getenv("GROQ_MODEL", MODELO_PADRAO),
+        )
+    except Exception:
+        logger.exception("Falha ao gerar resposta natural pos-validacao.")
+        return ""
+
+    payload = _extrair_json_resposta(texto_modelo)
+    if isinstance(payload, Mapping):
+        texto = str(payload.get("resposta") or payload.get("resposta_natural") or payload.get("texto") or "").strip()
+    else:
+        texto = remover_flag_reserva(texto_modelo)
+    return texto if texto and not _texto_modelo_parece_rigido(texto) else ""
+
+
+def _usa_contrato_novo(interpretacao: Mapping[str, Any]) -> bool:
+    return bool(interpretacao.get("contrato_novo"))
+
+
+def _resultado_validacao(campo: str, estado: Mapping[str, Any]) -> dict[str, Any]:
+    abertura, fechamento = _horario_funcionamento_texto()
+    if campo == "horario":
+        horario = str(estado.get("horario_invalido") or "")
+        return {
+            "valido": False,
+            "campo": "horario",
+            "motivo": "fora_do_funcionamento",
+            "horario_informado": horario,
+            "abre": abertura,
+            "fecha": fechamento,
+        }
+    if campo == "data_reserva":
+        return {
+            "valido": False,
+            "campo": "data",
+            "motivo": "data_passada_ou_invalida",
+            "hoje": _hoje().isoformat(),
+        }
+    if campo == "pessoas":
+        return {
+            "valido": False,
+            "campo": "quantidade",
+            "motivo": "fora_do_limite_automatico",
+            "limite": _limite_pessoas_reserva(),
+        }
+    return {"valido": False, "campo": campo, "motivo": "campo_invalido"}
 
 
 def _texto_modelo_para_validacao(texto: str, campo: str) -> str:
@@ -1261,6 +1586,16 @@ def _mensagem_confirmacao_previa_segura(dados: Mapping[str, Any]) -> str:
             dados.get("pessoas", ""),
         )
     return texto
+
+
+def _texto_modelo_confirmacao_previa(texto: str, dados: Mapping[str, Any]) -> str:
+    texto_limpo = remover_flag_reserva(str(texto or ""))
+    if not texto_limpo or _texto_modelo_parece_rigido(texto_limpo):
+        return ""
+    normalizado = _normalizar_busca(texto_limpo)
+    if not re.search(r"\b(confirma|posso confirmar|esta certo|tudo certo|fechado)\b", normalizado):
+        return ""
+    return texto_limpo if _resumo_confere_estado(texto_limpo, dados) else ""
 
 
 def _resumo_confere_estado(texto: str, dados: Mapping[str, Any]) -> bool:
@@ -1610,13 +1945,18 @@ def _responder_pergunta_restaurante(
     categoria: str,
     telefone: str,
     estado: EstadoReserva,
+    interpretacao: Mapping[str, Any] | None = None,
     confianca: float,
 ) -> RespostaAgente:
     campo = _campo_retomada_apos_informacao(estado, telefone)
     if campo:
         _definir_campo_pendente(estado, campo)
 
-    texto = _texto_pergunta_restaurante(categoria, estado)
+    texto = ""
+    if interpretacao is not None and bool(interpretacao.get("contrato_novo")):
+        texto = _texto_modelo_para_intencao(str(interpretacao.get("texto") or ""), "pergunta_restaurante")
+    if not texto:
+        texto = _texto_pergunta_restaurante(categoria, estado)
     logger.info(
         "Pergunta sobre restaurante respondida durante fluxo de reserva: categoria=%s campo_retomada=%s.",
         categoria,
@@ -1935,15 +2275,21 @@ def _mensagem_sistema(nome_cliente: str, *, perfil_cliente: Mapping[str, Any] | 
             "\n"
             "Seu objetivo:\n"
             "Coletar dia, horário e número de pessoas. "
-            "Converse primeiro como uma atendente humana inteligente. "
+            "Converse primeiro como uma atendente humana inteligente; voce e a orquestradora principal da conversa. "
+            "Entenda o significado completo da mensagem antes de extrair qualquer dado. "
             "Antes de tratar a mensagem como preenchimento de campo, classifique a intencao: "
             "pedido de humano, pergunta sobre restaurante, pergunta sobre o bot/conversa, correcao, recusa/cancelamento, "
-            "fornecimento de data/horario/quantidade ou mensagem incompreensivel. "
+            "pergunta contextual, fornecimento de data/horario/quantidade ou mensagem incompreensivel. "
             "Perguntas, comentarios e duvidas nao sao erro e nao devem soar como formulario. "
             "Quando fizer sentido, responda ao que o cliente disse e retome naturalmente o proximo dado da reserva. "
             "Interprete dados como uma pessoa interpretaria: '11 horas' e '11 da manha' significam horario 11:00; "
             "'20 sem contar comigo' significa 21 pessoas; 'eu e mais 3' significa 4 pessoas; "
             "comentarios como 'se nao estiver chovendo eu vou no dia 28 kkk' sao comentarios/condicionais, nao erro de horario. "
+            "Nunca considere um numero como dado confirmado apenas porque apareceu na frase. "
+            "Exemplo: 'eu saio do trabalho as 20h, sera que da tempo?' menciona 20h, mas nao escolhe horario. "
+            "Nesse caso use dados_mencionados, nao dados_confirmados, e deve_avancar_estado=false. "
+            "Ja 'entao coloca 20h30' confirma ou corrige horario. "
+            "Separe sempre dados_confirmados, dados_mencionados e dados_incertos. "
             "Use a etapa atual para interpretar numeros: se o sistema aguarda quantidade, um numero solto e quantidade; "
             "se aguarda horario, um numero solto pode ser horario; se aguarda data, pode ser dia. "
             "Pergunte data e horário juntos na primeira pergunta quando a conversa ainda estiver iniciando. "
@@ -1967,12 +2313,16 @@ def _mensagem_sistema(nome_cliente: str, *, perfil_cliente: Mapping[str, Any] | 
             "Se o cliente perguntar como voce sabe uma informacao, explique que os dados foram cadastrados pela equipe no sistema. "
             "Nunca diga que um horario esta disponivel sem uma agenda real integrada; diga que atende dentro do funcionamento e vai verificar a solicitacao. "
             "Responda sempre e somente em JSON válido, sem markdown. Use este formato principal: "
-            '{"resposta_natural":"texto natural para enviar ao cliente",'
-            '"intencao":"pedido_humano|pergunta_restaurante|pergunta_bot|pergunta_fonte|correcao|recusa|fornecimento_dados|comentario|incompreensivel",'
-            '"dados_extraidos":{"data":"YYYY-MM-DD ou null","horario":"HH:MM ou null","quantidade":numero ou null},'
+            '{"resposta":"texto natural para enviar ao cliente",'
+            '"intencao":"pedido_humano|pergunta_restaurante|pergunta_bot|pergunta_fonte|pergunta_contextual|correcao|recusa|fornecimento_dados|comentario|brincadeira|incompreensivel",'
+            '"dados_confirmados":{"data":"YYYY-MM-DD ou null","horario":"HH:MM ou null","quantidade":numero ou null,"nome":"texto ou null"},'
+            '"dados_mencionados":{"data":"YYYY-MM-DD ou null","horario":"HH:MM ou null","quantidade":numero ou null},'
+            '"dados_incertos":{"campo":"valor incerto"} ou {},'
             '"correcoes":{"campo":"valor corrigido"} ou {},'
-            '"acao":"continuar_conversa|confirmar_reserva|cancelar|encaminhar_humano",'
-            '"proximo_campo":"data|horario|quantidade|nome|confirmacao|null",'
+            '"acao":"responder|continuar_conversa|pedir_confirmacao|confirmar_reserva|cancelar|encaminhar_humano",'
+            '"deve_avancar_estado":true ou false,'
+            '"campo_sugerido":"data|horario|quantidade|nome|confirmacao|null",'
+            '"assunto_atual":"texto curto","pergunta_aberta":"texto curto","tom_cliente":"texto curto","resumo_conversa":"texto curto",'
             '"confianca":0.0}. '
             "O formato antigo tambem e aceito internamente: "
             '{"resposta_cliente":"texto para enviar ao cliente",'
@@ -2008,7 +2358,7 @@ def _extrair_json_resposta(texto: str) -> dict[str, Any] | None:
 
 def _dados_reserva_de_json(reserva: dict[str, Any]) -> DadosReserva:
     dados: DadosReserva = {}
-    data_reserva = reserva.get("data_reserva")
+    data_reserva = reserva.get("data_reserva") or reserva.get("data") or reserva.get("dia")
     if isinstance(data_reserva, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", data_reserva):
         dados["data_reserva"] = data_reserva
     elif isinstance(data_reserva, str):
@@ -2016,7 +2366,7 @@ def _dados_reserva_de_json(reserva: dict[str, Any]) -> DadosReserva:
         if data_interpretada:
             dados["data_reserva"] = data_interpretada
 
-    horario = reserva.get("horario")
+    horario = reserva.get("horario") or reserva.get("hora")
     if isinstance(horario, str) and re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", horario):
         dados["horario"] = horario
     elif isinstance(horario, str):
@@ -2024,9 +2374,10 @@ def _dados_reserva_de_json(reserva: dict[str, Any]) -> DadosReserva:
         if horario_interpretado:
             dados["horario"] = horario_interpretado
 
-    pessoas = _pessoas_json(reserva.get("pessoas"))
-    if pessoas is None and isinstance(reserva.get("pessoas"), str):
-        pessoas = _extrair_pessoas_solicitadas(str(reserva.get("pessoas")), permitir_numero_isolado=True)
+    pessoas_valor = reserva.get("pessoas") or reserva.get("quantidade") or reserva.get("quantidade_pessoas")
+    pessoas = _pessoas_json(pessoas_valor)
+    if pessoas is None and isinstance(pessoas_valor, str):
+        pessoas = _extrair_pessoas_solicitadas(str(pessoas_valor), permitir_numero_isolado=True)
     if pessoas is not None:
         dados["pessoas"] = pessoas
 
