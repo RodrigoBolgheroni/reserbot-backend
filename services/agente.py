@@ -46,7 +46,7 @@ MESES: Final[dict[str, int]] = {
     "nov": 11,
     "dezembro": 12,
     "dez": 12,
-}
+    }
 
 NUMEROS_POR_EXTENSO: Final[dict[str, int]] = {
     "um": 1,
@@ -492,6 +492,20 @@ def _registrar_ultima_resposta(telefone: str, texto: str) -> None:
         estado["ultimo_campo_perguntado"] = campo
 
 
+def _log_resposta_substituida(*, texto_ia: str, texto_final: str, funcao: str, motivo: str) -> None:
+    texto_ia_limpo = remover_flag_reserva(str(texto_ia or "")).strip()
+    texto_final_limpo = str(texto_final or "").strip()
+    if texto_ia_limpo and texto_final_limpo and texto_ia_limpo == texto_final_limpo:
+        return
+    logger.info(
+        "DIAG_RESERVA resposta_sobrescrita funcao=%s motivo=%s texto_ia=%r texto_final=%r",
+        funcao,
+        motivo,
+        texto_ia_limpo,
+        texto_final_limpo,
+    )
+
+
 def aplicar_guardrails_reserva(
     *,
     telefone: str,
@@ -527,9 +541,23 @@ def aplicar_guardrails_reserva(
         intencao_conversacional = intencao_modelo
 
     if _eh_recusa_reserva(mensagem_cliente):
+        texto = _texto_modelo_para_intencao(
+            interpretacao.get("texto", ""),
+            "recusa",
+            estado=estado,
+            faltantes=_campos_obrigatorios_faltantes(estado, telefone_limpo),
+        )
+        if not texto or _mensagem_indica_reserva(texto):
+            texto = MENSAGEM_RECUSA_RESERVA
+            _log_resposta_substituida(
+                texto_ia=interpretacao.get("texto", ""),
+                texto_final=texto,
+                funcao="aplicar_guardrails_reserva.recusa",
+                motivo="recusa_operacional",
+            )
         _estados_reserva.pop(telefone_limpo, None)
         return {
-            "texto": MENSAGEM_RECUSA_RESERVA,
+            "texto": texto,
             "reserva_confirmada": False,
             "dados_reserva": {},
             "status_reserva": "sem_interesse",
@@ -537,9 +565,17 @@ def aplicar_guardrails_reserva(
         }
 
     if (status_modelo == "cancelada" or _eh_cancelamento_cliente(mensagem_cliente)) and not categoria_pergunta_restaurante:
+        texto = interpretacao["texto"] or "Tudo bem, nao vou seguir com essa reserva."
+        if not interpretacao["texto"]:
+            _log_resposta_substituida(
+                texto_ia=interpretacao["texto"],
+                texto_final=texto,
+                funcao="aplicar_guardrails_reserva.cancelamento",
+                motivo="texto_ia_vazio",
+            )
         _estados_reserva.pop(telefone_limpo, None)
         return {
-            "texto": interpretacao["texto"] or "Tudo bem, nao vou seguir com essa reserva.",
+            "texto": texto,
             "reserva_confirmada": False,
             "dados_reserva": {},
             "status_reserva": "cancelada",
@@ -575,8 +611,20 @@ def aplicar_guardrails_reserva(
         _definir_campo_pendente(estado, "horario")
         texto = ""
         if bool(interpretacao.get("contrato_novo")):
-            texto = _texto_modelo_para_intencao(interpretacao["texto"], "pergunta_restaurante")
-        texto = texto or _mensagem_horario_fora_funcionamento()
+            texto = _texto_modelo_para_intencao(
+                interpretacao["texto"],
+                "pergunta_restaurante",
+                estado=estado,
+                faltantes=_campos_obrigatorios_faltantes(estado, telefone_limpo),
+            )
+        if not texto:
+            texto = _mensagem_horario_fora_funcionamento()
+            _log_resposta_substituida(
+                texto_ia=interpretacao["texto"],
+                texto_final=texto,
+                funcao="aplicar_guardrails_reserva.pergunta_horario_indisponivel",
+                motivo="texto_ia_vazio_ou_inseguro",
+            )
         return {
             "texto": texto,
             "reserva_confirmada": False,
@@ -590,8 +638,20 @@ def aplicar_guardrails_reserva(
         _definir_campo_pendente(estado, "data_reserva")
         texto = ""
         if bool(interpretacao.get("contrato_novo")):
-            texto = _texto_modelo_para_intencao(interpretacao["texto"], "pergunta_disponibilidade")
-        texto = texto or "Você tem alguma data em mente? Me fala o dia e eu verifico para você."
+            texto = _texto_modelo_para_intencao(
+                interpretacao["texto"],
+                "pergunta_disponibilidade",
+                estado=estado,
+                faltantes=_campos_obrigatorios_faltantes(estado, telefone_limpo),
+            )
+        if not texto:
+            texto = "Você tem alguma data em mente? Me fala o dia e eu verifico para você."
+            _log_resposta_substituida(
+                texto_ia=interpretacao["texto"],
+                texto_final=texto,
+                funcao="aplicar_guardrails_reserva.pergunta_data_disponivel",
+                motivo="texto_ia_vazio_ou_inseguro",
+            )
         return {
             "texto": texto,
             "reserva_confirmada": False,
@@ -641,8 +701,15 @@ def aplicar_guardrails_reserva(
             )
             campo = _primeiro_campo_pendente([], estado, telefone_limpo)
             _definir_campo_pendente(estado, campo)
+            texto = _mensagem_pedir_campo(campo, estado)
+            _log_resposta_substituida(
+                texto_ia=interpretacao["texto"],
+                texto_final=texto,
+                funcao="aplicar_guardrails_reserva.confirmacao_bloqueada",
+                motivo=f"confirmacao_incompleta:{campo}",
+            )
             return {
-                "texto": _mensagem_pedir_campo(campo, estado),
+                "texto": texto,
                 "reserva_confirmada": False,
                 "dados_reserva": dados_estado,
                 "status_reserva": "em_coleta",
@@ -655,8 +722,15 @@ def aplicar_guardrails_reserva(
             dados_estado.get("pessoas", ""),
             telefone_limpo,
         )
+        texto = _mensagem_reserva_confirmada(dados_estado)
+        _log_resposta_substituida(
+            texto_ia=interpretacao["texto"],
+            texto_final=texto,
+            funcao="aplicar_guardrails_reserva.confirmacao_final",
+            motivo="confirmacao_final_operacional",
+        )
         return {
-            "texto": _mensagem_reserva_confirmada(dados_estado),
+            "texto": texto,
             "reserva_confirmada": True,
             "dados_reserva": dados_estado,
             "status_reserva": "confirmada",
@@ -667,11 +741,11 @@ def aplicar_guardrails_reserva(
         campo = _primeiro_campo_pendente(list(invalidos), estado, telefone_limpo)
         _definir_campo_pendente(estado, campo)
         texto = _mensagem_validacao_falhou(campo, estado, telefone_limpo, interpretacao, mensagem_cliente=mensagem_cliente)
-        logger.info(
-            "DIAG_RESERVA resposta_sobrescrita motivo=validacao_invalida campo=%s texto_ia=%r texto_final=%r",
-            campo,
-            interpretacao["texto"],
-            texto,
+        _log_resposta_substituida(
+            texto_ia=interpretacao["texto"],
+            texto_final=texto,
+            funcao="aplicar_guardrails_reserva.validacao",
+            motivo=f"validacao_invalida:{campo}",
         )
         status_reserva = "aguardando_humano" if _deve_encaminhar_humano_por_tentativas(estado, campo) else "em_coleta"
         return {
@@ -696,12 +770,11 @@ def aplicar_guardrails_reserva(
             texto = _mensagem_pedir_campo(campo, estado, registrar_tentativa=False, tentativa=tentativa)
         if not texto:
             texto = _mensagem_pedir_campo(campo, estado, registrar_tentativa=False, tentativa=tentativa)
-            logger.info(
-                "DIAG_RESERVA resposta_sobrescrita motivo=texto_ia_inseguro_em_coleta campo=%s texto_ia=%r texto_final=%r faltantes=%s",
-                campo,
-                interpretacao["texto"],
-                texto,
-                faltantes,
+            _log_resposta_substituida(
+                texto_ia=interpretacao["texto"],
+                texto_final=texto,
+                funcao="aplicar_guardrails_reserva.coleta",
+                motivo=f"texto_ia_inseguro_em_coleta:{campo}:faltantes={','.join(faltantes)}",
             )
         status_reserva = "aguardando_humano" if conta_tentativa and _deve_encaminhar_humano_por_tentativas(estado, campo) else "em_coleta"
         return {
@@ -718,6 +791,12 @@ def aplicar_guardrails_reserva(
     texto_confirmacao = _texto_modelo_confirmacao_previa(interpretacao["texto"], dados_estado)
     if not texto_confirmacao:
         texto_confirmacao = _mensagem_confirmacao_previa_segura(dados_estado)
+        _log_resposta_substituida(
+            texto_ia=interpretacao["texto"],
+            texto_final=texto_confirmacao,
+            funcao="aplicar_guardrails_reserva.confirmacao_previa",
+            motivo="resumo_ia_vazio_ou_inseguro",
+        )
     return {
         "texto": texto_confirmacao,
         "reserva_confirmada": False,
@@ -1969,9 +2048,17 @@ def _responder_intencao_conversacional(
     if campo:
         _definir_campo_pendente(estado, campo)
 
-    texto = _texto_modelo_para_intencao(interpretacao.get("texto", ""), intencao)
+    faltantes = _campos_obrigatorios_faltantes(estado, telefone)
+    texto_ia = str(interpretacao.get("texto", "") or "")
+    texto = _texto_modelo_para_intencao(texto_ia, intencao, estado=estado, faltantes=faltantes)
     if not texto:
         texto = _texto_fallback_intencao(intencao, estado)
+        _log_resposta_substituida(
+            texto_ia=texto_ia,
+            texto_final=texto,
+            funcao="_responder_intencao_conversacional",
+            motivo="texto_ia_vazio_ou_inseguro",
+        )
 
     logger.info(
         "Intencao conversacional respondida sem contar erro: intencao=%s campo_retomada=%s.",
@@ -1984,26 +2071,24 @@ def _responder_intencao_conversacional(
         "dados_reserva": _dados_reserva_do_estado(estado),
         "status_reserva": "aguardando_confirmacao" if campo == "confirmacao" else "em_coleta",
         "confianca": max(interpretacao["confianca"], 0.8),
-    }
+}
 
 
-def _texto_modelo_para_intencao(texto: str, intencao: str) -> str:
+def _texto_modelo_para_intencao(
+    texto: str,
+    intencao: str,
+    *,
+    estado: Mapping[str, Any] | None = None,
+    faltantes: Sequence[str] = (),
+) -> str:
     texto_limpo = remover_flag_reserva(str(texto or ""))
-    if not texto_limpo or _texto_modelo_parece_rigido(texto_limpo):
+    if not texto_limpo:
         return ""
-    normalizado = _normalizar_busca(texto_limpo)
-    if intencao == "pergunta_fonte":
-        return texto_limpo if re.search(r"\b(cadastrad|equipe|sistema|informacoes|dados)\b", normalizado) else ""
-    if intencao == "pergunta_bot":
-        return texto_limpo if re.search(r"\b(assistente|virtual|bot|robo|atendente|equipe)\b", normalizado) else ""
-    if intencao == "comentario_indecisao":
-        return texto_limpo if re.search(r"\b(sem problema|tranquilo|quando|decidir|continuo|por aqui)\b", normalizado) else ""
-    if intencao in {"comentario", "brincadeira", "indecisao", "duvida"}:
-        return texto_limpo if not re.search(r"\b(nao consegui entender|invalido|invalida)\b", normalizado) else ""
-    if intencao in {"pergunta_restaurante", "pergunta_disponibilidade"}:
-        return texto_limpo if "?" not in texto_limpo or not _texto_so_pede_campo(texto_limpo) else ""
-    if intencao == "saudacao":
-        return texto_limpo if not _texto_so_pede_campo(texto_limpo) else ""
+    estado_seguro = estado or {}
+    if _texto_modelo_parece_rigido(texto_limpo):
+        return ""
+    if _texto_modelo_inseguro_em_coleta(texto_limpo, faltantes, estado_seguro):
+        return ""
     return texto_limpo
 
 
@@ -2188,10 +2273,23 @@ def _responder_pergunta_restaurante(
         _definir_campo_pendente(estado, campo)
 
     texto = ""
+    texto_ia = ""
     if interpretacao is not None and bool(interpretacao.get("contrato_novo")):
-        texto = _texto_modelo_para_intencao(str(interpretacao.get("texto") or ""), "pergunta_restaurante")
+        texto_ia = str(interpretacao.get("texto") or "")
+        texto = _texto_modelo_para_intencao(
+            texto_ia,
+            "pergunta_restaurante",
+            estado=estado,
+            faltantes=_campos_obrigatorios_faltantes(estado, telefone),
+        )
     if not texto:
         texto = _texto_pergunta_restaurante(categoria, estado)
+        _log_resposta_substituida(
+            texto_ia=texto_ia,
+            texto_final=texto,
+            funcao="_responder_pergunta_restaurante",
+            motivo="texto_ia_vazio_ou_inseguro",
+        )
     logger.info(
         "Pergunta sobre restaurante respondida durante fluxo de reserva: categoria=%s campo_retomada=%s.",
         categoria,

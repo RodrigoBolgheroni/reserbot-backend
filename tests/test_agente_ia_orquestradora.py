@@ -134,6 +134,30 @@ class AgenteIAOrquestradoraTest(unittest.TestCase):
         self.assertEqual(estado["tentativas_campos"]["horario"], 2)
         self.assertNotIn("nao consegui entender", agente._normalizar_busca(resposta["texto"]))
 
+    def test_comentario_indecisao_usa_resposta_natural_da_ia(self) -> None:
+        telefone = "5511990000034"
+        payload = {
+            "resposta": "Qual dia e horário você está pensando para a reserva, caso consiga combinar com os outros?",
+            "intencao": "comentario_indecisao",
+            "dados_confirmados": {},
+            "dados_mencionados": {},
+            "dados_incertos": {},
+            "correcoes": {},
+            "acao": "responder",
+            "deve_avancar_estado": False,
+            "campo_sugerido": "data",
+            "confianca": 0.9,
+        }
+
+        resposta = self._processar(telefone, "Quero reservar, mas ainda estou vendo com o pessoal", payload)
+
+        estado = agente._estados_reserva[telefone]
+        self.assertEqual(resposta["texto"], payload["resposta"])
+        self.assertEqual(resposta["status_reserva"], "em_coleta")
+        self.assertEqual(estado["campo_pendente"], "data_reserva")
+        self.assertNotIn("tentativas_campos", estado)
+        self.assertNotIn("quando decidir", agente._normalizar_busca(resposta["texto"]))
+
     def test_contexto_expandido_fica_serializavel_para_supabase(self) -> None:
         telefone = "5511990000999"
         payload = {
