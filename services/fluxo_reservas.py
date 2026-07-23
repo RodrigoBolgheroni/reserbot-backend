@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any, TypedDict
 
@@ -137,8 +138,9 @@ def processar_resposta_cliente(
             "confianca": 0.0,
         }
 
-    if provider_message_id and _mensagem_ja_processada(provider_message_id):
-        logger.info("Mensagem de webhook ja processada: %s", provider_message_id)
+    provider_message_ids = _provider_message_ids(provider_message_id, metadata_mensagem)
+    if any(message_id and _mensagem_ja_processada(message_id) for message_id in provider_message_ids):
+        logger.info("Mensagem de webhook ja processada: %s", ",".join(provider_message_ids))
         return {
             "texto": "",
             "reserva_confirmada": False,
@@ -167,9 +169,8 @@ def processar_resposta_cliente(
             if conversa_atual is None:
                 conversa_atual = iniciar_conversa(cliente, origem="webhook", status="aguardando_humano")
             logger.info("Mensagem recebida fora de fluxo ativo. Bot nao respondeu. telefone=%s", telefone_limpo)
-            registrar_mensagem(
+            _registrar_mensagens_cliente(
                 conversa_atual,
-                remetente="cliente",
                 conteudo=mensagem_limpa,
                 provider_message_id=provider_message_id,
                 metadata=metadata_mensagem,
@@ -196,9 +197,8 @@ def processar_resposta_cliente(
             telefone_limpo,
             status_conversa,
         )
-        registrar_mensagem(
+        _registrar_mensagens_cliente(
             conversa_atual,
-            remetente="cliente",
             conteudo=mensagem_limpa,
             provider_message_id=provider_message_id,
             metadata=metadata_mensagem,
@@ -211,15 +211,15 @@ def processar_resposta_cliente(
             "confianca": 1.0,
         }
 
-    registrar_mensagem(
+    _registrar_mensagens_cliente(
         conversa_atual,
-        remetente="cliente",
         conteudo=mensagem_limpa,
         provider_message_id=provider_message_id,
         metadata=metadata_mensagem,
     )
     if _pediu_atendimento_humano(mensagem_limpa):
         atualizar_status_conversa(conversa_atual, status="humano")
+        _limpar_estado_reserva_conversa(conversa_atual, telefone_limpo)
         logger.info("Bot pausado por pedido de humano. telefone=%s", telefone_limpo)
         return {
             "texto": "",
@@ -231,6 +231,7 @@ def processar_resposta_cliente(
 
     atualizar_status_conversa(conversa_atual, status="bot_ativo")
     logger.info("Bot respondeu porque conversa esta ativa. telefone=%s", telefone_limpo)
+    _carregar_estado_reserva_conversa(conversa_atual, telefone_limpo)
     resposta = agente.processar_mensagem(
         telefone=telefone_limpo,
         mensagem_cliente=mensagem_limpa,
@@ -250,6 +251,7 @@ def processar_resposta_cliente(
             "reserva_confirmada": False,
             "status_reserva": "em_coleta",
         }
+    _salvar_estado_reserva_conversa(conversa_atual, telefone_limpo, resposta=resposta)
 
     if resposta["texto"]:
         envio = whatsapp.enviar_com_resultado(telefone_limpo, resposta["texto"])
@@ -269,12 +271,14 @@ def processar_resposta_cliente(
     if resposta.get("status_reserva") == "aguardando_humano":
         atualizar_status_conversa(conversa_atual, status="aguardando_humano")
         agente.limpar_historico(telefone_limpo)
+        _limpar_estado_reserva_conversa(conversa_atual, telefone_limpo)
         logger.info("Bot pausado para atendimento humano. telefone=%s motivo=%s", telefone_limpo, resposta.get("status_reserva"))
         return resposta
 
     if resposta.get("status_reserva") == "sem_interesse":
         finalizar_conversa(conversa_atual, status="finalizada")
         agente.limpar_historico(telefone_limpo)
+        _limpar_estado_reserva_conversa(conversa_atual, telefone_limpo)
         logger.info("Conversa finalizada por recusa ao convite de reserva. telefone=%s", telefone_limpo)
         return resposta
 
@@ -285,8 +289,219 @@ def processar_resposta_cliente(
             dados_reserva=resposta["dados_reserva"],
         )
         finalizar_conversa(conversa_atual, status="finalizada")
+        _limpar_estado_reserva_conversa(conversa_atual, telefone_limpo)
 
     return resposta
+
+
+def _provider_message_ids(provider_message_id: str, metadata_mensagem: Mapping[str, Any] | None) -> list[str]:
+    ids: list[str] = []
+    if provider_message_id:
+        ids.append(str(provider_message_id))
+    agrupadas = _mensagens_agrupadas_metadata(metadata_mensagem)
+    for item in agrupadas:
+        message_id = str(item.get("provider_message_id") or "").strip()
+        if message_id and message_id not in ids:
+            ids.append(message_id)
+    return ids
+
+
+def _registrar_mensagens_cliente(
+    conversa: Mapping[str, Any],
+    *,
+    conteudo: str,
+    provider_message_id: str,
+    metadata: Mapping[str, Any] | None,
+) -> None:
+    agrupadas = _mensagens_agrupadas_metadata(metadata)
+    if not agrupadas:
+        registrar_mensagem(
+            conversa,
+            remetente="cliente",
+            conteudo=conteudo,
+            provider_message_id=provider_message_id,
+            metadata=metadata,
+        )
+        return
+
+    for indice, item in enumerate(agrupadas, start=1):
+        registrar_mensagem(
+            conversa,
+            remetente="cliente",
+            conteudo=str(item.get("texto") or "").strip(),
+            provider_message_id=str(item.get("provider_message_id") or "").strip(),
+            metadata={
+                **dict(metadata or {}),
+                "agrupada": True,
+                "ordem_agrupamento": indice,
+                "total_agrupado": len(agrupadas),
+                "timestamp_provider": item.get("timestamp", ""),
+            },
+        )
+
+
+def _mensagens_agrupadas_metadata(metadata: Mapping[str, Any] | None) -> list[Mapping[str, Any]]:
+    if not isinstance(metadata, Mapping):
+        return []
+    agrupadas = metadata.get("mensagens_agrupadas")
+    if not isinstance(agrupadas, list):
+        return []
+    return [item for item in agrupadas if isinstance(item, Mapping)]
+
+
+def _carregar_estado_reserva_conversa(conversa: Mapping[str, Any], telefone: str) -> None:
+    metadata = _metadata_conversa(conversa)
+    estado = metadata.get("estado_reserva")
+    conversa_id = str(conversa.get("id") or "")
+    if isinstance(estado, Mapping):
+        agente.definir_estado_reserva(telefone, {**dict(estado), "conversa_id": conversa_id})
+        logger.info("Estado de reserva carregado da conversa %s para telefone=%s.", conversa_id, telefone)
+        return
+
+    estado_memoria = agente.obter_estado_reserva(telefone)
+    if estado_memoria and str(estado_memoria.get("conversa_id") or "") not in {"", conversa_id}:
+        agente.limpar_historico(telefone)
+
+
+def _salvar_estado_reserva_conversa(
+    conversa: Mapping[str, Any],
+    telefone: str,
+    *,
+    resposta: Mapping[str, Any],
+) -> None:
+    estado = agente.obter_estado_reserva(telefone)
+    if not estado:
+        return
+    estado["conversa_id"] = str(conversa.get("id") or "")
+    metadata = _metadata_conversa(conversa)
+    metadata["estado_reserva"] = estado
+    metadata["dados_reserva"] = dict(resposta.get("dados_reserva") or {})
+    metadata["status_reserva"] = resposta.get("status_reserva", "")
+    _atualizar_metadata_conversa(conversa, metadata)
+
+
+def _limpar_estado_reserva_conversa(conversa: Mapping[str, Any], telefone: str) -> None:
+    metadata = _metadata_conversa(conversa)
+    if "estado_reserva" not in metadata and "dados_reserva" not in metadata:
+        return
+    metadata.pop("estado_reserva", None)
+    metadata.pop("dados_reserva", None)
+    metadata["estado_reserva_finalizado_em"] = _agora()
+    _atualizar_metadata_conversa(conversa, metadata)
+    agente.limpar_historico(telefone)
+
+
+def _metadata_conversa(conversa: Mapping[str, Any]) -> dict[str, Any]:
+    metadata = conversa.get("metadata")
+    return dict(metadata) if isinstance(metadata, Mapping) else {}
+
+
+def _atualizar_metadata_conversa(conversa: Mapping[str, Any], metadata: Mapping[str, Any]) -> None:
+    conversa_id = str(conversa.get("id") or "")
+    if isinstance(conversa, dict):
+        conversa["metadata"] = dict(metadata)
+    if not conversa_id or conversa_id.startswith("local:"):
+        return
+
+    resultado = supabase.atualizar(
+        _tabela_conversas(),
+        {"metadata": dict(metadata)},
+        filtros={"id": f"eq.{conversa_id}"},
+        retornar=False,
+    )
+    if resultado.get("ok"):
+        logger.info("Metadata da conversa %s atualizada com estado de reserva.", conversa_id)
+    else:
+        logger.warning("Nao foi possivel atualizar metadata da conversa %s: %s", conversa_id, resultado.get("erro"))
+
+
+def processar_mensagens_webhook(mensagens: Sequence[MensagemRecebida]) -> list[ResultadoWebhook]:
+    resultados: list[ResultadoWebhook] = []
+    for mensagem in _agrupar_mensagens_rapidas(mensagens):
+        resultados.append(processar_mensagem_webhook(mensagem))
+    return resultados
+
+
+def _agrupar_mensagens_rapidas(mensagens: Sequence[MensagemRecebida]) -> list[MensagemRecebida]:
+    janela = _janela_coalescencia_segundos()
+    grupos: list[list[MensagemRecebida]] = []
+    grupo_atual: list[MensagemRecebida] = []
+
+    for mensagem in mensagens:
+        if not grupo_atual:
+            grupo_atual = [mensagem]
+            continue
+        if _mensagens_mesmo_grupo(grupo_atual[-1], mensagem, janela):
+            grupo_atual.append(mensagem)
+            continue
+        grupos.append(grupo_atual)
+        grupo_atual = [mensagem]
+
+    if grupo_atual:
+        grupos.append(grupo_atual)
+
+    return [_montar_mensagem_agrupada(grupo) for grupo in grupos]
+
+
+def _mensagens_mesmo_grupo(anterior: MensagemRecebida, atual: MensagemRecebida, janela: float) -> bool:
+    telefone_anterior = str(anterior.get("telefone") or "").strip()
+    telefone_atual = str(atual.get("telefone") or "").strip()
+    if not telefone_anterior or telefone_anterior != telefone_atual:
+        return False
+
+    timestamp_anterior = _timestamp_segundos(anterior.get("timestamp"))
+    timestamp_atual = _timestamp_segundos(atual.get("timestamp"))
+    if timestamp_anterior is None or timestamp_atual is None:
+        return True
+    return abs(timestamp_atual - timestamp_anterior) <= janela
+
+
+def _montar_mensagem_agrupada(grupo: Sequence[MensagemRecebida]) -> MensagemRecebida:
+    if len(grupo) == 1:
+        return dict(grupo[0])
+
+    primeira = grupo[0]
+    ultima = grupo[-1]
+    textos = [str(item.get("texto") or "").strip() for item in grupo if str(item.get("texto") or "").strip()]
+    logger.info(
+        "Mensagens rapidas agrupadas para telefone=%s total=%s.",
+        primeira.get("telefone", ""),
+        len(grupo),
+    )
+    return {
+        "telefone": str(primeira.get("telefone") or ""),
+        "texto": "\n".join(textos),
+        "remetente": str(ultima.get("remetente") or primeira.get("remetente") or ""),
+        "timestamp": str(ultima.get("timestamp") or primeira.get("timestamp") or ""),
+        "provider_message_id": str(primeira.get("provider_message_id") or ""),
+        "raw": {
+            "coalesced": True,
+            "messages": [dict(item) for item in grupo],
+        },
+    }
+
+
+def _janela_coalescencia_segundos() -> float:
+    try:
+        valor = float(os.getenv("RESERVABOT_COALESCENCIA_SEGUNDOS", "2"))
+    except ValueError:
+        return 2.0
+    return max(0.0, min(valor, 10.0))
+
+
+def _timestamp_segundos(valor: Any) -> float | None:
+    if valor in (None, ""):
+        return None
+    try:
+        return float(valor)
+    except (TypeError, ValueError):
+        pass
+
+    texto = str(valor).replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(texto).timestamp()
+    except ValueError:
+        return None
 
 
 def processar_mensagem_webhook(mensagem: MensagemRecebida) -> ResultadoWebhook:
@@ -301,12 +516,24 @@ def processar_mensagem_webhook(mensagem: MensagemRecebida) -> ResultadoWebhook:
         }
 
     conversa = buscar_conversa_ativa_por_telefone(telefone)
+    raw = mensagem.get("raw") if isinstance(mensagem.get("raw"), Mapping) else {}
     metadata = {
         "provider": "cloud",
         "timestamp_provider": mensagem.get("timestamp", ""),
         "remetente_whatsapp": mensagem.get("remetente", ""),
-        "raw": mensagem.get("raw", {}),
+        "raw": raw,
     }
+    mensagens_agrupadas = raw.get("messages") if isinstance(raw, Mapping) and raw.get("coalesced") else None
+    if isinstance(mensagens_agrupadas, list):
+        metadata["mensagens_agrupadas"] = [
+            {
+                "texto": str(item.get("texto") or ""),
+                "provider_message_id": str(item.get("provider_message_id") or ""),
+                "timestamp": str(item.get("timestamp") or ""),
+            }
+            for item in mensagens_agrupadas
+            if isinstance(item, Mapping)
+        ]
     resposta = processar_resposta_cliente(
         telefone=telefone,
         mensagem_cliente=texto,

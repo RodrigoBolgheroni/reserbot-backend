@@ -412,7 +412,14 @@ class ConfigHandler(BaseHTTPRequestHandler):
 
         recebidas = whatsapp_cloud.extrair_mensagens_webhook(payload)
         resultados: list[dict[str, Any]] = []
-        for mensagem in recebidas:
+        try:
+            resultados = [dict(resultado) for resultado in fluxo_reservas.processar_mensagens_webhook(recebidas)]
+        except Exception:
+            logger.exception("Falha ao processar lote de mensagens recebidas da Cloud API.")
+            resultados = []
+
+        mensagens_com_erro = recebidas if not resultados and recebidas else []
+        for mensagem in mensagens_com_erro:
             try:
                 resultado = fluxo_reservas.processar_mensagem_webhook(mensagem)
                 resultados.append(dict(resultado))

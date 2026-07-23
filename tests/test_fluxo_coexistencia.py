@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import json
 import os
 import unittest
+from datetime import date
 from unittest.mock import patch
 
 from services import fluxo_reservas
+
+
+def json_payload(payload: dict) -> str:
+    return json.dumps(payload, ensure_ascii=False)
 
 
 class FluxoCoexistenciaTest(unittest.TestCase):
@@ -265,6 +271,108 @@ class FluxoCoexistenciaTest(unittest.TestCase):
         self.assertTrue(resultado["ok"])
         self.assertEqual(resultado["status"], "humano")
         atualizar.assert_called_once_with(buscar.return_value, status="humano")
+
+    @patch.object(fluxo_reservas, "_mensagem_ja_processada", return_value=False)
+    @patch.object(fluxo_reservas, "registrar_mensagem")
+    @patch.object(fluxo_reservas, "atualizar_status_conversa")
+    @patch.object(fluxo_reservas, "buscar_conversa_ativa_por_telefone")
+    @patch.object(fluxo_reservas.clientes_supabase, "buscar_cliente_por_telefone")
+    @patch.object(fluxo_reservas.whatsapp, "enviar_com_resultado")
+    @patch.object(fluxo_reservas.supabase, "atualizar")
+    def test_estado_reserva_e_carregado_e_salvo_no_metadata_da_conversa(
+        self,
+        atualizar_supabase,
+        enviar,
+        buscar_cliente,
+        buscar_ativa,
+        atualizar_status,
+        registrar,
+        _ja_processada,
+    ) -> None:
+        conversa = {
+            "id": "conv-estado",
+            "cliente_telefone": "5511999999999",
+            "status": "bot_ativo",
+            "metadata": {
+                "estado_reserva": {
+                    "data_reserva": "2026-07-29",
+                    "pessoas": 4,
+                    "nome_cliente": "Rodrigo Teste",
+                    "campo_pendente": "horario",
+                    "etapa": "aguardando_horario",
+                }
+            },
+        }
+        payload = {
+            "resposta_natural": "Perfeito, às 20h.",
+            "intencao": "fornecimento_dados",
+            "dados_extraidos": {"data": None, "horario": "20:00", "quantidade": None},
+            "acao": "continuar_conversa",
+            "proximo_campo": "confirmacao",
+            "confianca": 0.9,
+        }
+        buscar_cliente.return_value = {"id": "cliente-1", "telefone": "5511999999999", "nome": "Rodrigo Teste"}
+        buscar_ativa.return_value = conversa
+        enviar.return_value = {"ok": True, "provider_message_id": "wamid.bot"}
+        atualizar_supabase.return_value = {"ok": True}
+
+        with (
+            patch.object(fluxo_reservas.agente, "_hoje", return_value=date(2026, 7, 22)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste"}),
+            patch.object(fluxo_reservas.agente, "_chamar_groq", return_value=json_payload(payload)),
+        ):
+            resposta = fluxo_reservas.processar_resposta_cliente(
+                telefone="5511999999999",
+                mensagem_cliente="20h",
+                provider_message_id="wamid.estado",
+            )
+
+        self.assertEqual(resposta["status_reserva"], "aguardando_confirmacao")
+        payload_metadata = atualizar_supabase.call_args_list[-1].args[1]
+        estado_salvo = payload_metadata["metadata"]["estado_reserva"]
+        self.assertEqual(estado_salvo["data_reserva"], "2026-07-29")
+        self.assertEqual(estado_salvo["horario"], "20:00")
+        self.assertEqual(estado_salvo["pessoas"], 4)
+        self.assertEqual(estado_salvo["campo_pendente"], "confirmacao")
+        enviar.assert_called_once()
+        self.assertEqual(registrar.call_count, 2)
+
+    @patch.object(fluxo_reservas, "buscar_conversa_ativa_por_telefone", return_value={"id": "conv-1", "status": "bot_ativo"})
+    @patch.object(fluxo_reservas, "processar_resposta_cliente")
+    def test_mensagens_rapidas_no_mesmo_payload_viram_uma_chamada(self, processar, _buscar_ativa) -> None:
+        processar.return_value = {
+            "texto": "Claro, qual dia você prefere?",
+            "reserva_confirmada": False,
+            "dados_reserva": {},
+            "status_reserva": "em_coleta",
+            "confianca": 0.9,
+        }
+
+        resultados = fluxo_reservas.processar_mensagens_webhook(
+            [
+                {
+                    "telefone": "5511999999999",
+                    "texto": "Olá",
+                    "remetente": "Rodrigo",
+                    "timestamp": "2026-07-22T20:00:00+00:00",
+                    "provider_message_id": "wamid.ola",
+                },
+                {
+                    "telefone": "5511999999999",
+                    "texto": "Quero sim",
+                    "remetente": "Rodrigo",
+                    "timestamp": "2026-07-22T20:00:01+00:00",
+                    "provider_message_id": "wamid.quero",
+                },
+            ]
+        )
+
+        self.assertEqual(len(resultados), 1)
+        processar.assert_called_once()
+        chamada = processar.call_args.kwargs
+        self.assertEqual(chamada["mensagem_cliente"], "Olá\nQuero sim")
+        self.assertEqual(chamada["provider_message_id"], "wamid.ola")
+        self.assertEqual(len(chamada["metadata_mensagem"]["mensagens_agrupadas"]), 2)
 
 
 if __name__ == "__main__":
