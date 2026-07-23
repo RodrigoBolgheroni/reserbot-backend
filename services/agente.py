@@ -240,6 +240,7 @@ def processar_mensagem(
 
     with _lock_conversa(telefone_limpo):
         config_processamento = config_restaurante.obter_config()
+        _log_config_restaurante_processamento(config_processamento)
         token_config = _config_restaurante_processamento.set(config_processamento)
         try:
             return _processar_mensagem_sem_lock(
@@ -255,6 +256,28 @@ def processar_mensagem(
 def _config_restaurante_atual() -> config_restaurante.ConfigRestaurante:
     config = _config_restaurante_processamento.get()
     return config if config is not None else config_restaurante.obter_config()
+
+
+def _log_config_restaurante_processamento(config: config_restaurante.ConfigRestaurante) -> None:
+    possui_configuracao_reserva = bool(
+        config.quantidade_minima_reserva is not None
+        or config.horarios_permitidos_reserva
+        or config.taxa_valor is not None
+        or config.taxa_convertida_consumacao
+        or config.exige_comprovante
+        or config.prazo_cancelamento_horas is not None
+        or config.tolerancia_atraso_minutos is not None
+    )
+    logger.info(
+        "Config restaurante carregada para agente: source=%s estabelecimento_id=%s "
+        "configuracoes_reserva=%s taxa_valor=%s quantidade_minima=%s horarios_permitidos=%s",
+        config.fonte,
+        config.estabelecimento_id,
+        possui_configuracao_reserva,
+        _taxa_para_log(config.taxa_valor),
+        config.quantidade_minima_reserva,
+        list(config.horarios_permitidos_reserva),
+    )
 
 
 def _processar_mensagem_sem_lock(
@@ -362,6 +385,13 @@ def _processar_mensagem_sem_lock(
         mensagem_cliente=mensagem_limpa,
         interpretacao=interpretacao,
         nome_cliente=nome_cliente,
+    )
+    resposta_segura = _aplicar_guardrails_configuracao_resposta(
+        telefone=telefone_limpo,
+        mensagem_cliente=mensagem_limpa,
+        texto_ia=str(interpretacao.get("texto") or ""),
+        resposta=resposta_segura,
+        config=_config_restaurante_atual(),
     )
     reserva_confirmada = resposta_segura["reserva_confirmada"]
     texto_cliente = resposta_segura["texto"]
@@ -551,6 +581,244 @@ def _log_resposta_substituida(*, texto_ia: str, texto_final: str, funcao: str, m
         texto_ia_limpo,
         texto_final_limpo,
     )
+
+
+def _aplicar_guardrails_configuracao_resposta(
+    *,
+    telefone: str,
+    mensagem_cliente: str,
+    texto_ia: str,
+    resposta: RespostaAgente,
+    config: config_restaurante.ConfigRestaurante,
+) -> RespostaAgente:
+    texto_original = str(resposta.get("texto") or "")
+    texto_corrigido, motivos = _corrigir_texto_por_configuracao_estruturada(
+        texto=texto_original,
+        mensagem_cliente=mensagem_cliente,
+        config=config,
+    )
+    if not motivos:
+        return resposta
+
+    resposta_corrigida = dict(resposta)
+    resposta_corrigida["texto"] = texto_corrigido
+    motivo = ",".join(motivos)
+    _log_resposta_substituida(
+        texto_ia=texto_ia or texto_original,
+        texto_final=texto_corrigido,
+        funcao="_aplicar_guardrails_configuracao_resposta",
+        motivo=motivo,
+    )
+    logger.warning(
+        "Resposta corrigida por configuracao estruturada: telefone=%s motivos=%s source=%s "
+        "estabelecimento_id=%s taxa_valor=%s quantidade_minima=%s horarios_permitidos=%s",
+        telefone,
+        motivo,
+        config.fonte,
+        config.estabelecimento_id,
+        _taxa_para_log(config.taxa_valor),
+        config.quantidade_minima_reserva,
+        list(config.horarios_permitidos_reserva),
+    )
+    return resposta_corrigida  # type: ignore[return-value]
+
+
+def _corrigir_texto_por_configuracao_estruturada(
+    *,
+    texto: str,
+    mensagem_cliente: str,
+    config: config_restaurante.ConfigRestaurante,
+) -> tuple[str, list[str]]:
+    texto_limpo = remover_flag_reserva(str(texto or "")).strip()
+    if not texto_limpo:
+        return texto_limpo, []
+
+    motivos = _motivos_contradicao_configuracao(texto_limpo, config)
+    if not motivos:
+        return texto_limpo, []
+
+    normalizado_cliente = _normalizar_busca(mensagem_cliente)
+    if any(motivo in motivos for motivo in ("taxa_reserva_contradita", "comprovante_pix_contradito")):
+        if re.search(r"\b(pessoas|quantidade|grupo|18|20|22|como funciona)\b", normalizado_cliente):
+            return _texto_reserva_estruturada(config), motivos
+        return _texto_taxa_reserva_config(config), motivos
+    if "horarios_reserva_fora_config" in motivos:
+        return _texto_horarios_reserva_config(config), motivos
+    if "quantidade_minima_contradita" in motivos:
+        return _texto_quantidade_minima_config(config), motivos
+    if "politica_cancelamento_contradita" in motivos:
+        return _texto_cancelamento_config(config), motivos
+    return _texto_reserva_estruturada(config), motivos
+
+
+def _motivos_contradicao_configuracao(
+    texto: str,
+    config: config_restaurante.ConfigRestaurante,
+) -> list[str]:
+    normalizado = _normalizar_busca(texto)
+    motivos: list[str] = []
+
+    if _taxa_configurada(config) and _texto_nega_taxa_reserva(normalizado):
+        motivos.append("taxa_reserva_contradita")
+    if config.exige_comprovante and _texto_nega_comprovante_pix(normalizado):
+        motivos.append("comprovante_pix_contradito")
+    if config.quantidade_minima_reserva is not None and _texto_nega_quantidade_minima(normalizado):
+        motivos.append("quantidade_minima_contradita")
+    if config.politica_cancelamento and _texto_contradiz_cancelamento(normalizado):
+        motivos.append("politica_cancelamento_contradita")
+    if config.horarios_permitidos_reserva and _texto_inventa_horario_reserva(texto, normalizado, config):
+        motivos.append("horarios_reserva_fora_config")
+
+    return motivos
+
+
+def _taxa_configurada(config: config_restaurante.ConfigRestaurante) -> bool:
+    return config.taxa_valor is not None and config.taxa_valor > 0
+
+
+def _texto_nega_taxa_reserva(normalizado: str) -> bool:
+    return bool(
+        re.search(r"\bnao\s+(?:temos|ha|existe)\b.{0,80}\b(?:taxa|valor|custo|cobranca)\b", normalizado)
+        or re.search(r"\bnao\s+cobramos\b.{0,80}\b(?:reserva|taxa|valor|custo|r\$|50)\b", normalizado)
+        or re.search(r"\b(?:sem|nenhum|nenhuma)\s+(?:taxa|valor|custo|cobranca)\b", normalizado)
+        or re.search(r"\breserva\b.{0,60}\bsem custo\b", normalizado)
+        or re.search(r"\bsem custo adicional\b", normalizado)
+        or re.search(r"\breserva gratuita\b", normalizado)
+    )
+
+
+def _texto_nega_comprovante_pix(normalizado: str) -> bool:
+    return bool(
+        re.search(r"\bnao\s+(?:precisa|precisamos|necessita|exigimos|exige)\b.{0,80}\bcomprovante\b", normalizado)
+        or re.search(r"\bcomprovante\b.{0,40}\bnao\s+(?:e|eh)\s+obrigatorio\b", normalizado)
+        or re.search(r"\bsem comprovante\b", normalizado)
+    )
+
+
+def _texto_nega_quantidade_minima(normalizado: str) -> bool:
+    return bool(
+        re.search(r"\bnao\s+(?:temos|ha|existe)\b.{0,80}\b(?:quantidade minima|minimo de pessoas|minimo)\b", normalizado)
+        or re.search(r"\b(?:sem|nenhum|nenhuma)\s+(?:quantidade minima|minimo de pessoas|minimo)\b", normalizado)
+        or re.search(r"\bqualquer quantidade\b", normalizado)
+    )
+
+
+def _texto_contradiz_cancelamento(normalizado: str) -> bool:
+    if not re.search(r"\b(cancelamento|cancelar|estorno|desistencia)\b", normalizado):
+        return False
+    return bool(
+        re.search(r"\bsem prazo\b", normalizado)
+        or re.search(r"\ba qualquer momento\b", normalizado)
+        or re.search(r"\bestorno\b.{0,40}\bsempre\b", normalizado)
+        or re.search(r"\bnao\s+(?:temos|ha|existe)\b.{0,80}\b(?:politica|prazo|regra)\b", normalizado)
+    )
+
+
+def _texto_inventa_horario_reserva(
+    texto: str,
+    normalizado: str,
+    config: config_restaurante.ConfigRestaurante,
+) -> bool:
+    if not re.search(
+        r"\b(reserva|reservar|mesa|horarios? aceitos|horarios? para reserva|horarios? de reserva|"
+        r"qual horario|horario que voce prefere|horario voce prefere|horario disponivel)\b",
+        normalizado,
+    ):
+        return False
+
+    horarios_citados = _horarios_citados_no_texto(texto)
+    if not horarios_citados:
+        return False
+    permitidos = set(config.horarios_permitidos_reserva)
+    return any(horario not in permitidos for horario in horarios_citados)
+
+
+def _horarios_citados_no_texto(texto: str) -> list[str]:
+    encontrados: list[str] = []
+    for match in re.finditer(r"\b([01]?\d|2[0-3])\s*[:h]\s*([0-5]\d)\b", texto, flags=re.IGNORECASE):
+        horario = f"{int(match.group(1)):02d}:{int(match.group(2)):02d}"
+        if horario not in encontrados:
+            encontrados.append(horario)
+
+    normalizado = _normalizar_busca(texto)
+    for match in re.finditer(r"\b(?:as|a|das|de|entre|ate|e)\s+([01]?\d|2[0-3])h?\b", normalizado):
+        horario = f"{int(match.group(1)):02d}:00"
+        if horario not in encontrados:
+            encontrados.append(horario)
+    return encontrados
+
+
+def _texto_taxa_reserva_config(config: config_restaurante.ConfigRestaurante) -> str:
+    if not _taxa_configurada(config):
+        return "Nao tenho uma taxa de reserva configurada aqui. Posso seguir com os dados da reserva para a equipe conferir."
+
+    complementos: list[str] = []
+    if config.taxa_convertida_consumacao:
+        complementos.append("esse valor e convertido em consumacao")
+    if config.exige_comprovante:
+        complementos.append("o comprovante Pix e obrigatorio")
+
+    texto = f"A reserva tem taxa de {_formatar_moeda_brl(config.taxa_valor)}"
+    if complementos:
+        texto = f"{texto}, {' e '.join(complementos)}"
+    return f"{texto}."
+
+
+def _texto_horarios_reserva_config(config: config_restaurante.ConfigRestaurante) -> str:
+    if config.horarios_permitidos_reserva:
+        horarios = _formatar_lista_texto(config.horarios_permitidos_reserva)
+        return f"Os horarios aceitos para reserva sao {horarios}. Me fala qual deles voce prefere e eu verifico a solicitacao."
+    return f"Para reservas, trabalhamos {config.horarios_aceitos_reserva}."
+
+
+def _texto_quantidade_minima_config(config: config_restaurante.ConfigRestaurante) -> str:
+    if config.quantidade_minima_reserva is None:
+        return f"Consigo confirmar automaticamente reservas de ate {config.limite_pessoas_reserva} pessoas por aqui."
+    return (
+        f"As reservas sao feitas a partir de {config.quantidade_minima_reserva} pessoas. "
+        f"Consigo confirmar automaticamente ate {config.limite_pessoas_reserva} pessoas por aqui."
+    )
+
+
+def _texto_cancelamento_config(config: config_restaurante.ConfigRestaurante) -> str:
+    if config.politica_cancelamento:
+        return config.politica_cancelamento
+    if config.prazo_cancelamento_horas:
+        return f"O cancelamento com estorno deve ser solicitado com pelo menos {config.prazo_cancelamento_horas} horas de antecedencia."
+    return "A politica de cancelamento ainda precisa ser confirmada com a equipe."
+
+
+def _texto_reserva_estruturada(config: config_restaurante.ConfigRestaurante) -> str:
+    partes: list[str] = []
+    if config.quantidade_minima_reserva is not None:
+        partes.append(f"Reservas sao feitas a partir de {config.quantidade_minima_reserva} pessoas.")
+    if config.horarios_permitidos_reserva:
+        partes.append(f"Os horarios aceitos para reserva sao {_formatar_lista_texto(config.horarios_permitidos_reserva)}.")
+    if _taxa_configurada(config):
+        partes.append(_texto_taxa_reserva_config(config))
+    if not partes:
+        partes.append("Posso seguir com os dados da reserva para a equipe conferir.")
+    return " ".join(partes)
+
+
+def _formatar_lista_texto(valores: Sequence[str]) -> str:
+    itens = [str(valor).strip() for valor in valores if str(valor).strip()]
+    if not itens:
+        return ""
+    if len(itens) == 1:
+        return itens[0]
+    return ", ".join(itens[:-1]) + f" e {itens[-1]}"
+
+
+def _formatar_moeda_brl(valor: float | None) -> str:
+    numero = float(valor or 0)
+    return f"R$ {numero:.2f}".replace(".", ",")
+
+
+def _taxa_para_log(valor: float | None) -> str:
+    if valor is None:
+        return ""
+    return f"{float(valor):.2f}"
 
 
 def aplicar_guardrails_reserva(
@@ -2701,6 +2969,11 @@ def _categoria_pergunta_restaurante(texto: str) -> str | None:
         return "endereco"
     if re.search(r"\b(estacionamento|estacionar|manobrista|valet)\b", normalizado):
         return "estacionamento"
+    if marcador_pergunta and re.search(
+        r"\b(taxa|valor|custo|cobra|cobram|cobranca|comprovante|sinal)\b",
+        normalizado,
+    ) and re.search(r"\b(reserva|reservar|mesa|pix|comprovante|50)\b", normalizado):
+        return "taxa_reserva"
     if re.search(r"\b(pagamento|pagar|pix|cartao|debito|credito|dinheiro|voucher|vale refeicao)\b", normalizado):
         return "pagamento"
     if re.search(r"\b(aniversario|bolo|decoracao|decorar|parabens|comemorar)\b", normalizado):
@@ -2801,10 +3074,12 @@ def _texto_pergunta_restaurante(categoria: str, estado: EstadoReserva) -> str:
         base = config.estacionamento
     elif categoria == "pagamento":
         base = f"Aceitamos {config.formas_pagamento}."
+    elif categoria == "taxa_reserva":
+        base = _texto_taxa_reserva_config(config)
     elif categoria == "aniversario":
         base = config.aniversario
     elif categoria == "limite_pessoas":
-        base = f"Consigo confirmar automaticamente reservas de ate {config.limite_pessoas_reserva} pessoas por aqui."
+        base = _texto_quantidade_minima_config(config)
     elif categoria == "cancelamento":
         base = config.politica_cancelamento
         if config.telefone_atendimento:
@@ -3181,9 +3456,13 @@ def _mensagem_sistema(nome_cliente: str, *, perfil_cliente: Mapping[str, Any] | 
             f"- Endereco: {config.endereco}\n"
             f"- Funcionamento: {config.dias_funcionamento}, das {config.horario_abertura} as {config.horario_fechamento}\n"
             f"- Horarios aceitos para reserva: {config.horarios_aceitos_reserva}\n"
+            f"- Quantidade minima para reserva: {_texto_quantidade_minima_config(config)}\n"
             f"- Limite de pessoas por reserva automatica: {config.limite_pessoas_reserva}\n"
+            f"- Taxa de reserva: {_texto_taxa_reserva_config(config)}\n"
+            f"- Comprovante de Pix: {'obrigatorio' if config.exige_comprovante else 'nao configurado como obrigatorio'}\n"
             f"- Formas de pagamento: {config.formas_pagamento}\n"
             f"- Cancelamento: {config.politica_cancelamento}\n"
+            f"- Instrucoes de reserva: {config.regras_reservas_imediatas}\n"
             f"- Estacionamento: {config.estacionamento}\n"
             f"- Aniversarios: {config.aniversario}\n"
             "Se o cliente fizer uma pergunta normal sobre o restaurante, responda e retome o campo da reserva que faltava. "
