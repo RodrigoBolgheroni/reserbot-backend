@@ -7,6 +7,7 @@ import re
 import threading
 import unicodedata
 from collections.abc import Mapping, Sequence
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Final, Literal, TypedDict
 
@@ -146,6 +147,10 @@ _historicos: dict[str, list[Mensagem]] = {}
 _estados_reserva: dict[str, EstadoReserva] = {}
 _locks_conversa: dict[str, threading.RLock] = {}
 _locks_conversa_guard = threading.Lock()
+_config_restaurante_processamento: ContextVar[config_restaurante.ConfigRestaurante | None] = ContextVar(
+    "config_restaurante_processamento",
+    default=None,
+)
 
 ETAPA_POR_CAMPO: Final[dict[str, str]] = {
     "data_reserva": "aguardando_data",
@@ -234,12 +239,22 @@ def processar_mensagem(
         }
 
     with _lock_conversa(telefone_limpo):
-        return _processar_mensagem_sem_lock(
-            telefone=telefone_limpo,
-            mensagem_cliente=mensagem_limpa,
-            nome_cliente=nome_cliente,
-            perfil_cliente=perfil_cliente,
-        )
+        config_processamento = config_restaurante.obter_config()
+        token_config = _config_restaurante_processamento.set(config_processamento)
+        try:
+            return _processar_mensagem_sem_lock(
+                telefone=telefone_limpo,
+                mensagem_cliente=mensagem_limpa,
+                nome_cliente=nome_cliente,
+                perfil_cliente=perfil_cliente,
+            )
+        finally:
+            _config_restaurante_processamento.reset(token_config)
+
+
+def _config_restaurante_atual() -> config_restaurante.ConfigRestaurante:
+    config = _config_restaurante_processamento.get()
+    return config if config is not None else config_restaurante.obter_config()
 
 
 def _processar_mensagem_sem_lock(
@@ -847,7 +862,10 @@ def dados_reserva_obrigatorios_ok(
     pessoas = _pessoas_json(dados.get("pessoas"))
     return bool(
         _data_reserva_valida(str(dados.get("data_reserva") or ""))
-        and _horario_reserva_valido(str(dados.get("horario") or ""))
+        and _horario_reserva_valido(
+            str(dados.get("horario") or ""),
+            data_reserva=str(dados.get("data_reserva") or ""),
+        )
         and pessoas is not None
         and nome
         and telefone_limpo
@@ -1208,7 +1226,10 @@ def _atualizar_estado_reserva(
                 invalidos.add("pessoas")
 
         horario_usuario = horario_parser
-        if horario_usuario and not _horario_reserva_valido(horario_usuario):
+        if horario_usuario and not _horario_reserva_valido(
+            horario_usuario,
+            data_reserva=str(estado.get("data_reserva") or ""),
+        ):
             invalidos.add("horario")
 
     tem_sinal_data = _mensagem_tem_sinal_data(mensagem_cliente) or (
@@ -1334,7 +1355,10 @@ def _remover_campos_invalidos_estado(estado: EstadoReserva, invalidos: set[str])
         estado.pop("data_reserva", None)
         invalidos.add("data_reserva")
     horario_estado = str(estado.get("horario") or "")
-    if horario_estado and not _horario_reserva_valido(horario_estado):
+    if horario_estado and not _horario_reserva_valido(
+        horario_estado,
+        data_reserva=str(estado.get("data_reserva") or ""),
+    ):
         estado.pop("horario", None)
         invalidos.add("horario")
     if estado.get("pessoas") and _pessoas_json(estado.get("pessoas")) is None:
@@ -1349,7 +1373,7 @@ def _definir_horario_estado(estado: EstadoReserva, valor: Any, *, invalidos: set
     if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", horario):
         logger.info("DIAG_RESERVA validacao_horario valor=%r valido=false motivo=formato_invalido fonte=%s", valor, fonte)
         return
-    if not _horario_reserva_valido(horario):
+    if not _horario_reserva_valido(horario, data_reserva=str(estado.get("data_reserva") or "")):
         estado["horario_invalido"] = horario
         invalidos.add("horario")
         logger.info(
@@ -1735,7 +1759,10 @@ def _campos_obrigatorios_faltantes(estado: EstadoReserva, telefone: str) -> list
     faltantes: list[str] = []
     if not _data_reserva_valida(str(estado.get("data_reserva") or "")):
         faltantes.append("data_reserva")
-    if not _horario_reserva_valido(str(estado.get("horario") or "")):
+    if not _horario_reserva_valido(
+        str(estado.get("horario") or ""),
+        data_reserva=str(estado.get("data_reserva") or ""),
+    ):
         faltantes.append("horario")
     if _pessoas_json(estado.get("pessoas")) is None:
         faltantes.append("pessoas")
@@ -1873,7 +1900,7 @@ def _usa_contrato_novo(interpretacao: Mapping[str, Any]) -> bool:
 
 
 def _resultado_validacao(campo: str, estado: Mapping[str, Any]) -> dict[str, Any]:
-    abertura, fechamento = _horario_funcionamento_texto()
+    abertura, fechamento = _horario_funcionamento_texto(str(estado.get("data_reserva") or ""))
     if campo == "horario":
         horario = str(estado.get("horario_invalido") or "")
         return {
@@ -1956,7 +1983,7 @@ def _mensagem_pedir_campo(
         if tentativa_atual == 2:
             return "Você pode me passar um horário aproximado, como 19h ou 20h?"
         if estado.get("horario_invalido"):
-            return _mensagem_horario_fora_funcionamento()
+            return _mensagem_horario_fora_funcionamento(estado)
         if estado.get("data_reserva") and estado.get("pessoas"):
             return "Certo, tenho a data e a quantidade de pessoas. Só falta o horário. Qual horário fica melhor para você?"
         if estado.get("data_reserva"):
@@ -1975,8 +2002,12 @@ def _mensagem_pedir_campo(
     return "Antes de confirmar, preciso completar os dados da reserva."
 
 
-def _mensagem_horario_fora_funcionamento() -> str:
-    abertura, fechamento = _horario_funcionamento_texto()
+def _mensagem_horario_fora_funcionamento(estado: Mapping[str, Any] | None = None) -> str:
+    data_reserva = str((estado or {}).get("data_reserva") or "")
+    config = _config_restaurante_atual()
+    if data_reserva and config_restaurante.fechado_na_data(data_reserva, config=config):
+        return "Nesse dia estamos fechados. Me fala outra data para eu verificar a reserva."
+    abertura, fechamento = _horario_funcionamento_texto(data_reserva, config=config)
     return (
         "Esse horário fica fora do nosso funcionamento, que é das "
         f"{_horario_para_cliente(abertura)} às {_horario_para_cliente(fechamento)}. "
@@ -2419,7 +2450,7 @@ def _resposta_pedido_imediato(
 def _pergunta_sobre_horario_indisponivel(texto: str, estado: Mapping[str, Any]) -> bool:
     normalizado = _normalizar_busca(texto)
     horario = _extrair_horario(texto, permitir_numero_isolado=False) or str(estado.get("horario_invalido") or "")
-    if horario and not _horario_reserva_valido(horario):
+    if horario and not _horario_reserva_valido(horario, data_reserva=str(estado.get("data_reserva") or "")):
         return True
     return bool(
         re.search(r"\b(por que|pq|porque|motivo|nao pode|nao disponivel|indisponivel)\b", normalizado)
@@ -2745,8 +2776,9 @@ def _campo_retomada_apos_informacao(estado: EstadoReserva, telefone: str) -> str
 
 
 def _texto_pergunta_restaurante(categoria: str, estado: EstadoReserva) -> str:
-    config = config_restaurante.obter_config()
-    abertura, fechamento = _horario_funcionamento_texto()
+    config = _config_restaurante_atual()
+    data_reserva = str(estado.get("data_reserva") or "")
+    abertura, fechamento = _horario_funcionamento_texto(data_reserva, config=config)
     abertura_cliente = _horario_para_cliente(abertura)
     fechamento_cliente = _horario_para_cliente(fechamento)
 
@@ -2757,7 +2789,9 @@ def _texto_pergunta_restaurante(categoria: str, estado: EstadoReserva) -> str:
         )
 
     if categoria == "funcionamento":
-        if estado.get("data_reserva"):
+        if data_reserva and config_restaurante.fechado_na_data(data_reserva, config=config):
+            base = "Nesse dia estamos fechados."
+        elif data_reserva:
             base = f"Nesse dia abrimos as {abertura_cliente} e fechamos as {fechamento_cliente}."
         else:
             base = f"Funcionamos {config.dias_funcionamento}, das {abertura_cliente} as {fechamento_cliente}."
@@ -2918,22 +2952,30 @@ def _data_estado_confere_origem(estado: Mapping[str, Any]) -> bool:
     return data_original == data_estado
 
 
-def _horario_reserva_valido(horario: str) -> bool:
+def _horario_reserva_valido(
+    horario: str,
+    *,
+    data_reserva: str | None = None,
+    config: config_restaurante.ConfigRestaurante | None = None,
+) -> bool:
     if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", horario):
         return False
-    minuto = _horario_para_minutos(horario)
-    abertura, fechamento = _horario_funcionamento_texto()
-    inicio = _horario_para_minutos(abertura)
-    fim = _horario_para_minutos(fechamento)
-    if inicio is None or fim is None or minuto is None:
-        return True
-    if inicio <= fim:
-        return inicio <= minuto <= fim
-    return minuto >= inicio or minuto <= fim
+    return config_restaurante.horario_valido_para_chegada(
+        horario,
+        data_reserva,
+        config=config or _config_restaurante_atual(),
+    )
 
 
-def _horario_funcionamento_texto() -> tuple[str, str]:
-    abertura, fechamento = config_restaurante.horario_funcionamento()
+def _horario_funcionamento_texto(
+    data_reserva: str | None = None,
+    *,
+    config: config_restaurante.ConfigRestaurante | None = None,
+) -> tuple[str, str]:
+    abertura, fechamento = config_restaurante.horario_funcionamento(
+        data_reserva,
+        config=config or _config_restaurante_atual(),
+    )
     if _horario_para_minutos(abertura) is None:
         abertura = "10:00"
     if _horario_para_minutos(fechamento) is None:
@@ -2942,13 +2984,13 @@ def _horario_funcionamento_texto() -> tuple[str, str]:
 
 
 def _horario_para_cliente(horario: str) -> str:
-    if horario == "23:59":
+    if horario in {"00:00", "23:59"}:
         return "meia-noite"
     return horario
 
 
 def _limite_pessoas_reserva() -> int:
-    return config_restaurante.limite_pessoas_reserva()
+    return config_restaurante.limite_pessoas_reserva(config=_config_restaurante_atual())
 
 
 def _horario_para_minutos(horario: str) -> int | None:
@@ -3065,7 +3107,7 @@ def _chamar_groq(mensagens: Sequence[Mensagem], modelo: str, *, response_format_
 
 
 def _mensagem_sistema(nome_cliente: str, *, perfil_cliente: Mapping[str, Any] | None = None) -> Mensagem:
-    config = config_restaurante.obter_config()
+    config = _config_restaurante_atual()
     restaurante = config.nome
     hoje = _hoje().strftime("%d/%m/%Y")
     nome = nome_cliente.strip() or "cliente"
