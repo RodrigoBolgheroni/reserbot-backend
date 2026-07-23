@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import hmac
 import os
 import re
 import sys
@@ -16,7 +17,7 @@ ROOT_DIR: Final[Path] = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from services import clientes_supabase, conversas_supabase, disparador, fluxo_reservas, pdf_clientes, perfis, whatsapp_cloud
+from services import clientes_supabase, configuracoes_admin, conversas_supabase, disparador, fluxo_reservas, pdf_clientes, perfis, whatsapp_cloud
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,21 @@ class ConfigHandler(BaseHTTPRequestHandler):
             return
         if rota == "/api/config":
             self._responder_json(_ler_env())
+            return
+        if rota == "/api/configuracoes/estabelecimento":
+            self._config_admin_ler(configuracoes_admin.obter_estabelecimento)
+            return
+        if rota == "/api/configuracoes/horarios":
+            self._config_admin_ler(configuracoes_admin.listar_horarios)
+            return
+        if rota == "/api/configuracoes/reserva":
+            self._config_admin_ler(configuracoes_admin.obter_configuracao_reserva)
+            return
+        if rota == "/api/configuracoes/espacos":
+            self._config_admin_ler(configuracoes_admin.listar_espacos)
+            return
+        if rota == "/api/configuracoes/faqs":
+            self._config_admin_ler(configuracoes_admin.listar_faqs, _query_params_simples(self.path))
             return
         if rota == "/api/clientes/aniversarios-proximos":
             self._listar_aniversarios_proximos()
@@ -74,6 +90,12 @@ class ConfigHandler(BaseHTTPRequestHandler):
         if rota == "/api/config":
             self._salvar_config()
             return
+        if rota == "/api/configuracoes/espacos":
+            self._config_admin_escrever(configuracoes_admin.criar_espaco, status_sucesso=HTTPStatus.CREATED)
+            return
+        if rota == "/api/configuracoes/faqs":
+            self._config_admin_escrever(configuracoes_admin.criar_faq, status_sucesso=HTTPStatus.CREATED)
+            return
         if rota == "/api/clientes/pdf/preview":
             self._preview_pdf_clientes()
             return
@@ -101,6 +123,41 @@ class ConfigHandler(BaseHTTPRequestHandler):
 
         self._responder_erro(HTTPStatus.NOT_FOUND, "rota nao encontrada")
 
+    def do_PUT(self) -> None:
+        rota = urlparse(self.path).path
+        if rota == "/api/configuracoes/estabelecimento":
+            self._config_admin_escrever(configuracoes_admin.atualizar_estabelecimento)
+            return
+        if rota == "/api/configuracoes/horarios":
+            self._config_admin_escrever(configuracoes_admin.atualizar_horarios)
+            return
+        if rota == "/api/configuracoes/reserva":
+            self._config_admin_escrever(configuracoes_admin.atualizar_configuracao_reserva)
+            return
+        espaco_id = _id_rota_configuracao(rota, "espacos")
+        if espaco_id:
+            self._config_admin_escrever(configuracoes_admin.atualizar_espaco, espaco_id)
+            return
+        faq_id = _id_rota_configuracao(rota, "faqs")
+        if faq_id:
+            self._config_admin_escrever(configuracoes_admin.atualizar_faq, faq_id)
+            return
+
+        self._responder_erro(HTTPStatus.NOT_FOUND, "rota nao encontrada")
+
+    def do_DELETE(self) -> None:
+        rota = urlparse(self.path).path
+        espaco_id = _id_rota_configuracao(rota, "espacos")
+        if espaco_id:
+            self._config_admin_ler(configuracoes_admin.excluir_espaco, espaco_id)
+            return
+        faq_id = _id_rota_configuracao(rota, "faqs")
+        if faq_id:
+            self._config_admin_ler(configuracoes_admin.excluir_faq, faq_id)
+            return
+
+        self._responder_erro(HTTPStatus.NOT_FOUND, "rota nao encontrada")
+
     def do_OPTIONS(self) -> None:
         self.send_response(HTTPStatus.NO_CONTENT)
         self.end_headers()
@@ -108,13 +165,91 @@ class ConfigHandler(BaseHTTPRequestHandler):
     def end_headers(self) -> None:
         self.send_header("Access-Control-Allow-Origin", _cors_origin(self.headers.get("Origin", "")))
         self.send_header("Vary", "Origin")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Config-Admin-Token")
         self.send_header("Access-Control-Max-Age", "86400")
         super().end_headers()
 
     def log_message(self, formato: str, *args: Any) -> None:
         logger.info("config-server: " + formato, *args)
+
+    def _config_admin_ler(self, func: Any, *args: Any, status_sucesso: HTTPStatus = HTTPStatus.OK) -> None:
+        if not self._exigir_config_admin():
+            return
+        try:
+            resultado = func(*args)
+        except Exception:
+            logger.exception("Falha inesperada em endpoint administrativo de configuracoes.")
+            self._responder_json(
+                {
+                    "ok": False,
+                    "erro": "erro_interno",
+                    "mensagem": "Nao foi possivel processar a configuracao agora.",
+                },
+                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+        self._responder_resultado_config_admin(resultado, status_sucesso=status_sucesso)
+
+    def _config_admin_escrever(self, func: Any, *args: Any, status_sucesso: HTTPStatus = HTTPStatus.OK) -> None:
+        if not self._exigir_config_admin():
+            return
+        try:
+            payload = self._ler_json_body()
+        except ValueError as erro:
+            self._responder_json(
+                {
+                    "ok": False,
+                    "erro": "json_invalido",
+                    "mensagem": str(erro),
+                },
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        if not isinstance(payload, dict):
+            self._responder_json(
+                {
+                    "ok": False,
+                    "erro": "payload_invalido",
+                    "mensagem": "JSON precisa ser um objeto.",
+                },
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        try:
+            resultado = func(*args, payload) if args else func(payload)
+        except Exception:
+            logger.exception("Falha inesperada em escrita administrativa de configuracoes.")
+            self._responder_json(
+                {
+                    "ok": False,
+                    "erro": "erro_interno",
+                    "mensagem": "Nao foi possivel salvar a configuracao agora.",
+                },
+                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+        self._responder_resultado_config_admin(resultado, status_sucesso=status_sucesso)
+
+    def _exigir_config_admin(self) -> bool:
+        autorizacao = _autorizar_config_admin(self.headers)
+        if autorizacao["ok"]:
+            return True
+        self._responder_json(
+            {
+                "ok": False,
+                "erro": autorizacao["erro"],
+                "mensagem": autorizacao["mensagem"],
+            },
+            status=HTTPStatus(autorizacao["status"]),
+        )
+        return False
+
+    def _responder_resultado_config_admin(self, resultado: dict[str, Any], *, status_sucesso: HTTPStatus = HTTPStatus.OK) -> None:
+        payload = dict(resultado)
+        status = HTTPStatus(int(payload.pop("_status", status_sucesso)))
+        self._responder_json(payload, status=status)
 
     def _salvar_config(self) -> None:
         try:
@@ -542,11 +677,18 @@ class ConfigHandler(BaseHTTPRequestHandler):
     def _responder_erro(self, status: HTTPStatus, mensagem: str) -> None:
         self._responder_json({"ok": False, "erro": mensagem}, status=status)
 
-    def _responder_json(self, payload: dict[str, Any], status: HTTPStatus = HTTPStatus.OK) -> None:
+    def _responder_json(
+        self,
+        payload: dict[str, Any],
+        status: HTTPStatus = HTTPStatus.OK,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         corpo = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(corpo)))
+        for nome, valor in (headers or {}).items():
+            self.send_header(nome, valor)
         self.end_headers()
         self.wfile.write(corpo)
 
@@ -650,6 +792,58 @@ def _query_int(path: str, nome: str, padrao: int) -> int:
         return int(query.get(nome, [str(padrao)])[0])
     except (TypeError, ValueError):
         return padrao
+
+
+def _autorizar_config_admin(headers: Any) -> dict[str, Any]:
+    token_configurado = os.getenv("CONFIG_ADMIN_TOKEN", "").strip()
+    if not token_configurado:
+        return {
+            "ok": False,
+            "erro": "config_admin_token_nao_configurado",
+            "mensagem": "Acesso administrativo nao configurado.",
+            "status": HTTPStatus.FORBIDDEN,
+        }
+    token_recebido = _token_config_admin_recebido(headers)
+    if not token_recebido:
+        return {
+            "ok": False,
+            "erro": "nao_autenticado",
+            "mensagem": "Token administrativo ausente.",
+            "status": HTTPStatus.UNAUTHORIZED,
+        }
+    if not hmac.compare_digest(token_recebido, token_configurado):
+        return {
+            "ok": False,
+            "erro": "acesso_negado",
+            "mensagem": "Token administrativo invalido.",
+            "status": HTTPStatus.FORBIDDEN,
+        }
+    return {"ok": True, "modo": "token"}
+
+
+def _token_config_admin_recebido(headers: Any) -> str:
+    token_header = str(headers.get("X-Config-Admin-Token", "") if headers else "").strip()
+    if token_header:
+        return token_header
+    autorizacao = str(headers.get("Authorization", "") if headers else "").strip()
+    if not autorizacao:
+        return ""
+    partes = autorizacao.split(None, 1)
+    if len(partes) == 2 and partes[0].lower() == "bearer":
+        return partes[1].strip()
+    return autorizacao
+
+
+def _query_params_simples(path: str) -> dict[str, str]:
+    query = parse_qs(urlparse(path).query)
+    return {chave: valores[0] for chave, valores in query.items() if valores}
+
+
+def _id_rota_configuracao(rota: str, recurso: str) -> str:
+    partes = [parte for parte in rota.split("/") if parte]
+    if len(partes) == 4 and partes[:3] == ["api", "configuracoes", recurso]:
+        return partes[3]
+    return ""
 
 
 def _paginacao_clientes(path: str) -> tuple[int, int, int]:
