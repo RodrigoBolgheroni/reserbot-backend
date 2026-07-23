@@ -11,7 +11,9 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Final
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
+from urllib.request import Request, urlopen
 
 ROOT_DIR: Final[Path] = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -31,6 +33,7 @@ CONFIG_KEYS: Final[set[str]] = {
 MAX_UPLOAD_MB_PADRAO: Final[int] = 15
 CLIENTES_PAGE_SIZE_PADRAO: Final[int] = 100
 CLIENTES_PAGE_SIZE_MAX: Final[int] = 500
+SUPABASE_AUTH_TIMEOUT_SEGUNDOS: Final[int] = 10
 _IMPORTACOES_PENDENTES: dict[str, pdf_clientes.ResultadoExtracaoPDF] = {}
 
 
@@ -796,14 +799,23 @@ def _query_int(path: str, nome: str, padrao: int) -> int:
 
 def _autorizar_config_admin(headers: Any) -> dict[str, Any]:
     token_configurado = os.getenv("CONFIG_ADMIN_TOKEN", "").strip()
+    token_recebido = _token_config_admin_recebido(headers)
     if not token_configurado:
+        if not token_recebido:
+            return {
+                "ok": False,
+                "erro": "nao_autenticado",
+                "mensagem": "Sessao do painel ausente.",
+                "status": HTTPStatus.UNAUTHORIZED,
+            }
+        if _validar_token_supabase(token_recebido):
+            return {"ok": True, "modo": "supabase_auth"}
         return {
             "ok": False,
-            "erro": "config_admin_token_nao_configurado",
-            "mensagem": "Acesso administrativo nao configurado.",
+            "erro": "acesso_negado",
+            "mensagem": "Sessao do painel invalida ou expirada.",
             "status": HTTPStatus.FORBIDDEN,
         }
-    token_recebido = _token_config_admin_recebido(headers)
     if not token_recebido:
         return {
             "ok": False,
@@ -819,6 +831,63 @@ def _autorizar_config_admin(headers: Any) -> dict[str, Any]:
             "status": HTTPStatus.FORBIDDEN,
         }
     return {"ok": True, "modo": "token"}
+
+
+def _validar_token_supabase(token: str) -> bool:
+    token = str(token or "").strip()
+    if not token:
+        return False
+    supabase_url = _env_backend("SUPABASE_URL").rstrip("/")
+    supabase_key = (
+        _env_backend("SUPABASE_ANON_KEY")
+        or _env_backend("SUPABASE_PUBLISHABLE_KEY")
+        or _env_backend("SUPABASE_SERVICE_ROLE_KEY")
+    )
+    if not supabase_url or not supabase_key:
+        logger.warning("Nao foi possivel validar sessao do painel: Supabase nao configurado.")
+        return False
+
+    request = Request(
+        f"{supabase_url}/auth/v1/user",
+        method="GET",
+        headers={
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urlopen(request, timeout=SUPABASE_AUTH_TIMEOUT_SEGUNDOS) as response:
+            return 200 <= int(getattr(response, "status", 200)) < 300
+    except HTTPError as erro:
+        logger.warning("Supabase Auth recusou sessao do painel: HTTP %s", erro.code)
+        return False
+    except URLError as erro:
+        logger.warning("Falha ao validar sessao do painel no Supabase Auth: %s", erro.reason)
+        return False
+    except OSError as erro:
+        logger.warning("Falha ao validar sessao do painel: %s", erro)
+        return False
+
+
+def _env_backend(nome: str) -> str:
+    return os.getenv(nome, "").strip() or _ler_env_local().get(nome, "").strip()
+
+
+def _ler_env_local(path: Path = ENV_PATH) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    try:
+        linhas = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    valores: dict[str, str] = {}
+    for linha in linhas:
+        if not linha or linha.lstrip().startswith("#") or "=" not in linha:
+            continue
+        chave, _, valor = linha.partition("=")
+        valores[chave.strip()] = valor.strip()
+    return valores
 
 
 def _token_config_admin_recebido(headers: Any) -> str:

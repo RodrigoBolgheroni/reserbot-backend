@@ -344,6 +344,17 @@ class ConfigServerConfiguracoesAdminTest(unittest.TestCase):
         self.assertEqual(valido[0][0]["ok"], True)
         self.assertNotIn("correto", str(valido[0][0]))
 
+        supabase_auth: list[tuple[dict, object]] = []
+        handler = self._handler(headers={"Authorization": "Bearer jwt-supabase"})
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(config_server, "_validar_token_supabase", return_value=True) as validar,
+            patch.object(config_server.ConfigHandler, "_responder_json", lambda _self, payload, status=None: supabase_auth.append((payload, status))),
+        ):
+            config_server.ConfigHandler._config_admin_ler(handler, lambda: {"ok": True, "data": {"id": "est-1"}})
+        validar.assert_called_once_with("jwt-supabase")
+        self.assertEqual(supabase_auth[0][0]["ok"], True)
+
     def test_rotas_chamam_services_e_respeitam_status(self) -> None:
         respostas: list[tuple[dict, object]] = []
         handler = self._handler(path="/api/configuracoes/faqs?page=1&page_size=30", headers={"Authorization": "Bearer token"})
