@@ -295,16 +295,38 @@ def _processar_mensagem_sem_lock(
             texto_modelo = _chamar_groq(
                 mensagens=mensagens_groq,
                 modelo=os.getenv("GROQ_MODEL", MODELO_PADRAO),
+                response_format_json=True,
             )
         except Exception:
             logger.exception("Falha ao processar mensagem com Groq.")
             texto_modelo = _resposta_contingencia()
     logger.info("DIAG_RESERVA json_bruto_ia telefone=%s resposta=%s", telefone_limpo, texto_modelo)
+    json_valido = _extrair_json_resposta(texto_modelo) is not None
+    logger.info("DIAG_RESERVA json_estruturado telefone=%s valido=%s tentativa_reparo=%s", telefone_limpo, json_valido, not json_valido)
+    texto_para_interpretar = texto_modelo
+    reparo_aplicado = False
+    if not json_valido:
+        texto_reparado = _reparar_interpretacao_texto_simples(
+            telefone=telefone_limpo,
+            mensagem_cliente=mensagem_limpa,
+            resposta_natural=texto_modelo,
+        )
+        if texto_reparado:
+            texto_para_interpretar = texto_reparado
+            reparo_aplicado = True
+        logger.info(
+            "DIAG_RESERVA reparo_json_resultado telefone=%s sucesso=%s resposta=%s",
+            telefone_limpo,
+            bool(texto_reparado),
+            texto_reparado or "",
+        )
 
     interpretacao = interpretar_resposta_modelo(
-        texto_modelo=texto_modelo,
+        texto_modelo=texto_para_interpretar,
         mensagem_cliente=mensagem_limpa,
     )
+    if reparo_aplicado:
+        interpretacao["texto"] = remover_flag_reserva(texto_modelo)
     logger.info(
         "DIAG_RESERVA interpretacao_ia telefone=%s intencao=%s dados_confirmados=%s dados_mencionados=%s correcoes=%s",
         telefone_limpo,
@@ -527,6 +549,7 @@ def aplicar_guardrails_reserva(
 
     _atualizar_contexto_conversacional_estado(estado, interpretacao)
     data_clara_promovivel = _mensagem_tem_data_clara_promovivel(mensagem_cliente, estado, interpretacao)
+    horario_claro_promovivel = _mensagem_tem_horario_claro_promovivel(mensagem_cliente, estado, interpretacao)
 
     intencao_conversacional = _intencao_conversacional(mensagem_cliente)
     categoria_pergunta_restaurante = _categoria_pergunta_restaurante(mensagem_cliente)
@@ -537,6 +560,7 @@ def aplicar_guardrails_reserva(
         and intencao_modelo in INTENCOES_CONVERSACIONAIS_IA
         and not _interpretacao_tem_dados_reserva(interpretacao)
         and not data_clara_promovivel
+        and not horario_claro_promovivel
     ):
         intencao_conversacional = intencao_modelo
 
@@ -1120,6 +1144,42 @@ def _atualizar_estado_reserva(
             "DIAG_RESERVA dados_confirmados_promovidos campo=data_reserva valor=%s motivo=data_clara_sem_data_no_estado",
             data_parser,
         )
+    horario_parser = _extrair_horario(
+        mensagem_cliente,
+        permitir_numero_isolado=campo_pendente == "horario",
+    )
+    promover_horario, motivo_horario = _avaliar_promocao_horario_claro(
+        mensagem_cliente,
+        horario_parser,
+        estado,
+        interpretacao,
+    )
+    logger.info(
+        "DIAG_RESERVA horario_ia texto=%r campo_pendente=%s intencao=%s dados_confirmados.horario=%s dados_mencionados.horario=%s correcoes.horario=%s deve_avancar_estado=%s parser_horario=%s promover=%s motivo=%s",
+        mensagem_cliente,
+        campo_pendente,
+        intencao_modelo,
+        _valor_horario_interpretacao(interpretacao.get("dados_confirmados")),
+        _valor_horario_interpretacao(interpretacao.get("dados_mencionados")),
+        _valor_horario_interpretacao(interpretacao.get("correcoes")),
+        bool(interpretacao.get("deve_avancar_estado")),
+        horario_parser,
+        promover_horario,
+        motivo_horario,
+    )
+    if promover_horario and horario_parser:
+        dados_modelo_confirmados["horario"] = horario_parser
+        logger.info(
+            "DIAG_RESERVA dados_confirmados_promovidos campo=horario valor=%s motivo=horario_claro_sem_horario_no_estado",
+            horario_parser,
+        )
+    elif horario_parser:
+        logger.info(
+            "DIAG_RESERVA horario_parser_descartado valor=%s motivo=%s horario_estado=%s",
+            horario_parser,
+            motivo_horario,
+            estado.get("horario", ""),
+        )
     dados_usuario = (
         _extrair_dados_reserva_contextual(
             mensagem_cliente,
@@ -1141,10 +1201,7 @@ def _atualizar_estado_reserva(
             else:
                 invalidos.add("pessoas")
 
-        horario_usuario = _extrair_horario(
-            mensagem_cliente,
-            permitir_numero_isolado=campo_pendente == "horario",
-        )
+        horario_usuario = horario_parser
         if horario_usuario and not _horario_reserva_valido(horario_usuario):
             invalidos.add("horario")
 
@@ -1170,8 +1227,8 @@ def _atualizar_estado_reserva(
             fonte="ia_confirmado",
             permitir_sobrescrever=_mensagem_indica_correcao(mensagem_cliente, interpretacao),
         )
-    if _pode_aplicar_dado_confirmado("horario", estado, interpretacao, mensagem_cliente):
-        _definir_horario_estado(estado, dados_modelo_confirmados.get("horario"), invalidos=invalidos)
+    if promover_horario or _pode_aplicar_dado_confirmado("horario", estado, interpretacao, mensagem_cliente):
+        _definir_horario_estado(estado, dados_modelo_confirmados.get("horario"), invalidos=invalidos, fonte="ia_confirmado")
     if _pode_aplicar_dado_confirmado("pessoas", estado, interpretacao, mensagem_cliente):
         _definir_pessoas_estado(estado, dados_modelo_confirmados.get("pessoas"), invalidos=invalidos)
     if _pode_aplicar_dado_confirmado("nome_cliente", estado, interpretacao, mensagem_cliente) and _nome_parece_valido(
@@ -1187,7 +1244,7 @@ def _atualizar_estado_reserva(
         fonte="cliente",
         permitir_sobrescrever=campo_pendente not in {"horario", "pessoas"} and tem_sinal_data,
     )
-    _definir_horario_estado(estado, dados_usuario.get("horario"), invalidos=invalidos)
+    _definir_horario_estado(estado, dados_usuario.get("horario"), invalidos=invalidos, fonte="cliente")
     _definir_pessoas_estado(estado, dados_usuario.get("pessoas"), invalidos=invalidos)
 
     observacoes = str(dados_modelo_confirmados.get("observacoes") or dados_usuario.get("observacoes") or "").strip()
@@ -1279,19 +1336,32 @@ def _remover_campos_invalidos_estado(estado: EstadoReserva, invalidos: set[str])
         invalidos.add("pessoas")
 
 
-def _definir_horario_estado(estado: EstadoReserva, valor: Any, *, invalidos: set[str]) -> None:
+def _definir_horario_estado(estado: EstadoReserva, valor: Any, *, invalidos: set[str], fonte: str = "") -> None:
     if not isinstance(valor, str) or not valor.strip():
         return
     horario = valor.strip()
     if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", horario):
+        logger.info("DIAG_RESERVA validacao_horario valor=%r valido=false motivo=formato_invalido fonte=%s", valor, fonte)
         return
     if not _horario_reserva_valido(horario):
         estado["horario_invalido"] = horario
         invalidos.add("horario")
+        logger.info(
+            "DIAG_RESERVA validacao_horario valor=%s valido=false motivo=fora_funcionamento fonte=%s horario_salvo=%s",
+            horario,
+            fonte,
+            estado.get("horario", ""),
+        )
         return
     estado["horario"] = horario
     estado.pop("horario_invalido", None)
     _limpar_tentativas_campo(estado, "horario")
+    logger.info(
+        "DIAG_RESERVA validacao_horario valor=%s valido=true aplicada=true fonte=%s horario_salvo=%s",
+        horario,
+        fonte,
+        estado.get("horario", ""),
+    )
 
 
 def _definir_pessoas_estado(estado: EstadoReserva, valor: Any, *, invalidos: set[str]) -> None:
@@ -1436,6 +1506,11 @@ def _pode_aplicar_dado_confirmado(
         return False
     contrato_novo = bool(interpretacao.get("contrato_novo"))
     campo_aguardado = _campo_aguardado(estado)
+    intencao = _normalizar_intencao_ia(str(interpretacao.get("intencao") or ""))
+    if tem_dado and campo == campo_aguardado and intencao in {"fornecimento_dados", "correcao"}:
+        return True
+    if tem_dado and campo == "horario" and campo_aguardado == "horario" and _mensagem_tem_sinal_horario(mensagem_cliente):
+        return True
     if not contrato_novo:
         if _mensagem_indica_correcao(mensagem_cliente, interpretacao):
             return campo == campo_aguardado or (
@@ -1448,7 +1523,7 @@ def _pode_aplicar_dado_confirmado(
         return True
     if bool(interpretacao.get("deve_avancar_estado")):
         return True
-    return campo == campo_aguardado and _normalizar_intencao_ia(str(interpretacao.get("intencao") or "")) == "fornecimento_dados"
+    return campo == campo_aguardado and intencao == "fornecimento_dados"
 
 
 def _deve_promover_data_clara(
@@ -1488,6 +1563,67 @@ def _mensagem_tem_data_clara_promovivel(
         permitir_dia_isolado=_campo_aguardado(estado) == "data_reserva" or not estado.get("data_reserva"),
     )
     return _deve_promover_data_clara(mensagem_cliente, data_parser, estado, interpretacao)
+
+
+def _valor_horario_interpretacao(valor: Any) -> str:
+    if not isinstance(valor, Mapping):
+        return ""
+    horario = valor.get("horario") or valor.get("hora")
+    return "" if horario in (None, "", []) else str(horario)
+
+
+def _avaliar_promocao_horario_claro(
+    mensagem_cliente: str,
+    horario_parser: str | None,
+    estado: Mapping[str, Any],
+    interpretacao: Mapping[str, Any],
+) -> tuple[bool, str]:
+    if not horario_parser:
+        return False, "sem_horario_extraido"
+    if estado.get("horario") and not _mensagem_indica_correcao(mensagem_cliente, interpretacao):
+        return False, "horario_ja_salvo"
+    if _categoria_pergunta_restaurante(mensagem_cliente):
+        return False, "pergunta_restaurante"
+    if _mensagem_eh_pergunta_contextual(mensagem_cliente):
+        return False, "pergunta_contextual"
+
+    campo = _campo_aguardado(estado)
+    if campo and campo not in {"horario", "confirmacao"}:
+        return False, f"campo_aguardado_{campo}"
+
+    intencao = _normalizar_intencao_ia(str(interpretacao.get("intencao") or ""))
+    if intencao in {"fornecimento_dados", "correcao"}:
+        return True, f"intencao_{intencao}"
+    if _mensagem_indica_correcao(mensagem_cliente, interpretacao):
+        return True, "correcao_detectada"
+    if _mensagem_confirma_horario(mensagem_cliente, campo):
+        return True, "mensagem_confirma_horario"
+    return False, "horario_apenas_mencionado"
+
+
+def _mensagem_tem_horario_claro_promovivel(
+    mensagem_cliente: str,
+    estado: Mapping[str, Any],
+    interpretacao: Mapping[str, Any],
+) -> bool:
+    horario_parser = _extrair_horario(
+        mensagem_cliente,
+        permitir_numero_isolado=_campo_aguardado(estado) == "horario",
+    )
+    promover, _ = _avaliar_promocao_horario_claro(mensagem_cliente, horario_parser, estado, interpretacao)
+    return promover
+
+
+def _mensagem_confirma_horario(mensagem_cliente: str, campo_aguardado: str) -> bool:
+    normalizado = _normalizar_busca(mensagem_cliente)
+    if not normalizado or _mensagem_eh_pergunta_contextual(mensagem_cliente):
+        return False
+    if re.search(r"\b(coloca|coloque|anota|anote|marca|marque|pode ser|fechado|fecha|confirmo|prefiro|vou chegar|chego)\b", normalizado):
+        return True
+    if campo_aguardado == "horario":
+        palavras = re.findall(r"\w+", normalizado)
+        return 1 <= len(palavras) <= 4 and _extrair_horario(mensagem_cliente, permitir_numero_isolado=True) is not None
+    return False
 
 
 def _pode_aceitar_dado_modelo(
@@ -2427,7 +2563,8 @@ def _mensagem_tem_sinal_data(texto: str) -> bool:
 def _mensagem_tem_sinal_horario(texto: str) -> bool:
     normalizado = _normalizar_busca(texto)
     return bool(
-        re.search(r"\b([01]?\d|2[0-3])[:h]([0-5]\d)?\b", normalizado)
+        _extrair_horario(texto, permitir_numero_isolado=False)
+        or re.search(r"\b([01]?\d|2[0-3])[:h]([0-5]\d)?\b", normalizado)
         or re.search(r"\b(?:as|às)\s+(\d{1,2})\b", texto, flags=re.IGNORECASE)
         or re.search(r"\b\d{1,2}\s+horas?\b", normalizado)
         or re.search(r"\b\d{1,2}\s*(?:da|de)\s*(manha|tarde|noite)\b", normalizado)
@@ -2540,7 +2677,63 @@ def _resposta_contingencia() -> str:
     )
 
 
-def _chamar_groq(mensagens: Sequence[Mensagem], modelo: str) -> str:
+def _reparar_interpretacao_texto_simples(
+    *,
+    telefone: str,
+    mensagem_cliente: str,
+    resposta_natural: str,
+) -> str:
+    if not os.getenv("GROQ_API_KEY", "").strip():
+        return ""
+    try:
+        texto_modelo = _chamar_groq(
+            mensagens=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Voce converte uma resposta de atendimento em JSON estruturado para o backend. "
+                        "Nao gere uma nova resposta ao cliente. Preserve exatamente a resposta_natural no campo resposta. "
+                        "Classifique a intencao e separe dados_confirmados, dados_mencionados, dados_incertos e correcoes. "
+                        "Se o cliente apenas mencionou um horario em uma pergunta contextual, use dados_mencionados. "
+                        "Se o cliente escolheu/corrigiu um horario, use dados_confirmados ou correcoes. "
+                        "Responda somente JSON valido no contrato principal."
+                    ),
+                },
+                _mensagem_contexto_reserva(telefone),
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "mensagem_cliente": mensagem_cliente,
+                            "resposta_natural": remover_flag_reserva(resposta_natural),
+                            "formato": {
+                                "resposta": "mesma resposta_natural, sem alterar",
+                                "intencao": "pedido_humano|pergunta_restaurante|pergunta_bot|pergunta_fonte|pergunta_contextual|correcao|recusa|fornecimento_dados|comentario|brincadeira|incompreensivel",
+                                "dados_confirmados": {"data": None, "horario": None, "quantidade": None, "nome": None},
+                                "dados_mencionados": {"data": None, "horario": None, "quantidade": None},
+                                "dados_incertos": {},
+                                "correcoes": {},
+                                "acao": "responder|continuar_conversa|pedir_confirmacao|confirmar_reserva|cancelar|encaminhar_humano",
+                                "deve_avancar_estado": False,
+                                "campo_sugerido": None,
+                                "confianca": 0.0,
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            modelo=os.getenv("GROQ_MODEL", MODELO_PADRAO),
+            response_format_json=True,
+        )
+    except Exception:
+        logger.exception("Falha ao reparar resposta em texto simples para JSON.")
+        return ""
+
+    return texto_modelo if _extrair_json_resposta(texto_modelo) is not None else ""
+
+
+def _chamar_groq(mensagens: Sequence[Mensagem], modelo: str, *, response_format_json: bool = False) -> str:
     api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("GROQ_API_KEY nao configurada.")
@@ -2548,12 +2741,29 @@ def _chamar_groq(mensagens: Sequence[Mensagem], modelo: str) -> str:
     from groq import Groq
 
     client = Groq(api_key=api_key)
-    resposta = client.chat.completions.create(
-        model=modelo.strip() or MODELO_PADRAO,
-        messages=list(mensagens),
-        temperature=0.4,
-        max_tokens=500,
-    )
+    kwargs: dict[str, Any] = {
+        "model": modelo.strip() or MODELO_PADRAO,
+        "messages": list(mensagens),
+        "temperature": 0.4,
+        "max_tokens": 500,
+    }
+    if response_format_json:
+        kwargs["response_format"] = {"type": "json_object"}
+
+    try:
+        resposta = client.chat.completions.create(**kwargs)
+    except TypeError:
+        if not response_format_json:
+            raise
+        logger.warning("Groq SDK nao aceitou response_format JSON. Repetindo sem response_format.")
+        kwargs.pop("response_format", None)
+        resposta = client.chat.completions.create(**kwargs)
+    except Exception as exc:
+        if not response_format_json or "response_format" not in str(exc).lower():
+            raise
+        logger.warning("Groq rejeitou response_format JSON. Repetindo sem response_format: %s", exc)
+        kwargs.pop("response_format", None)
+        resposta = client.chat.completions.create(**kwargs)
 
     conteudo = resposta.choices[0].message.content
     if not conteudo:
@@ -2833,11 +3043,42 @@ def _formatar_data_futura(dia: int, mes: int, ano: int) -> str | None:
 
 def _extrair_horario(texto: str, *, permitir_numero_isolado: bool = False) -> str | None:
     texto_normalizado = _normalizar_busca(texto)
+    if re.search(r"\bmeia[-\s]?noite\b", texto_normalizado):
+        return "00:00"
+    if re.search(r"\bmeio[-\s]?dia\b", texto_normalizado):
+        return "12:00"
+
     match = re.search(r"\b([01]?\d|2[0-3])[:h]([0-5]\d)?\b", texto_normalizado)
     if match:
         hora = int(match.group(1))
         minuto = int(match.group(2) or 0)
         return f"{hora:02d}:{minuto:02d}"
+
+    palavras_numero = "|".join(sorted((re.escape(palavra) for palavra in NUMEROS_POR_EXTENSO), key=len, reverse=True))
+    match_texto_meia = re.search(rf"\b({palavras_numero})\s+e\s+meia\b", texto_normalizado)
+    if match_texto_meia:
+        hora = _numero_texto_para_int(match_texto_meia.group(1))
+        if hora is not None and 0 <= hora <= 23:
+            return f"{hora:02d}:30"
+
+    match_texto_periodo = re.search(
+        rf"\b({palavras_numero})\s*(?:horas?\s*)?(?:da|de)\s*(manha|tarde|noite)\b",
+        texto_normalizado,
+    )
+    if match_texto_periodo:
+        hora = _numero_texto_para_int(match_texto_periodo.group(1))
+        periodo = match_texto_periodo.group(2)
+        if hora is not None:
+            if periodo in {"tarde", "noite"} and 1 <= hora <= 11:
+                hora += 12
+            if 0 <= hora <= 23:
+                return f"{hora:02d}:00"
+
+    match_texto_horas = re.search(rf"\b({palavras_numero})\s+horas?\b", texto_normalizado)
+    if match_texto_horas:
+        hora = _numero_texto_para_int(match_texto_horas.group(1))
+        if hora is not None and 0 <= hora <= 23:
+            return f"{hora:02d}:00"
 
     match_periodo_normalizado = re.search(
         r"\b(\d{1,2})\s*(?:horas?\s*)?(?:da|de)\s*(manha|tarde|noite)\b",

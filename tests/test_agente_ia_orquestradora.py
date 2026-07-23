@@ -134,6 +134,135 @@ class AgenteIAOrquestradoraTest(unittest.TestCase):
         self.assertEqual(estado["tentativas_campos"]["horario"], 2)
         self.assertNotIn("nao consegui entender", agente._normalizar_busca(resposta["texto"]))
 
+    def test_horarios_texto_simples_sao_reparados_e_validados(self) -> None:
+        casos = [
+            ("Então coloca umas 20h30", "20:30", True, "20h30, anotado! Agora, quantas pessoas vão estar com você no dia 30/07?"),
+            ("20:30", "20:30", True, "20h30, anotado! Agora, quantas pessoas vão estar com você no dia 30/07?"),
+            ("Oito horas", "08:00", False, "Às 8h ainda estamos fechados, porque abrimos às 10h. Qual horário dentro do funcionamento fica melhor?"),
+            ("19:30", "19:30", True, "19h30, anotado! Agora, quantas pessoas vão estar com você no dia 30/07?"),
+        ]
+
+        for indice, (mensagem, horario, valido, resposta_natural) in enumerate(casos, 1):
+            with self.subTest(mensagem=mensagem):
+                telefone = f"55119900010{indice:02d}"
+                agente._estados_reserva[telefone] = {
+                    "data_reserva": "2026-07-30",
+                    "campo_pendente": "horario",
+                    "etapa": "aguardando_horario",
+                }
+                reparo = {
+                    "resposta": resposta_natural,
+                    "intencao": "fornecimento_dados",
+                    "dados_confirmados": {"horario": horario},
+                    "dados_mencionados": {},
+                    "dados_incertos": {},
+                    "correcoes": {},
+                    "acao": "continuar_conversa",
+                    "deve_avancar_estado": False,
+                    "campo_sugerido": "quantidade" if valido else "horario",
+                    "confianca": 0.92,
+                }
+                chamadas = [resposta_natural, self._json(reparo)]
+                if not valido:
+                    chamadas.append(self._json({"resposta": resposta_natural}))
+                estado_antes = dict(agente._estados_reserva[telefone])
+
+                with (
+                    patch.object(agente, "_hoje", return_value=date(2026, 7, 22)),
+                    patch.dict(os.environ, {"GROQ_API_KEY": "teste", "RESERVA_HORARIO_INICIO": "10:00", "RESERVA_HORARIO_FIM": "23:59"}),
+                    patch.object(agente, "_chamar_groq", side_effect=chamadas),
+                ):
+                    resposta = agente.processar_mensagem(telefone, mensagem, nome_cliente="Rodrigo Teste")
+
+                estado_depois = agente._estados_reserva[telefone]
+                self.assertEqual(estado_antes["campo_pendente"], "horario")
+                if valido:
+                    self.assertEqual(resposta["texto"], resposta_natural)
+                    self.assertEqual(estado_depois["horario"], horario)
+                    self.assertEqual(estado_depois["campo_pendente"], "pessoas")
+                else:
+                    self.assertNotIn("horario", estado_depois)
+                    self.assertEqual(estado_depois["horario_invalido"], horario)
+                    self.assertEqual(estado_depois["campo_pendente"], "horario")
+                    self.assertIn("fechados", agente._normalizar_busca(resposta["texto"]))
+
+    def test_horarios_json_sao_validados_sem_deve_avancar(self) -> None:
+        casos = [
+            ("Então coloca umas 20h30", "20:30", True),
+            ("20:30", "20:30", True),
+            ("Oito horas", "08:00", False),
+            ("19:30", "19:30", True),
+        ]
+
+        for indice, (mensagem, horario, valido) in enumerate(casos, 1):
+            with self.subTest(mensagem=mensagem):
+                telefone = f"55119900011{indice:02d}"
+                agente._estados_reserva[telefone] = {
+                    "data_reserva": "2026-07-30",
+                    "campo_pendente": "horario",
+                    "etapa": "aguardando_horario",
+                }
+                resposta_natural = (
+                    f"{horario}, anotado! Agora, quantas pessoas vão estar com você no dia 30/07?"
+                    if valido
+                    else "Às 8h ainda estamos fechados, porque abrimos às 10h. Qual horário dentro do funcionamento fica melhor?"
+                )
+                payload = {
+                    "resposta": resposta_natural,
+                    "intencao": "fornecimento_dados",
+                    "dados_confirmados": {"horario": horario},
+                    "dados_mencionados": {},
+                    "dados_incertos": {},
+                    "correcoes": {},
+                    "acao": "continuar_conversa",
+                    "deve_avancar_estado": False,
+                    "campo_sugerido": "quantidade" if valido else "horario",
+                    "confianca": 0.92,
+                }
+                chamadas = [self._json(payload)]
+                if not valido:
+                    chamadas.append(self._json({"resposta": resposta_natural}))
+                estado_antes = dict(agente._estados_reserva[telefone])
+
+                with (
+                    patch.object(agente, "_hoje", return_value=date(2026, 7, 22)),
+                    patch.dict(os.environ, {"GROQ_API_KEY": "teste", "RESERVA_HORARIO_INICIO": "10:00", "RESERVA_HORARIO_FIM": "23:59"}),
+                    patch.object(agente, "_chamar_groq", side_effect=chamadas),
+                ):
+                    resposta = agente.processar_mensagem(telefone, mensagem, nome_cliente="Rodrigo Teste")
+
+                estado_depois = agente._estados_reserva[telefone]
+                self.assertEqual(estado_antes["campo_pendente"], "horario")
+                if valido:
+                    self.assertEqual(resposta["texto"], resposta_natural)
+                    self.assertEqual(estado_depois["horario"], horario)
+                    self.assertEqual(estado_depois["campo_pendente"], "pessoas")
+                else:
+                    self.assertNotIn("horario", estado_depois)
+                    self.assertEqual(estado_depois["horario_invalido"], horario)
+                    self.assertEqual(estado_depois["campo_pendente"], "horario")
+                    self.assertIn("fechados", agente._normalizar_busca(resposta["texto"]))
+
+    def test_parser_horario_aceita_formatos_basicos(self) -> None:
+        casos = {
+            "20:30": "20:30",
+            "20h30": "20:30",
+            "20h": "20:00",
+            "20 horas": "20:00",
+            "às 20": "20:00",
+            "umas 20h30": "20:30",
+            "então coloca 20h30": "20:30",
+            "pode ser 20:30": "20:30",
+            "oito horas": "08:00",
+            "oito e meia": "08:30",
+            "meia-noite": "00:00",
+            "meio-dia": "12:00",
+        }
+
+        for frase, esperado in casos.items():
+            with self.subTest(frase=frase):
+                self.assertEqual(agente._extrair_horario(frase, permitir_numero_isolado=True), esperado)
+
     def test_comentario_indecisao_usa_resposta_natural_da_ia(self) -> None:
         telefone = "5511990000034"
         payload = {
