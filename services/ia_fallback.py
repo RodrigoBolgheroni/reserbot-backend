@@ -23,6 +23,14 @@ MENSAGEM_HANDOFF_IA: Final[str] = (
     "Estou com uma instabilidade no atendimento automatico. "
     "Vou encaminhar sua conversa para a equipe continuar por aqui."
 )
+INSTRUCAO_JSON_TOLERANTE: Final[str] = (
+    "Retorne somente um objeto JSON valido. Nao use markdown, blocos de codigo, comentarios "
+    "ou texto antes/depois do JSON.\n"
+    "Use este contrato reduzido quando nao houver outros dados necessarios: "
+    '{"resposta":"texto para o cliente","intencao":"tipo da intencao",'
+    '"dados_confirmados":{},"dados_mencionados":{},"acao":"responder",'
+    '"deve_avancar_estado":false}.'
+)
 
 _cooldown_lock = threading.RLock()
 _cooldowns_memoria: dict[tuple[str, str], dict[str, Any]] = {}
@@ -113,7 +121,7 @@ def executar_ia_com_fallback(
                     conversa_id or "",
                 )
                 continue
-            if codigo in {"connection", "timeout", "server_error", "response_format"}:
+            if codigo in {"connection", "timeout", "server_error", "response_format", "bad_request", "json_validate_failed"}:
                 logger.warning(
                     "ai_%s_failed provider=groq model=%s erro_codigo=%s telefone=%s conversa_id=%s",
                     papel,
@@ -218,37 +226,124 @@ def _executar_groq_modelo(
     if not api_key:
         raise RuntimeError("GROQ_API_KEY nao configurada.")
 
-    from groq import Groq
-
-    client = Groq(api_key=api_key)
-    kwargs: dict[str, Any] = {
-        "model": modelo.strip() or MODELO_GROQ_PADRAO,
-        "messages": [dict(mensagem) for mensagem in mensagens],
-        "temperature": 0.4,
-        "max_tokens": 500,
-    }
-    if response_format_json:
-        kwargs["response_format"] = {"type": "json_object"}
+    client = _criar_cliente_groq(api_key)
+    kwargs = _kwargs_chat_groq(
+        mensagens,
+        modelo=modelo,
+        response_format_json=response_format_json,
+        temperature=0.4,
+    )
 
     try:
-        resposta = client.chat.completions.create(**kwargs)
+        resposta = _criar_completion_groq(client, kwargs)
     except TypeError:
         if not response_format_json:
             raise
         logger.warning("Groq SDK nao aceitou response_format JSON. Repetindo sem response_format.")
         kwargs.pop("response_format", None)
-        resposta = client.chat.completions.create(**kwargs)
+        resposta = _criar_completion_groq(client, kwargs)
     except Exception as exc:
-        if not response_format_json or "response_format" not in str(exc).lower():
+        if response_format_json and _erro_json_validate_failed(exc):
+            logger.warning(
+                "ai_fallback_json_mode_failed provider=groq model=%s codigo=json_validate_failed erro=%s",
+                modelo,
+                _sanitizar_erro(exc),
+            )
+            return _executar_groq_sem_json_mode_tolerante(
+                client,
+                mensagens,
+                modelo=modelo,
+            )
+        codigo = _classificar_erro_ia(exc)
+        if codigo in {"connection", "timeout", "server_error"}:
+            logger.warning(
+                "ai_groq_retry_started provider=groq model=%s erro_codigo=%s",
+                modelo,
+                codigo,
+            )
+            resposta = _criar_completion_groq(client, kwargs)
+        else:
             raise
-        logger.warning("Groq rejeitou response_format JSON. Repetindo sem response_format: %s", _sanitizar_erro(exc))
-        kwargs.pop("response_format", None)
-        resposta = client.chat.completions.create(**kwargs)
 
     conteudo = resposta.choices[0].message.content
     if not conteudo:
         raise RuntimeError("Groq retornou resposta vazia.")
     return str(conteudo).strip()
+
+
+def _kwargs_chat_groq(
+    mensagens: Sequence[Mapping[str, str]],
+    *,
+    modelo: str,
+    response_format_json: bool,
+    temperature: float,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "model": modelo.strip() or MODELO_GROQ_PADRAO,
+        "messages": [dict(mensagem) for mensagem in mensagens],
+        "temperature": temperature,
+        "max_tokens": 500,
+    }
+    if response_format_json:
+        kwargs["response_format"] = {"type": "json_object"}
+    return kwargs
+
+
+def _criar_completion_groq(client: Any, kwargs: Mapping[str, Any]) -> Any:
+    return client.chat.completions.create(**dict(kwargs))
+
+
+def _criar_cliente_groq(api_key: str) -> Any:
+    from groq import Groq
+
+    return Groq(api_key=api_key)
+
+
+def _executar_groq_sem_json_mode_tolerante(
+    client: Any,
+    mensagens: Sequence[Mapping[str, str]],
+    *,
+    modelo: str,
+) -> str:
+    logger.info(
+        "ai_fallback_plain_text_retry_started provider=groq model=%s",
+        modelo,
+    )
+    kwargs = _kwargs_chat_groq(
+        _mensagens_json_tolerante(mensagens),
+        modelo=modelo,
+        response_format_json=False,
+        temperature=0.0,
+    )
+    resposta = _criar_completion_groq(client, kwargs)
+    conteudo = str(resposta.choices[0].message.content or "").strip()
+    payload = extrair_json_resposta(conteudo)
+    if payload is None:
+        logger.warning(
+            "ai_fallback_json_repair_failed provider=groq model=%s",
+            modelo,
+        )
+        raise RuntimeError("json_repair_failed")
+    if not _json_texto_completo_valido(conteudo):
+        logger.info(
+            "ai_fallback_json_repair_success provider=groq model=%s",
+            modelo,
+        )
+    logger.info(
+        "ai_fallback_plain_text_retry_success provider=groq model=%s",
+        modelo,
+    )
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _mensagens_json_tolerante(mensagens: Sequence[Mapping[str, str]]) -> list[dict[str, str]]:
+    mensagens_tolerantes = [dict(mensagem) for mensagem in mensagens]
+    for indice in range(len(mensagens_tolerantes) - 1, -1, -1):
+        if mensagens_tolerantes[indice].get("role") == "system":
+            conteudo = str(mensagens_tolerantes[indice].get("content") or "").rstrip()
+            mensagens_tolerantes[indice]["content"] = f"{conteudo}\n\n{INSTRUCAO_JSON_TOLERANTE}"
+            return mensagens_tolerantes
+    return [{"role": "system", "content": INSTRUCAO_JSON_TOLERANTE}, *mensagens_tolerantes]
 
 
 def _executar_provider_alternativo(
@@ -398,6 +493,10 @@ def _classificar_erro_ia(exc: Exception) -> str:
     texto = str(exc).lower()
     if nome == "RateLimitError" or status == 429 or "rate_limit_exceeded" in texto:
         return "rate_limit"
+    if _erro_json_validate_failed(exc):
+        return "json_validate_failed"
+    if nome == "BadRequestError" or status == 400:
+        return "bad_request"
     if nome in {"APIConnectionError", "APIStatusError"} and status is None:
         return "connection"
     if nome == "APITimeoutError" or isinstance(exc, TimeoutError) or "timeout" in texto:
@@ -409,6 +508,102 @@ def _classificar_erro_ia(exc: Exception) -> str:
     if isinstance(exc, (ConnectionError, OSError)):
         return "connection"
     return "unknown"
+
+
+def _erro_json_validate_failed(exc: Exception) -> bool:
+    status = _status_code(exc)
+    texto = str(exc).lower()
+    return bool(
+        status == 400
+        and (
+            "json_validate_failed" in texto
+            or "failed to validate json" in texto
+            or "validate json" in texto
+        )
+    )
+
+
+def extrair_json_resposta(texto: str) -> dict[str, Any] | None:
+    texto_limpo = str(texto or "").strip()
+    if not texto_limpo:
+        return None
+
+    for candidato in _candidatos_json_texto(texto_limpo):
+        payload = _loads_json_objeto(candidato)
+        if payload is not None:
+            normalizado = _normalizar_contrato_fallback(payload)
+            if normalizado is not None:
+                return normalizado
+
+    reparado = _reparar_json_simples(texto_limpo)
+    if reparado:
+        payload = _loads_json_objeto(reparado)
+        if payload is not None:
+            return _normalizar_contrato_fallback(payload)
+    return None
+
+
+def _candidatos_json_texto(texto: str) -> list[str]:
+    candidatos = [texto]
+    sem_cerca = _remover_cerca_json(texto)
+    if sem_cerca != texto:
+        candidatos.append(sem_cerca)
+    primeiro = texto.find("{")
+    ultimo = texto.rfind("}")
+    if primeiro != -1 and ultimo != -1 and ultimo > primeiro:
+        candidatos.append(texto[primeiro : ultimo + 1])
+    return candidatos
+
+
+def _remover_cerca_json(texto: str) -> str:
+    match = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", texto.strip(), flags=re.IGNORECASE | re.DOTALL)
+    return match.group(1).strip() if match else texto
+
+
+def _loads_json_objeto(texto: str) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(texto)
+    except json.JSONDecodeError:
+        return None
+    return dict(payload) if isinstance(payload, Mapping) else None
+
+
+def _reparar_json_simples(texto: str) -> str:
+    primeiro = texto.find("{")
+    ultimo = texto.rfind("}")
+    candidato = texto[primeiro : ultimo + 1] if primeiro != -1 and ultimo != -1 and ultimo > primeiro else texto
+    candidato = _remover_cerca_json(candidato)
+    candidato = re.sub(r",\s*([}\]])", r"\1", candidato)
+    return candidato.strip()
+
+
+def _normalizar_contrato_fallback(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    resposta = str(
+        payload.get("resposta")
+        or payload.get("resposta_natural")
+        or payload.get("resposta_cliente")
+        or payload.get("texto")
+        or ""
+    ).strip()
+    if not resposta:
+        return None
+    normalizado = dict(payload)
+    normalizado["resposta"] = resposta
+    normalizado.setdefault("intencao", "comentario")
+    normalizado.setdefault("acao", "responder")
+    normalizado.setdefault("dados_confirmados", {})
+    normalizado.setdefault("dados_mencionados", {})
+    normalizado.setdefault("dados_incertos", {})
+    normalizado.setdefault("correcoes", {})
+    normalizado.setdefault("deve_avancar_estado", False)
+    normalizado.setdefault("campo_sugerido", None)
+    normalizado.setdefault("confianca", 0.7)
+    return normalizado
+
+
+def _json_texto_completo_valido(texto: str) -> bool:
+    payload = _loads_json_objeto(str(texto or "").strip())
+    return payload is not None and _normalizar_contrato_fallback(payload) is not None
 
 
 def _status_code(exc: Exception) -> int | None:
