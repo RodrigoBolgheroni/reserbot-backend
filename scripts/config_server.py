@@ -16,7 +16,7 @@ ROOT_DIR: Final[Path] = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from services import clientes_supabase, disparador, fluxo_reservas, pdf_clientes, perfis, whatsapp_cloud
+from services import clientes_supabase, conversas_supabase, disparador, fluxo_reservas, pdf_clientes, perfis, whatsapp_cloud
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,12 @@ class ConfigHandler(BaseHTTPRequestHandler):
             return
         if rota == "/api/clientes":
             self._listar_clientes()
+            return
+        if rota == "/api/conversas":
+            self._listar_conversas()
+            return
+        if rota.startswith("/api/conversas/"):
+            self._obter_conversa_ou_mensagens(rota)
             return
         if rota == "/api/reservas":
             self._listar_reservas()
@@ -241,6 +247,42 @@ class ConfigHandler(BaseHTTPRequestHandler):
                 "clientes": resultado["clientes"],
             }
         )
+
+    def _listar_conversas(self) -> None:
+        page, page_size = _paginacao_conversas(self.path)
+        query = parse_qs(urlparse(self.path).query)
+        resultado = conversas_supabase.listar_conversas(
+            page=page,
+            page_size=page_size,
+            search=query.get("search", [""])[0],
+            status=query.get("status", [""])[0],
+        )
+        self._responder_json({"ok": True, **resultado})
+
+    def _obter_conversa_ou_mensagens(self, rota: str) -> None:
+        partes = [parte for parte in rota.split("/") if parte]
+        if len(partes) not in {3, 4} or partes[:2] != ["api", "conversas"]:
+            self._responder_erro(HTTPStatus.NOT_FOUND, "conversa nao encontrada")
+            return
+
+        conversa_id = partes[2]
+        if len(partes) == 4 and partes[3] == "mensagens":
+            resultado = conversas_supabase.listar_mensagens_conversa(conversa_id)
+            if resultado is None:
+                self._responder_erro(HTTPStatus.NOT_FOUND, "conversa nao encontrada")
+                return
+            self._responder_json({"ok": True, **resultado})
+            return
+
+        if len(partes) == 3:
+            resultado_conversa = conversas_supabase.obter_conversa(conversa_id)
+            if resultado_conversa is None:
+                self._responder_erro(HTTPStatus.NOT_FOUND, "conversa nao encontrada")
+                return
+            self._responder_json({"ok": True, **resultado_conversa})
+            return
+
+        self._responder_erro(HTTPStatus.NOT_FOUND, "conversa nao encontrada")
 
     def _listar_reservas(self) -> None:
         limite = _query_int(self.path, "limit", 500)
@@ -623,6 +665,14 @@ def _paginacao_clientes(path: str) -> tuple[int, int, int]:
     page = max(1, _query_param_int(query, "page", 1))
     offset = (page - 1) * page_size
     return page, page_size, offset
+
+
+def _paginacao_conversas(path: str) -> tuple[int, int]:
+    query = parse_qs(urlparse(path).query)
+    page = max(1, _query_param_int(query, "page", 1))
+    page_size = _query_param_int(query, "page_size", _query_param_int(query, "limit", conversas_supabase.PAGE_SIZE_PADRAO))
+    page_size = max(1, min(page_size, conversas_supabase.PAGE_SIZE_MAX))
+    return page, page_size
 
 
 def _query_param_int(query: dict[str, list[str]], nome: str, padrao: int) -> int:

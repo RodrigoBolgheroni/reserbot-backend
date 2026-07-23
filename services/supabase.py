@@ -68,10 +68,13 @@ def selecionar(
     limite: int | None = None,
     offset: int | None = None,
     contar: bool = False,
+    order: str | None = None,
 ) -> SupabaseResultado:
     parametros: dict[str, str] = {"select": colunas}
     for campo, valor in (filtros or {}).items():
         parametros[campo] = valor
+    if order:
+        parametros["order"] = order
     if limite is not None:
         parametros["limit"] = str(limite)
     if offset is not None:

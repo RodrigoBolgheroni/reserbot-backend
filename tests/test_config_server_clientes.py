@@ -124,6 +124,43 @@ class ConfigServerClientesTest(unittest.TestCase):
         self.assertEqual(respostas[0][0]["ok"], False)
         self.assertEqual(respostas[0][1], config_server.HTTPStatus.BAD_REQUEST)
 
+    def test_paginacao_conversas_limita_page_size(self) -> None:
+        page, page_size = config_server._paginacao_conversas("/api/conversas?page=2&page_size=999")
+
+        self.assertEqual(page, 2)
+        self.assertEqual(page_size, 100)
+
+    def test_listar_conversas_repassa_filtros_para_servico(self) -> None:
+        handler = object.__new__(config_server.ConfigHandler)
+        handler.path = "/api/conversas?page=2&page_size=30&search=rodrigo&status=bot_ativo"
+        respostas: list[dict[str, object]] = []
+
+        with (
+            patch.object(
+                config_server.conversas_supabase,
+                "listar_conversas",
+                return_value={"items": [{"id": "conv-1"}], "page": 2, "page_size": 30, "total": 40, "has_next": True, "has_prev": True},
+            ) as listar,
+            patch.object(config_server.ConfigHandler, "_responder_json", lambda _self, payload, status=None: respostas.append(payload)),
+        ):
+            config_server.ConfigHandler._listar_conversas(handler)
+
+        listar.assert_called_once_with(page=2, page_size=30, search="rodrigo", status="bot_ativo")
+        self.assertEqual(respostas[0]["ok"], True)
+        self.assertEqual(respostas[0]["items"], [{"id": "conv-1"}])
+
+    def test_listar_mensagens_conversa_responde_404_quando_nao_existe(self) -> None:
+        handler = object.__new__(config_server.ConfigHandler)
+        respostas: list[tuple[config_server.HTTPStatus, str]] = []
+
+        with (
+            patch.object(config_server.conversas_supabase, "listar_mensagens_conversa", return_value=None),
+            patch.object(config_server.ConfigHandler, "_responder_erro", lambda _self, status, mensagem: respostas.append((status, mensagem))),
+        ):
+            config_server.ConfigHandler._obter_conversa_ou_mensagens(handler, "/api/conversas/conv-1/mensagens")
+
+        self.assertEqual(respostas[0][0], config_server.HTTPStatus.NOT_FOUND)
+
 
 if __name__ == "__main__":
     unittest.main()
