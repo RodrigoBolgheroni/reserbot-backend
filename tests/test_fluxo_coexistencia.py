@@ -254,6 +254,46 @@ class FluxoCoexistenciaTest(unittest.TestCase):
     @patch.object(fluxo_reservas, "_mensagem_ja_processada", return_value=False)
     @patch.object(fluxo_reservas, "registrar_mensagem")
     @patch.object(fluxo_reservas, "atualizar_status_conversa")
+    @patch.object(fluxo_reservas, "buscar_conversa_ativa_por_telefone")
+    @patch.object(fluxo_reservas.clientes_supabase, "buscar_cliente_por_telefone")
+    @patch.object(fluxo_reservas.agente, "processar_mensagem")
+    @patch.object(fluxo_reservas.whatsapp, "enviar_com_resultado")
+    def test_handoff_por_falha_ia_envia_uma_unica_mensagem(
+        self,
+        enviar,
+        processar,
+        buscar_cliente,
+        buscar_ativa,
+        atualizar,
+        registrar,
+        _ja_processada,
+    ) -> None:
+        conversa = {"id": "conv-1", "cliente_telefone": "5511999999999", "status": "bot_ativo"}
+        buscar_cliente.return_value = {"id": "cliente-1", "telefone": "5511999999999", "nome": "Cliente"}
+        buscar_ativa.return_value = conversa
+        processar.return_value = {
+            "texto": fluxo_reservas.agente._resposta_contingencia(),
+            "reserva_confirmada": False,
+            "dados_reserva": {"data_reserva": "2026-07-30", "horario": "20:00", "pessoas": 4},
+            "status_reserva": "aguardando_humano",
+            "confianca": 1.0,
+        }
+        enviar.return_value = {"ok": True, "provider_message_id": "wamid.bot"}
+
+        resposta = fluxo_reservas.processar_resposta_cliente(
+            telefone="5511999999999",
+            mensagem_cliente="sim",
+            provider_message_id="wamid.falha-ia",
+        )
+
+        self.assertEqual(resposta["status_reserva"], "aguardando_humano")
+        enviar.assert_called_once_with("5511999999999", fluxo_reservas.agente._resposta_contingencia())
+        self.assertEqual(registrar.call_count, 2)
+        self.assertEqual(atualizar.call_args_list[-1].kwargs["status"], "aguardando_humano")
+
+    @patch.object(fluxo_reservas, "_mensagem_ja_processada", return_value=False)
+    @patch.object(fluxo_reservas, "registrar_mensagem")
+    @patch.object(fluxo_reservas, "atualizar_status_conversa")
     @patch.object(fluxo_reservas, "iniciar_conversa")
     @patch.object(fluxo_reservas, "buscar_conversa_por_telefone")
     @patch.object(fluxo_reservas, "buscar_conversa_ativa_por_telefone", return_value=None)

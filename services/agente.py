@@ -11,7 +11,7 @@ from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Final, Literal, TypedDict
 
-from services import config_restaurante
+from services import config_restaurante, ia_fallback
 
 
 logger = logging.getLogger(__name__)
@@ -151,6 +151,7 @@ _config_restaurante_processamento: ContextVar[config_restaurante.ConfigRestauran
     "config_restaurante_processamento",
     default=None,
 )
+_telefone_processamento: ContextVar[str] = ContextVar("telefone_processamento", default="")
 
 ETAPA_POR_CAMPO: Final[dict[str, str]] = {
     "data_reserva": "aguardando_data",
@@ -242,6 +243,7 @@ def processar_mensagem(
         config_processamento = config_restaurante.obter_config()
         _log_config_restaurante_processamento(config_processamento)
         token_config = _config_restaurante_processamento.set(config_processamento)
+        token_telefone = _telefone_processamento.set(telefone_limpo)
         try:
             return _processar_mensagem_sem_lock(
                 telefone=telefone_limpo,
@@ -250,6 +252,7 @@ def processar_mensagem(
                 perfil_cliente=perfil_cliente,
             )
         finally:
+            _telefone_processamento.reset(token_telefone)
             _config_restaurante_processamento.reset(token_config)
 
 
@@ -333,8 +336,8 @@ def _processar_mensagem_sem_lock(
     historico.append({"role": "user", "content": mensagem_limpa})
     _limitar_historico(historico)
 
-    if not os.getenv("GROQ_API_KEY", "").strip():
-        logger.warning("GROQ_API_KEY nao configurada. Usando resposta de contingencia.")
+    if not ia_fallback.tem_provedor_configurado():
+        logger.warning("Nenhum provedor de IA configurado. Usando handoff tecnico.")
         texto_modelo = _payload_fallback_tecnico()
     else:
         try:
@@ -355,11 +358,11 @@ def _processar_mensagem_sem_lock(
             )
             texto_modelo = _chamar_groq(
                 mensagens=mensagens_groq,
-                modelo=os.getenv("GROQ_MODEL", MODELO_PADRAO),
+                modelo=os.getenv("GROQ_PRIMARY_MODEL", "").strip() or os.getenv("GROQ_MODEL", MODELO_PADRAO),
                 response_format_json=True,
             )
         except Exception:
-            logger.exception("Falha ao processar mensagem com Groq.")
+            logger.exception("Falha inesperada ao processar mensagem com IA.")
             texto_modelo = _payload_fallback_tecnico()
     logger.info("DIAG_RESERVA json_bruto_ia telefone=%s resposta=%s", telefone_limpo, texto_modelo)
     json_valido = _extrair_json_resposta(texto_modelo) is not None
@@ -2314,7 +2317,7 @@ def _gerar_resposta_ia_pos_validacao(
 ) -> str:
     if not _usa_contrato_novo(interpretacao):
         return ""
-    if not os.getenv("GROQ_API_KEY", "").strip():
+    if not ia_fallback.tem_provedor_configurado():
         return ""
 
     resultado_validacao = _resultado_validacao(campo, estado)
@@ -2344,12 +2347,14 @@ def _gerar_resposta_ia_pos_validacao(
                     ),
                 },
             ],
-            modelo=os.getenv("GROQ_MODEL", MODELO_PADRAO),
+            modelo=os.getenv("GROQ_PRIMARY_MODEL", "").strip() or os.getenv("GROQ_MODEL", MODELO_PADRAO),
         )
     except Exception:
         logger.exception("Falha ao gerar resposta natural pos-validacao.")
         return ""
 
+    if _texto_modelo_eh_fallback_tecnico(texto_modelo):
+        return ""
     payload = _extrair_json_resposta(texto_modelo)
     if isinstance(payload, Mapping):
         texto = str(payload.get("resposta") or payload.get("resposta_natural") or payload.get("texto") or "").strip()
@@ -3451,7 +3456,7 @@ def _hoje() -> date:
 
 
 def _resposta_contingencia() -> str:
-    return "Nao consegui processar essa mensagem agora. Vou encaminhar para a equipe."
+    return ia_fallback.MENSAGEM_HANDOFF_IA
 
 
 def _payload_fallback_tecnico() -> str:
@@ -3478,7 +3483,7 @@ def _reparar_interpretacao_texto_simples(
     mensagem_cliente: str,
     resposta_natural: str,
 ) -> str:
-    if not os.getenv("GROQ_API_KEY", "").strip():
+    if not ia_fallback.tem_provedor_configurado():
         return ""
     try:
         texto_modelo = _chamar_groq(
@@ -3518,53 +3523,40 @@ def _reparar_interpretacao_texto_simples(
                     ),
                 },
             ],
-            modelo=os.getenv("GROQ_MODEL", MODELO_PADRAO),
+            modelo=os.getenv("GROQ_PRIMARY_MODEL", "").strip() or os.getenv("GROQ_MODEL", MODELO_PADRAO),
             response_format_json=True,
         )
     except Exception:
         logger.exception("Falha ao reparar resposta em texto simples para JSON.")
         return ""
 
+    if _texto_modelo_eh_fallback_tecnico(texto_modelo):
+        return ""
     return texto_modelo if _extrair_json_resposta(texto_modelo) is not None else ""
 
 
 def _chamar_groq(mensagens: Sequence[Mensagem], modelo: str, *, response_format_json: bool = False) -> str:
-    api_key = os.getenv("GROQ_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("GROQ_API_KEY nao configurada.")
+    telefone = _telefone_processamento.get()
+    estado = _estados_reserva.get(telefone, {}) if telefone else {}
+    resultado = ia_fallback.executar_ia_com_fallback(
+        mensagens,
+        telefone=telefone,
+        conversa_id=str(estado.get("conversa_id") or ""),
+        modelo_preferido=modelo,
+        response_format_json=response_format_json,
+    )
+    if resultado.get("ok") and resultado.get("conteudo"):
+        return str(resultado["conteudo"]).strip()
+    return _payload_fallback_tecnico()
 
-    from groq import Groq
 
-    client = Groq(api_key=api_key)
-    kwargs: dict[str, Any] = {
-        "model": modelo.strip() or MODELO_PADRAO,
-        "messages": list(mensagens),
-        "temperature": 0.4,
-        "max_tokens": 500,
-    }
-    if response_format_json:
-        kwargs["response_format"] = {"type": "json_object"}
-
-    try:
-        resposta = client.chat.completions.create(**kwargs)
-    except TypeError:
-        if not response_format_json:
-            raise
-        logger.warning("Groq SDK nao aceitou response_format JSON. Repetindo sem response_format.")
-        kwargs.pop("response_format", None)
-        resposta = client.chat.completions.create(**kwargs)
-    except Exception as exc:
-        if not response_format_json or "response_format" not in str(exc).lower():
-            raise
-        logger.warning("Groq rejeitou response_format JSON. Repetindo sem response_format: %s", exc)
-        kwargs.pop("response_format", None)
-        resposta = client.chat.completions.create(**kwargs)
-
-    conteudo = resposta.choices[0].message.content
-    if not conteudo:
-        raise RuntimeError("Groq retornou resposta vazia.")
-
-    return conteudo.strip()
+def _texto_modelo_eh_fallback_tecnico(texto_modelo: str) -> bool:
+    payload = _extrair_json_resposta(texto_modelo)
+    return bool(
+        isinstance(payload, Mapping)
+        and payload.get("acao") == "encaminhar_humano"
+        and str(payload.get("resposta") or "") == _resposta_contingencia()
+    )
 
 
 def _contexto_espacos_restaurante(config: config_restaurante.ConfigRestaurante) -> str:
