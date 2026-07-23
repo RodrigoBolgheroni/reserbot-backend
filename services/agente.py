@@ -685,17 +685,25 @@ def aplicar_guardrails_reserva(
     if faltantes:
         campo = faltantes[0]
         _definir_campo_pendente(estado, campo)
-        texto = _texto_modelo_para_pedir_campo(interpretacao["texto"], campo, estado, mensagem_cliente)
+        texto = _texto_modelo_para_pedir_campo(interpretacao["texto"], campo, estado, mensagem_cliente, faltantes=faltantes)
+        conta_tentativa = _deve_contar_tentativa_campo(
+            mensagem_cliente=mensagem_cliente,
+            interpretacao=interpretacao,
+            campo=campo,
+        )
+        tentativa = _registrar_tentativa_campo(estado, campo) if conta_tentativa else _tentativas_campo(estado, campo)
+        if conta_tentativa:
+            texto = _mensagem_pedir_campo(campo, estado, registrar_tentativa=False, tentativa=tentativa)
         if not texto:
-            texto = _mensagem_pedir_campo(campo, estado)
+            texto = _mensagem_pedir_campo(campo, estado, registrar_tentativa=False, tentativa=tentativa)
             logger.info(
-                "DIAG_RESERVA resposta_sobrescrita motivo=modelo_nao_retomou_campo_necessario campo=%s texto_ia=%r texto_final=%r faltantes=%s",
+                "DIAG_RESERVA resposta_sobrescrita motivo=texto_ia_inseguro_em_coleta campo=%s texto_ia=%r texto_final=%r faltantes=%s",
                 campo,
                 interpretacao["texto"],
                 texto,
                 faltantes,
             )
-        status_reserva = "aguardando_humano" if _deve_encaminhar_humano_por_tentativas(estado, campo) else "em_coleta"
+        status_reserva = "aguardando_humano" if conta_tentativa and _deve_encaminhar_humano_por_tentativas(estado, campo) else "em_coleta"
         return {
             "texto": texto,
             "reserva_confirmada": False,
@@ -1259,6 +1267,73 @@ def _deve_encaminhar_humano_por_tentativas(estado: Mapping[str, Any], campo: str
     return _tentativas_campo(estado, campo) >= 3
 
 
+def _deve_contar_tentativa_campo(
+    *,
+    mensagem_cliente: str,
+    interpretacao: Mapping[str, Any],
+    campo: str,
+) -> bool:
+    intencao = _normalizar_intencao_ia(str(interpretacao.get("intencao") or ""))
+    if intencao in INTENCOES_CONVERSACIONAIS_IA:
+        return False
+    if _intencao_conversacional(mensagem_cliente) or _categoria_pergunta_restaurante(mensagem_cliente):
+        return False
+    if _mensagem_eh_pergunta_contextual(mensagem_cliente):
+        return False
+    if _mensagem_tem_tom_de_brincadeira_ou_comentario(mensagem_cliente):
+        return False
+    dados_mencionados = interpretacao.get("dados_mencionados")
+    dados_incertos = interpretacao.get("dados_incertos")
+    if isinstance(dados_mencionados, Mapping) and any(valor not in (None, "", [], {}) for valor in dados_mencionados.values()):
+        return False
+    if isinstance(dados_incertos, Mapping) and any(valor not in (None, "", [], {}) for valor in dados_incertos.values()):
+        return False
+    if _mensagem_pode_usar_coleta_natural(mensagem_cliente):
+        return False
+
+    confianca = _confianca(interpretacao.get("confianca"))
+    if confianca < 0.65:
+        return True
+    if _mensagem_parece_incompreensivel_ou_evasiva(mensagem_cliente):
+        return True
+
+    if campo == "data_reserva":
+        return _mensagem_tem_sinal_data(mensagem_cliente)
+    if campo == "horario":
+        return _mensagem_tem_sinal_horario(mensagem_cliente) and not _mensagem_eh_pergunta_contextual(mensagem_cliente)
+    if campo == "pessoas":
+        return _mensagem_tem_sinal_pessoas(mensagem_cliente)
+    return False
+
+
+def _mensagem_eh_pergunta_contextual(texto: str) -> bool:
+    normalizado = _normalizar_busca(texto)
+    return bool(
+        "?" in texto
+        or re.search(r"\b(sera que|ser[aá] que|da tempo|daria tempo|como|quando|qual|quais|onde|por que|porque|pq|voce sabe|voce responde)\b", normalizado)
+    )
+
+
+def _mensagem_tem_tom_de_brincadeira_ou_comentario(texto: str) -> bool:
+    normalizado = _normalizar_busca(texto)
+    return bool(
+        re.search(r"\b(k+|kkk+|haha+|rsrs+|kkkk|brincadeira|zoeira)\b", normalizado)
+        or re.search(r"\b(rapido|rapida|hein|nossa|legal|boa|entendi|beleza|tranquilo)\b", normalizado)
+    )
+
+
+def _mensagem_parece_incompreensivel_ou_evasiva(texto: str) -> bool:
+    normalizado = _normalizar_busca(texto)
+    if not normalizado:
+        return False
+    if re.search(r"\b(qualquer coisa|sei la|sei nao|tanto faz)\b", normalizado):
+        return True
+    palavras = re.findall(r"\w+", normalizado)
+    if len(palavras) == 1 and len(palavras[0]) >= 5 and not _mensagem_indica_reserva(normalizado):
+        return True
+    return False
+
+
 def _pode_aplicar_dado_confirmado(
     campo: str,
     estado: EstadoReserva,
@@ -1635,18 +1710,29 @@ def _registrar_validacao_estado(estado: EstadoReserva, *, campo: str, resposta: 
     del validacoes[:-10]
 
 
-def _mensagem_pedir_campo(campo: str, estado: EstadoReserva) -> str:
-    tentativa = _registrar_tentativa_campo(estado, campo)
+def _mensagem_pedir_campo(
+    campo: str,
+    estado: EstadoReserva,
+    *,
+    registrar_tentativa: bool = True,
+    tentativa: int | None = None,
+) -> str:
+    if registrar_tentativa:
+        tentativa_atual = _registrar_tentativa_campo(estado, campo)
+    elif tentativa is not None:
+        tentativa_atual = tentativa
+    else:
+        tentativa_atual = max(_tentativas_campo(estado, campo), 1)
     if campo == "data_reserva":
-        if tentativa == 1:
+        if tentativa_atual == 1:
             return "Certo, para qual data você quer fazer a reserva?"
-        if tentativa == 2:
+        if tentativa_atual == 2:
             return "Você tem algum dia em mente? Pode me mandar como 26/07."
         return "Não consegui entender a data. Me passa no formato dia/mês, como 26/07? Se preferir, posso chamar alguém da equipe."
     if campo == "horario":
-        if tentativa >= 3:
+        if tentativa_atual >= 3:
             return "Não consegui entender o horário. Você pode me passar no formato 19h ou 19:30? Se preferir, posso chamar alguém da equipe."
-        if tentativa == 2:
+        if tentativa_atual == 2:
             return "Você pode me passar um horário aproximado, como 19h ou 20h?"
         if estado.get("horario_invalido"):
             return _mensagem_horario_fora_funcionamento()
@@ -1656,13 +1742,13 @@ def _mensagem_pedir_campo(campo: str, estado: EstadoReserva) -> str:
             return "Certo, tenho a data. Qual horário fica melhor para você?"
         return "Certo, qual horário fica melhor para você?"
     if campo == "pessoas":
-        if tentativa == 1:
+        if tentativa_atual == 1:
             return "Beleza, para quantas pessoas será a reserva?"
-        if tentativa == 2:
+        if tentativa_atual == 2:
             return "Me manda só a quantidade de pessoas, pode ser um número como 4 ou 6."
         return "Não consegui entender a quantidade de pessoas. Pode me mandar só o número, como 4 ou 6? Se preferir, posso chamar alguém da equipe."
     if campo == "nome_cliente":
-        if tentativa >= 3:
+        if tentativa_atual >= 3:
             return "Não consegui identificar o nome para a reserva. Se preferir, posso chamar alguém da equipe para ajudar."
         return "Só falta seu nome para deixar a reserva certinha. Qual nome devo colocar?"
     return "Antes de confirmar, preciso completar os dados da reserva."
@@ -1959,28 +2045,57 @@ def _texto_modelo_parece_rigido(texto: str) -> bool:
     )
 
 
-def _texto_modelo_para_pedir_campo(texto: str, campo: str, estado: EstadoReserva, mensagem_cliente: str) -> str:
-    if not _mensagem_pode_usar_coleta_natural(mensagem_cliente):
-        return ""
+def _texto_modelo_para_pedir_campo(
+    texto: str,
+    campo: str,
+    estado: EstadoReserva,
+    mensagem_cliente: str,
+    *,
+    faltantes: Sequence[str] = (),
+) -> str:
     texto_limpo = remover_flag_reserva(str(texto or ""))
-    if not texto_limpo or _texto_modelo_parece_rigido(texto_limpo):
+    if not texto_limpo:
         return ""
-    normalizado = _normalizar_busca(texto_limpo)
-    if re.search(r"\b(confirmad|posso confirmar|confirma\??|reserva para)\b", normalizado):
-        return ""
-    termos_por_campo = {
-        "data_reserva": r"\b(data|dia|quando)\b",
-        "horario": r"\b(horario|hora|periodo)\b",
-        "pessoas": r"\b(pessoas|quantas|total|convidados)\b",
-        "nome_cliente": r"\b(nome)\b",
-    }
-    padrao = termos_por_campo.get(campo)
-    if padrao and not re.search(padrao, normalizado):
+    if _texto_modelo_inseguro_em_coleta(texto_limpo, faltantes, estado):
         return ""
     ultimo_texto = str(estado.get("ultimo_texto_bot") or "")
     if ultimo_texto and _textos_muito_parecidos(ultimo_texto, texto_limpo):
         return ""
     return texto_limpo
+
+
+def _texto_modelo_inseguro_em_coleta(texto: str, faltantes: Sequence[str], estado: Mapping[str, Any]) -> bool:
+    normalizado = _normalizar_busca(texto)
+    if re.search(r"\breserva confirmada\b", normalizado):
+        return True
+    if faltantes and re.search(r"\b(posso confirmar|confirma\??|reserva para|so confirmando)\b", normalizado):
+        return True
+    if _texto_modelo_conflita_com_estado(normalizado, estado):
+        return True
+    if _texto_afirma_disponibilidade_sem_agenda(normalizado):
+        return True
+    return False
+
+
+def _texto_modelo_conflita_com_estado(normalizado: str, estado: Mapping[str, Any]) -> bool:
+    if estado.get("data_reserva") and re.search(r"\b(qual data|algum dia|me passa.*dia|me passa.*data|formato dia|data ja passou)\b", normalizado):
+        return True
+    if estado.get("horario") and re.search(r"\b(qual horario|me passa.*horario|nao consegui entender o horario)\b", normalizado):
+        return True
+    if estado.get("pessoas") and re.search(r"\b(quantas pessoas|quantidade de pessoas|nao consegui entender a quantidade)\b", normalizado):
+        return True
+    return False
+
+
+def _texto_afirma_disponibilidade_sem_agenda(normalizado: str) -> bool:
+    if "disponivel" not in normalizado and "disponiveis" not in normalizado:
+        return False
+    if re.search(r"\b(nao|sem)\b.{0,50}\b(agenda|disponibilidade|disponivel|disponiveis)\b", normalizado):
+        return False
+    return bool(
+        re.search(r"\b(temos|tenho|ha|existe|esta|ficou|fica|horario|horarios)\b.{0,50}\b(disponivel|disponiveis)\b", normalizado)
+        or re.search(r"\b(disponivel|disponiveis)\b.{0,50}\b(para|as|no dia|nesse dia)\b", normalizado)
+    )
 
 
 def _mensagem_pode_usar_coleta_natural(mensagem_cliente: str) -> bool:

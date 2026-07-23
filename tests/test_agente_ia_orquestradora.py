@@ -74,6 +74,66 @@ class AgenteIAOrquestradoraTest(unittest.TestCase):
         self.assertNotIn("horario", estado)
         self.assertEqual(estado["dados_mencionados"]["horario"], "20:00")
 
+    def test_comentario_rapidez_nao_e_sobrescrito_por_campo_pendente(self) -> None:
+        telefone = "5511990000032"
+        agente._estados_reserva[telefone] = {
+            "data_reserva": "2026-07-30",
+            "campo_pendente": "horario",
+            "etapa": "aguardando_horario",
+            "tentativas_campos": {"horario": 2},
+        }
+        payload = {
+            "resposta": "Sim, e para te ajudar o mais rapido possivel. Agora, sobre o horario da reserva, voce ja tem alguma ideia?",
+            "intencao": "fornecimento_dados",
+            "dados_confirmados": {},
+            "dados_mencionados": {},
+            "dados_incertos": {},
+            "correcoes": {},
+            "acao": "responder",
+            "deve_avancar_estado": False,
+            "campo_sugerido": "horario",
+            "confianca": 0.9,
+        }
+
+        resposta = self._processar(telefone, "Você responde rápido hein kkkkk", payload)
+
+        estado = agente._estados_reserva[telefone]
+        self.assertEqual(resposta["texto"], payload["resposta"])
+        self.assertEqual(resposta["status_reserva"], "em_coleta")
+        self.assertEqual(estado["campo_pendente"], "horario")
+        self.assertEqual(estado["tentativas_campos"]["horario"], 2)
+
+    def test_pergunta_contextual_com_horario_mencionado_nao_e_sobrescrita_nem_handoff(self) -> None:
+        telefone = "5511990000033"
+        agente._estados_reserva[telefone] = {
+            "data_reserva": "2026-07-30",
+            "campo_pendente": "horario",
+            "etapa": "aguardando_horario",
+            "tentativas_campos": {"horario": 2},
+        }
+        payload = {
+            "resposta": "Você sai do trabalho às 20h, mas não confirmou se vai chegar aqui às 20h. Como fechamos à meia-noite, dá tempo; qual horário você acha que vai chegar?",
+            "intencao": "fornecimento_dados",
+            "dados_confirmados": {},
+            "dados_mencionados": {"horario": "20:00"},
+            "dados_incertos": {"chegada": "cliente sai do trabalho às 20h"},
+            "correcoes": {},
+            "acao": "responder",
+            "deve_avancar_estado": False,
+            "campo_sugerido": "horario",
+            "confianca": 0.9,
+        }
+
+        resposta = self._processar(telefone, "Eu saio do trabalho às 20h, será que dá tempo?", payload)
+
+        estado = agente._estados_reserva[telefone]
+        self.assertEqual(resposta["texto"], payload["resposta"])
+        self.assertEqual(resposta["status_reserva"], "em_coleta")
+        self.assertNotIn("horario", estado)
+        self.assertEqual(estado["dados_mencionados"]["horario"], "20:00")
+        self.assertEqual(estado["tentativas_campos"]["horario"], 2)
+        self.assertNotIn("nao consegui entender", agente._normalizar_busca(resposta["texto"]))
+
     def test_contexto_expandido_fica_serializavel_para_supabase(self) -> None:
         telefone = "5511990000999"
         payload = {
