@@ -122,6 +122,9 @@ class EstadoReserva(TypedDict, total=False):
     pedido_imediato: bool
     tentativas_campos: dict[str, int]
     aguardando_confirmacao: bool
+    confirmacao_pausada: bool
+    cliente_autorizou_confirmacao: bool
+    ultima_confirmacao_oferecida_em: str
     conversa_id: str
     ultimo_texto_bot: str
     ultimo_campo_perguntado: str
@@ -192,6 +195,9 @@ CHAVES_ESTADO_PERSISTIDO: Final[set[str]] = {
     "pedido_imediato",
     "tentativas_campos",
     "aguardando_confirmacao",
+    "confirmacao_pausada",
+    "cliente_autorizou_confirmacao",
+    "ultima_confirmacao_oferecida_em",
     "conversa_id",
     "ultimo_texto_bot",
     "ultimo_campo_perguntado",
@@ -262,7 +268,8 @@ def _processar_mensagem_sem_lock(
         json.dumps(estado_antes, ensure_ascii=False, sort_keys=True),
     )
 
-    if _eh_recusa_reserva(mensagem_limpa):
+    estado_atual = _estados_reserva.get(telefone_limpo, {})
+    if _eh_recusa_reserva(mensagem_limpa) and not _confirmacao_ativa(estado_atual):
         logger.info("Cliente recusou convite de reserva. telefone=%s", telefone_limpo)
         limpar_historico(telefone_limpo)
         return {
@@ -440,7 +447,7 @@ def _normalizar_estado_reserva_persistido(estado: Mapping[str, Any] | None) -> E
         if chave == "validacoes" and isinstance(valor, list):
             normalizado["validacoes"] = [dict(item) for item in valor if isinstance(item, Mapping)][-10:]
             continue
-        if chave in {"pedido_imediato", "aguardando_confirmacao"}:
+        if chave in {"pedido_imediato", "aguardando_confirmacao", "confirmacao_pausada", "cliente_autorizou_confirmacao"}:
             normalizado[chave] = bool(valor)  # type: ignore[literal-required]
             continue
         if chave == "versao":
@@ -484,6 +491,9 @@ def _mensagem_contexto_reserva(telefone: str) -> Mensagem:
         "campo_sugerido": campo,
         "campo_pendente_orientativo": estado.get("campo_pendente", ""),
         "etapa_interna_orientativa": estado.get("etapa", ""),
+        "confirmacao_pausada": bool(estado.get("confirmacao_pausada")),
+        "cliente_autorizou_confirmacao": bool(estado.get("cliente_autorizou_confirmacao")),
+        "ultima_confirmacao_oferecida_em": estado.get("ultima_confirmacao_oferecida_em", ""),
         "ultima_intencao": estado.get("ultima_intencao", ""),
         "assunto_atual": estado.get("assunto_atual", ""),
         "pergunta_aberta": estado.get("pergunta_aberta", ""),
@@ -564,7 +574,17 @@ def aplicar_guardrails_reserva(
     ):
         intencao_conversacional = intencao_modelo
 
-    if _eh_recusa_reserva(mensagem_cliente):
+    resposta_confirmacao = _resolver_mensagem_confirmacao_pendente(
+        telefone=telefone_limpo,
+        mensagem_cliente=mensagem_cliente,
+        estado=estado,
+        interpretacao=interpretacao,
+        nome_cliente=nome_cliente,
+    )
+    if resposta_confirmacao is not None:
+        return resposta_confirmacao
+
+    if _eh_recusa_reserva(mensagem_cliente) and not _confirmacao_ativa(estado):
         texto = _texto_modelo_para_intencao(
             interpretacao.get("texto", ""),
             "recusa",
@@ -714,52 +734,13 @@ def aplicar_guardrails_reserva(
     dados_estado = _dados_reserva_do_estado(estado)
 
     if confirmacao_cliente and aguardava_confirmacao and not faltantes:
-        if not dados_reserva_obrigatorios_ok(dados_estado, nome_cliente=nome_cliente, telefone=telefone_limpo):
-            logger.warning(
-                "Confirmacao final bloqueada por validacao obrigatoria: data=%s horario=%s pessoas=%s nome=%s telefone=%s.",
-                dados_estado.get("data_reserva", ""),
-                dados_estado.get("horario", ""),
-                dados_estado.get("pessoas", ""),
-                bool(nome_cliente or dados_estado.get("nome_cliente")),
-                bool(telefone_limpo),
-            )
-            campo = _primeiro_campo_pendente([], estado, telefone_limpo)
-            _definir_campo_pendente(estado, campo)
-            texto = _mensagem_pedir_campo(campo, estado)
-            _log_resposta_substituida(
-                texto_ia=interpretacao["texto"],
-                texto_final=texto,
-                funcao="aplicar_guardrails_reserva.confirmacao_bloqueada",
-                motivo=f"confirmacao_incompleta:{campo}",
-            )
-            return {
-                "texto": texto,
-                "reserva_confirmada": False,
-                "dados_reserva": dados_estado,
-                "status_reserva": "em_coleta",
-                "confianca": interpretacao["confianca"],
-            }
-        logger.info(
-            "Confirmacao final validada: data=%s horario=%s pessoas=%s telefone=%s.",
-            dados_estado.get("data_reserva", ""),
-            dados_estado.get("horario", ""),
-            dados_estado.get("pessoas", ""),
-            telefone_limpo,
-        )
-        texto = _mensagem_reserva_confirmada(dados_estado)
-        _log_resposta_substituida(
-            texto_ia=interpretacao["texto"],
-            texto_final=texto,
+        return _confirmar_reserva_pendente(
+            telefone=telefone_limpo,
+            estado=estado,
+            interpretacao=interpretacao,
+            nome_cliente=nome_cliente,
             funcao="aplicar_guardrails_reserva.confirmacao_final",
-            motivo="confirmacao_final_operacional",
         )
-        return {
-            "texto": texto,
-            "reserva_confirmada": True,
-            "dados_reserva": dados_estado,
-            "status_reserva": "confirmada",
-            "confianca": max(interpretacao["confianca"], 0.9),
-        }
 
     if invalidos:
         campo = _primeiro_campo_pendente(list(invalidos), estado, telefone_limpo)
@@ -809,7 +790,32 @@ def aplicar_guardrails_reserva(
             "confianca": interpretacao["confianca"],
         }
 
+    if estado.get("confirmacao_pausada") and not confirmacao_cliente:
+        estado["aguardando_confirmacao"] = True
+        estado["cliente_autorizou_confirmacao"] = False
+        _definir_campo_pendente(estado, "confirmacao")
+        dados_estado = _dados_reserva_do_estado(estado)
+        texto_pausado = _texto_modelo_sem_pedir_confirmacao(interpretacao["texto"], estado)
+        if not texto_pausado:
+            texto_pausado = _mensagem_confirmacao_pausada(dados_estado)
+            _log_resposta_substituida(
+                texto_ia=interpretacao["texto"],
+                texto_final=texto_pausado,
+                funcao="aplicar_guardrails_reserva.confirmacao_pausada",
+                motivo="confirmacao_pausada_sem_pressao",
+            )
+        return {
+            "texto": texto_pausado,
+            "reserva_confirmada": False,
+            "dados_reserva": dados_estado,
+            "status_reserva": "aguardando_confirmacao",
+            "confianca": max(interpretacao["confianca"], 0.8),
+        }
+
     estado["aguardando_confirmacao"] = True
+    estado["confirmacao_pausada"] = False
+    estado["cliente_autorizou_confirmacao"] = False
+    estado["ultima_confirmacao_oferecida_em"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     _definir_campo_pendente(estado, "confirmacao")
     dados_estado = _dados_reserva_do_estado(estado)
     texto_confirmacao = _texto_modelo_confirmacao_previa(interpretacao["texto"], dados_estado)
@@ -2019,6 +2025,285 @@ def _texto_modelo_confirmacao_previa(texto: str, dados: Mapping[str, Any]) -> st
     return texto_limpo if _resumo_confere_estado(texto_limpo, dados) else ""
 
 
+def _confirmacao_ativa(estado: Mapping[str, Any]) -> bool:
+    return bool(estado.get("aguardando_confirmacao")) or _campo_aguardado(estado) == "confirmacao"
+
+
+def _resolver_mensagem_confirmacao_pendente(
+    *,
+    telefone: str,
+    mensagem_cliente: str,
+    estado: EstadoReserva,
+    interpretacao: ResultadoReservaEstruturada,
+    nome_cliente: str,
+) -> RespostaAgente | None:
+    if not _confirmacao_ativa(estado):
+        return None
+
+    if _eh_pausa_confirmacao(mensagem_cliente):
+        return _responder_pausa_confirmacao(
+            telefone=telefone,
+            estado=estado,
+            interpretacao=interpretacao,
+        )
+
+    if _eh_confirmacao_cliente(mensagem_cliente):
+        return _confirmar_reserva_pendente(
+            telefone=telefone,
+            estado=estado,
+            interpretacao=interpretacao,
+            nome_cliente=nome_cliente,
+            funcao="aplicar_guardrails_reserva.confirmacao_explicita",
+        )
+
+    if _eh_pedido_resumo_confirmacao(mensagem_cliente):
+        return _responder_resumo_confirmacao(
+            telefone=telefone,
+            estado=estado,
+            interpretacao=interpretacao,
+        )
+
+    if _mensagem_confirmacao_eh_pergunta_ou_comentario(mensagem_cliente, interpretacao):
+        return _responder_contexto_confirmacao(
+            telefone=telefone,
+            mensagem_cliente=mensagem_cliente,
+            estado=estado,
+            interpretacao=interpretacao,
+        )
+
+    return None
+
+
+def _confirmar_reserva_pendente(
+    *,
+    telefone: str,
+    estado: EstadoReserva,
+    interpretacao: Mapping[str, Any],
+    nome_cliente: str,
+    funcao: str,
+) -> RespostaAgente:
+    invalidos: set[str] = set()
+    _remover_campos_invalidos_estado(estado, invalidos)
+    dados_estado = _dados_reserva_do_estado(estado)
+    if not dados_reserva_obrigatorios_ok(dados_estado, nome_cliente=nome_cliente, telefone=telefone):
+        logger.warning(
+            "Confirmacao final bloqueada por validacao obrigatoria: data=%s horario=%s pessoas=%s nome=%s telefone=%s.",
+            dados_estado.get("data_reserva", ""),
+            dados_estado.get("horario", ""),
+            dados_estado.get("pessoas", ""),
+            bool(nome_cliente or dados_estado.get("nome_cliente")),
+            bool(telefone),
+        )
+        estado["cliente_autorizou_confirmacao"] = False
+        estado["aguardando_confirmacao"] = False
+        campo = _primeiro_campo_pendente(list(invalidos), estado, telefone)
+        _definir_campo_pendente(estado, campo)
+        texto = (
+            _mensagem_campo_invalido(campo, estado, telefone)
+            if campo in invalidos
+            else _mensagem_pedir_campo(campo, estado)
+        )
+        _log_resposta_substituida(
+            texto_ia=str(interpretacao.get("texto") or ""),
+            texto_final=texto,
+            funcao=f"{funcao}.bloqueada",
+            motivo=f"confirmacao_incompleta:{campo}",
+        )
+        return {
+            "texto": texto,
+            "reserva_confirmada": False,
+            "dados_reserva": dados_estado,
+            "status_reserva": "em_coleta",
+            "confianca": float(interpretacao.get("confianca") or 0.0),
+        }
+
+    estado["confirmacao_pausada"] = False
+    estado["cliente_autorizou_confirmacao"] = True
+    estado["aguardando_confirmacao"] = False
+    logger.info(
+        "Confirmacao final validada: data=%s horario=%s pessoas=%s telefone=%s.",
+        dados_estado.get("data_reserva", ""),
+        dados_estado.get("horario", ""),
+        dados_estado.get("pessoas", ""),
+        telefone,
+    )
+    texto = _mensagem_reserva_confirmada(dados_estado)
+    _log_resposta_substituida(
+        texto_ia=str(interpretacao.get("texto") or ""),
+        texto_final=texto,
+        funcao=funcao,
+        motivo="confirmacao_final_operacional",
+    )
+    return {
+        "texto": texto,
+        "reserva_confirmada": True,
+        "dados_reserva": dados_estado,
+        "status_reserva": "confirmada",
+        "confianca": max(float(interpretacao.get("confianca") or 0.0), 0.9),
+    }
+
+
+def _responder_pausa_confirmacao(
+    *,
+    telefone: str,
+    estado: EstadoReserva,
+    interpretacao: Mapping[str, Any],
+) -> RespostaAgente:
+    estado["confirmacao_pausada"] = True
+    estado["cliente_autorizou_confirmacao"] = False
+    estado["aguardando_confirmacao"] = True
+    _definir_campo_pendente(estado, "confirmacao")
+    texto = _texto_modelo_sem_pedir_confirmacao(str(interpretacao.get("texto") or ""), estado)
+    if not texto:
+        texto = "Tranquilo, nao vou confirmar ainda."
+        _log_resposta_substituida(
+            texto_ia=str(interpretacao.get("texto") or ""),
+            texto_final=texto,
+            funcao="_responder_pausa_confirmacao",
+            motivo="pausa_confirmacao",
+        )
+    logger.info("Confirmacao pausada pelo cliente. telefone=%s", telefone)
+    return {
+        "texto": texto,
+        "reserva_confirmada": False,
+        "dados_reserva": _dados_reserva_do_estado(estado),
+        "status_reserva": "aguardando_confirmacao",
+        "confianca": max(float(interpretacao.get("confianca") or 0.0), 0.8),
+    }
+
+
+def _responder_resumo_confirmacao(
+    *,
+    telefone: str,
+    estado: EstadoReserva,
+    interpretacao: Mapping[str, Any],
+) -> RespostaAgente:
+    estado["aguardando_confirmacao"] = True
+    estado["cliente_autorizou_confirmacao"] = False
+    _definir_campo_pendente(estado, "confirmacao")
+    dados_estado = _dados_reserva_do_estado(estado)
+    texto = _mensagem_resumo_reserva_sem_confirmacao(dados_estado)
+    _log_resposta_substituida(
+        texto_ia=str(interpretacao.get("texto") or ""),
+        texto_final=texto,
+        funcao="_responder_resumo_confirmacao",
+        motivo="pedido_resumo_sem_pressao_confirmacao",
+    )
+    logger.info("Resumo da reserva enviado sem repetir pedido de confirmacao. telefone=%s", telefone)
+    return {
+        "texto": texto,
+        "reserva_confirmada": False,
+        "dados_reserva": dados_estado,
+        "status_reserva": "aguardando_confirmacao",
+        "confianca": max(float(interpretacao.get("confianca") or 0.0), 0.8),
+    }
+
+
+def _responder_contexto_confirmacao(
+    *,
+    telefone: str,
+    mensagem_cliente: str,
+    estado: EstadoReserva,
+    interpretacao: Mapping[str, Any],
+) -> RespostaAgente:
+    estado["aguardando_confirmacao"] = True
+    estado["cliente_autorizou_confirmacao"] = False
+    _definir_campo_pendente(estado, "confirmacao")
+    texto = _texto_modelo_sem_pedir_confirmacao(str(interpretacao.get("texto") or ""), estado)
+    if not texto:
+        texto = _fallback_contexto_confirmacao(mensagem_cliente)
+        _log_resposta_substituida(
+            texto_ia=str(interpretacao.get("texto") or ""),
+            texto_final=texto,
+            funcao="_responder_contexto_confirmacao",
+            motivo="texto_ia_vazio_ou_com_pressao_confirmacao",
+        )
+    logger.info("Pergunta/comentario respondido durante confirmacao sem repetir pedido. telefone=%s", telefone)
+    return {
+        "texto": texto,
+        "reserva_confirmada": False,
+        "dados_reserva": _dados_reserva_do_estado(estado),
+        "status_reserva": "aguardando_confirmacao",
+        "confianca": max(float(interpretacao.get("confianca") or 0.0), 0.8),
+    }
+
+
+def _eh_pausa_confirmacao(texto: str) -> bool:
+    normalizado = re.sub(r"[^\w\s]", " ", _normalizar_busca(texto))
+    normalizado = re.sub(r"\s+", " ", normalizado).strip()
+    if normalizado in {"n", "nao", "calma", "pera", "perai", "espera"}:
+        return True
+    return bool(
+        re.search(r"\b(ainda\s+nao|nao\s+agora|calma|pera|perai|espera|aguenta)\b", normalizado)
+        and re.search(r"\b(confirma|confirmar|fecha|fechar|confirme)\b", normalizado)
+    )
+
+
+def _eh_pedido_resumo_confirmacao(texto: str) -> bool:
+    normalizado = _normalizar_busca(texto)
+    return bool(
+        re.search(r"\b(me\s+lembra|lembra|resume|resumo|recapitula|relembra)\b", normalizado)
+        or re.search(r"\b(como|qual)\s+ficou\b", normalizado)
+        or re.search(r"\bficou\s+como\b", normalizado)
+    )
+
+
+def _mensagem_confirmacao_eh_pergunta_ou_comentario(texto: str, interpretacao: Mapping[str, Any]) -> bool:
+    intencao = _normalizar_intencao_ia(str(interpretacao.get("intencao") or ""))
+    if intencao in INTENCOES_CONVERSACIONAIS_IA:
+        return True
+    if _intencao_conversacional(texto) or _categoria_pergunta_restaurante(texto):
+        return True
+    if _mensagem_eh_pergunta_contextual(texto) or _mensagem_tem_tom_de_brincadeira_ou_comentario(texto):
+        return True
+    return False
+
+
+def _texto_modelo_sem_pedir_confirmacao(texto: str, estado: Mapping[str, Any]) -> str:
+    texto_limpo = remover_flag_reserva(str(texto or ""))
+    if not texto_limpo or _texto_modelo_parece_rigido(texto_limpo):
+        return ""
+    if _texto_modelo_inseguro_em_coleta(texto_limpo, (), estado):
+        return ""
+    if _texto_pede_confirmacao(texto_limpo):
+        return ""
+    return texto_limpo
+
+
+def _texto_pede_confirmacao(texto: str) -> bool:
+    normalizado = _normalizar_busca(texto)
+    return bool(
+        re.search(r"\b(posso|pode|quer|queria)\s+confirmar\b", normalizado)
+        or re.search(r"\bconfirma\??\b", normalizado)
+        or re.search(r"\besta\s+tudo\s+certo\??\b", normalizado)
+    )
+
+
+def _mensagem_resumo_reserva_sem_confirmacao(dados: Mapping[str, Any]) -> str:
+    nome = str(dados.get("nome_cliente") or "").strip()
+    nome_trecho = f", no nome de {nome}" if nome else ""
+    return (
+        "Ficou para "
+        f"{_formatar_data_cliente(str(dados.get('data_reserva') or ''))}, "
+        f"as {dados.get('horario')}, para {dados.get('pessoas')} pessoas"
+        f"{nome_trecho}."
+    )
+
+
+def _mensagem_confirmacao_pausada(dados: Mapping[str, Any]) -> str:
+    resumo = _mensagem_resumo_reserva_sem_confirmacao(dados)
+    return f"Tranquilo, nao vou confirmar ainda. {resumo}"
+
+
+def _fallback_contexto_confirmacao(texto: str) -> str:
+    normalizado = _normalizar_busca(texto)
+    if re.search(r"\b(atraso|atrasado|atrasada|atrasar|chegar tarde)\b", normalizado):
+        return "Ainda nao tenho uma politica de atraso configurada por aqui. A equipe pode te orientar se precisar."
+    if _categoria_pergunta_restaurante(texto):
+        return "Essa informacao nao esta configurada por aqui agora."
+    return "Certo, sigo com os dados da reserva anotados por aqui."
+
+
 def _resumo_confere_estado(texto: str, dados: Mapping[str, Any]) -> bool:
     data_formatada = _formatar_data_cliente(str(dados.get("data_reserva") or ""))
     horario = str(dados.get("horario") or "")
@@ -2045,8 +2330,11 @@ def _formatar_data_cliente(valor: str) -> str:
 def _eh_confirmacao_cliente(texto: str) -> bool:
     normalizado = _normalizar_busca(texto)
     return bool(
-        re.fullmatch(r"(sim|s|confirmo|confirmado|pode confirmar|isso|isso mesmo|ok|fechado|beleza|perfeito)", normalizado)
-        or re.search(r"\b(pode confirmar|confirmo|esta certo|ta certo|fechado)\b", normalizado)
+        re.fullmatch(
+            r"(sim|s|confirmo|confirmado|pode confirmar|agora pode confirmar|confirma|pode fechar|tudo certo|sim confirma|sim pode confirmar|isso|isso mesmo|ok|fechado|beleza|perfeito)",
+            normalizado,
+        )
+        or re.search(r"\b(pode confirmar|agora pode confirmar|confirmo|confirma|pode fechar|tudo certo|esta certo|ta certo|fechado)\b", normalizado)
     )
 
 
@@ -2088,8 +2376,12 @@ def _eh_recusa_reserva(texto: str) -> bool:
 
 def _eh_pedido_imediato(texto: str) -> bool:
     normalizado = _normalizar_busca(texto)
+    if _eh_confirmacao_cliente(texto):
+        return False
     return bool(
-        re.search(r"\b(agora|agr|hj agora|hoje agora)\b", normalizado)
+        re.search(r"\b(?:quero|queria|gostaria|preciso)\s+(?:reservar|fazer reserva|uma mesa|mesa|ir|chegar)(?:\s+\w+){0,4}\s+(?:agora|agr)\b", normalizado)
+        or re.search(r"\btem\s+(?:mesa|reserva|lugar)(?:\s+\w+){0,4}\s+(?:agora|agr)\b", normalizado)
+        or re.search(r"\b(?:hj|hoje)\s+agora\b", normalizado)
         or re.search(r"\b(to|tou|estou)\s+(indo|chegando)\b", normalizado)
         or re.search(r"\b(chegando|indo ai|indo agora|mais rapido possivel|o quanto antes)\b", normalizado)
         or re.search(r"\bquero\s+(?:pra\s+)?agora\b", normalizado)

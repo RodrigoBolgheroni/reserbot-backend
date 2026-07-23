@@ -648,5 +648,132 @@ class AgenteIAOrquestradoraTest(unittest.TestCase):
         self.assertEqual(agente._estados_reserva[telefone]["campo_pendente"], "horario")
 
 
+    def test_confirmacao_pendente_responde_contexto_pausa_resumo_correcao_e_confirma(self) -> None:
+        telefone = "5511990010040"
+        agente._estados_reserva[telefone] = {
+            "data_reserva": "2026-07-30",
+            "data_reserva_original": "30/07",
+            "horario": "20:30",
+            "pessoas": 4,
+            "nome_cliente": "Rodrigo",
+            "campo_pendente": "confirmacao",
+            "etapa": "aguardando_confirmacao",
+            "aguardando_confirmacao": True,
+            "ultima_confirmacao_oferecida_em": "2026-07-23T02:00:00+00:00",
+        }
+
+        atraso = {
+            "resposta": "Se voce se atrasar um pouco, a equipe pode orientar no momento. Sigo com a reserva anotada.",
+            "intencao": "pergunta_contextual",
+            "dados_confirmados": {},
+            "dados_mencionados": {},
+            "dados_incertos": {},
+            "correcoes": {},
+            "acao": "responder",
+            "deve_avancar_estado": False,
+            "campo_sugerido": "confirmacao",
+            "confianca": 0.93,
+        }
+        pausa = {
+            "resposta": "Tranquilo, nao vou confirmar ainda.",
+            "intencao": "comentario",
+            "dados_confirmados": {},
+            "dados_mencionados": {},
+            "correcoes": {},
+            "acao": "responder",
+            "deve_avancar_estado": False,
+            "campo_sugerido": "confirmacao",
+            "confianca": 0.9,
+        }
+        resumo = {
+            "resposta": "Ficou para 30/07/2026, as 20:30, para 4 pessoas, no nome de Rodrigo. Posso confirmar?",
+            "intencao": "resumo_reserva",
+            "dados_confirmados": {},
+            "dados_mencionados": {},
+            "correcoes": {},
+            "acao": "pedir_confirmacao",
+            "deve_avancar_estado": False,
+            "campo_sugerido": "confirmacao",
+            "confianca": 0.95,
+        }
+        correcao = {
+            "resposta": "Claro, ajustei para 21h.",
+            "intencao": "correcao",
+            "dados_confirmados": {"horario": "21:00"},
+            "dados_mencionados": {},
+            "correcoes": {"horario": "21:00"},
+            "acao": "responder",
+            "deve_avancar_estado": False,
+            "campo_sugerido": "confirmacao",
+            "confianca": 0.96,
+        }
+        comentario = {
+            "resposta": "Kkkkk tomara que o tempo ajude. Sigo com os dados da reserva anotados.",
+            "intencao": "comentario",
+            "dados_confirmados": {},
+            "dados_mencionados": {},
+            "correcoes": {},
+            "acao": "responder",
+            "deve_avancar_estado": False,
+            "campo_sugerido": "confirmacao",
+            "confianca": 0.91,
+        }
+        confirmar = {
+            "resposta": "Reserva confirmada para 30/07/2026, as 21:00, para 4 pessoas, no nome de Rodrigo. Obrigado!",
+            "intencao": "comentario",
+            "dados_confirmados": {"data": "2026-07-30", "horario": "21:00", "quantidade": 4, "nome": "Rodrigo"},
+            "dados_mencionados": {},
+            "correcoes": {},
+            "acao": "confirmar_reserva",
+            "deve_avancar_estado": True,
+            "campo_sugerido": "confirmacao",
+            "confianca": 0.98,
+        }
+
+        resposta_atraso = self._processar(telefone, "E se eu chegar atrasado?", atraso)
+        self.assertEqual(resposta_atraso["texto"], atraso["resposta"])
+        self.assertNotIn("posso confirmar", agente._normalizar_busca(resposta_atraso["texto"]))
+        self.assertEqual(agente._estados_reserva[telefone]["campo_pendente"], "confirmacao")
+        self.assertEqual(agente._estados_reserva[telefone]["horario"], "20:30")
+
+        resposta_pausa = self._processar(telefone, "Calma, ainda nao confirma", pausa)
+        self.assertEqual(resposta_pausa["texto"], pausa["resposta"])
+        self.assertTrue(agente._estados_reserva[telefone]["confirmacao_pausada"])
+        self.assertFalse(agente._estados_reserva[telefone]["cliente_autorizou_confirmacao"])
+
+        resposta_resumo = self._processar(telefone, "Me lembra como ficou?", resumo)
+        texto_resumo = agente._normalizar_busca(resposta_resumo["texto"])
+        self.assertIn("30/07/2026", texto_resumo)
+        self.assertIn("20:30", texto_resumo)
+        self.assertIn("4 pessoas", texto_resumo)
+        self.assertIn("rodrigo", texto_resumo)
+        self.assertNotIn("posso confirmar", texto_resumo)
+
+        resposta_correcao = self._processar(telefone, "Na verdade muda para 21h", correcao)
+        self.assertEqual(resposta_correcao["texto"], correcao["resposta"])
+        self.assertEqual(agente._estados_reserva[telefone]["data_reserva"], "2026-07-30")
+        self.assertEqual(agente._estados_reserva[telefone]["horario"], "21:00")
+        self.assertTrue(agente._estados_reserva[telefone]["confirmacao_pausada"])
+        self.assertNotIn("posso confirmar", agente._normalizar_busca(resposta_correcao["texto"]))
+
+        resposta_comentario = self._processar(telefone, "Se nao estiver chovendo eu vou kkkkk", comentario)
+        self.assertEqual(resposta_comentario["texto"], comentario["resposta"])
+        self.assertEqual(agente._estados_reserva[telefone]["horario"], "21:00")
+        self.assertNotIn("posso confirmar", agente._normalizar_busca(resposta_comentario["texto"]))
+
+        resposta_confirmar = self._processar(telefone, "Agora pode confirmar", confirmar)
+        self.assertTrue(resposta_confirmar["reserva_confirmada"])
+        self.assertEqual(resposta_confirmar["status_reserva"], "confirmada")
+        self.assertEqual(resposta_confirmar["dados_reserva"]["data_reserva"], "2026-07-30")
+        self.assertEqual(resposta_confirmar["dados_reserva"]["horario"], "21:00")
+        self.assertEqual(resposta_confirmar["dados_reserva"]["pessoas"], 4)
+        self.assertNotIn("agora", agente._normalizar_busca(resposta_confirmar["texto"]))
+
+    def test_agora_pode_confirmar_nao_e_pedido_imediato(self) -> None:
+        self.assertFalse(agente._eh_pedido_imediato("Agora pode confirmar"))
+        self.assertFalse(agente._eh_pedido_imediato("pode confirmar agora"))
+        self.assertTrue(agente._eh_pedido_imediato("quero reservar agora"))
+
+
 if __name__ == "__main__":
     unittest.main()
