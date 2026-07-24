@@ -79,6 +79,10 @@ class DadosReserva(TypedDict, total=False):
     pessoas: int
     nome_cliente: str
     observacoes: str
+    preferencia_espaco_id: str
+    preferencia_espaco_nome: str
+    espaco_confirmado: bool
+    local_garantido: bool
 
 
 class RespostaAgente(TypedDict):
@@ -119,6 +123,13 @@ class EstadoReserva(TypedDict, total=False):
     pessoas: int
     nome_cliente: str
     observacoes: str
+    preferencia_espaco_id: str
+    preferencia_espaco_nome: str
+    preferencia_espaco_permitida: bool
+    espaco_confirmado: bool
+    local_garantido: bool
+    motivo_local_nao_garantido: str
+    disponibilidade_espaco_consultada: bool
     campo_pendente: str
     etapa: str
     pedido_imediato: bool
@@ -198,6 +209,13 @@ CHAVES_ESTADO_PERSISTIDO: Final[set[str]] = {
     "pessoas",
     "nome_cliente",
     "observacoes",
+    "preferencia_espaco_id",
+    "preferencia_espaco_nome",
+    "preferencia_espaco_permitida",
+    "espaco_confirmado",
+    "local_garantido",
+    "motivo_local_nao_garantido",
+    "disponibilidade_espaco_consultada",
     "campo_pendente",
     "etapa",
     "pedido_imediato",
@@ -1004,6 +1022,7 @@ def aplicar_guardrails_reserva(
         estado["nome_cliente"] = nome_cliente.strip()
 
     _atualizar_contexto_conversacional_estado(estado, interpretacao)
+    _atualizar_preferencia_espaco_estado(estado, mensagem_cliente=mensagem_cliente)
     data_clara_promovivel = _mensagem_tem_data_clara_promovivel(mensagem_cliente, estado, interpretacao)
     horario_claro_promovivel = _mensagem_tem_horario_claro_promovivel(mensagem_cliente, estado, interpretacao)
 
@@ -2259,6 +2278,220 @@ def _atualizar_contexto_conversacional_estado(estado: EstadoReserva, interpretac
         estado["dados_confirmados"] = _mesclar_dict_contexto(dict(estado.get("dados_confirmados") or {}), dict(dados_confirmados))
 
 
+def _atualizar_preferencia_espaco_estado(estado: EstadoReserva, *, mensagem_cliente: str) -> None:
+    config = _config_restaurante_atual()
+    espacos = _espacos_ativos(config)
+    logger.info(
+        "espacos_contexto_carregado source=%s estabelecimento_id=%s",
+        config.fonte,
+        config.estabelecimento_id,
+    )
+    logger.info(
+        "espacos_ativos_encontrados total=%s nomes=%s",
+        len(espacos),
+        [espaco.nome for espaco in espacos],
+    )
+    _registrar_conflitos_espaco_faq(config)
+
+    espaco = _identificar_espaco_na_mensagem(config, mensagem_cliente)
+    if espaco is None:
+        return
+
+    logger.info(
+        "espaco_identificado_na_mensagem espaco_id=%s nome=%s permite_preferencia=%s",
+        espaco.id,
+        espaco.nome,
+        espaco.permite_preferencia,
+    )
+    if not _mensagem_solicita_preferencia_espaco(mensagem_cliente):
+        return
+
+    logger.info("preferencia_espaco_solicitada espaco_id=%s nome=%s", espaco.id, espaco.nome)
+    if not espaco.permite_preferencia:
+        estado.pop("preferencia_espaco_id", None)
+        estado.pop("preferencia_espaco_nome", None)
+        estado["preferencia_espaco_permitida"] = False
+        estado["espaco_confirmado"] = False
+        estado["local_garantido"] = False
+        estado["motivo_local_nao_garantido"] = "O espaco nao permite preferencia no momento."
+        estado["disponibilidade_espaco_consultada"] = False
+        logger.warning(
+            "preferencia_espaco_nao_permitida espaco_id=%s nome=%s",
+            espaco.id,
+            espaco.nome,
+        )
+        logger.warning(
+            "espaco_confirmacao_bloqueada espaco_id=%s motivo=preferencia_nao_permitida",
+            espaco.id,
+        )
+        return
+
+    estado["preferencia_espaco_id"] = espaco.id
+    estado["preferencia_espaco_nome"] = espaco.nome
+    estado["preferencia_espaco_permitida"] = True
+    estado["espaco_confirmado"] = False
+    estado["local_garantido"] = False
+    estado["disponibilidade_espaco_consultada"] = False
+    logger.info(
+        "disponibilidade_espaco_consultada consultado=false espaco_id=%s motivo=sem_consulta_reservas",
+        espaco.id,
+    )
+
+    motivos = []
+    regra_espaco = _motivo_regra_espaco_nao_garantido(espaco, estado)
+    if regra_espaco:
+        motivos.append(regra_espaco)
+        logger.info("regra_espaco_aplicada espaco_id=%s regra=%r", espaco.id, regra_espaco)
+
+    regra_faq = _regra_faq_espaco_aplicavel(estado, config)
+    if regra_faq:
+        motivos.append(regra_faq)
+        logger.info("regra_faq_aplicada espaco_id=%s regra=%r", espaco.id, regra_faq)
+
+    if motivos:
+        estado["motivo_local_nao_garantido"] = " ".join(dict.fromkeys(motivos))
+    else:
+        estado.pop("motivo_local_nao_garantido", None)
+
+    logger.info("preferencia_espaco_permitida espaco_id=%s nome=%s", espaco.id, espaco.nome)
+    logger.info(
+        "espaco_preferencia_registrada espaco_id=%s nome=%s espaco_confirmado=%s local_garantido=%s",
+        espaco.id,
+        espaco.nome,
+        estado.get("espaco_confirmado"),
+        estado.get("local_garantido"),
+    )
+
+
+def _identificar_espaco_na_mensagem(
+    config: config_restaurante.ConfigRestaurante,
+    mensagem_cliente: str,
+) -> config_restaurante.EspacoRestaurante | None:
+    normalizado = _normalizar_busca(mensagem_cliente)
+    if not normalizado:
+        return None
+
+    melhor: tuple[int, config_restaurante.EspacoRestaurante] | None = None
+    tokens_mensagem = set(re.findall(r"\w+", normalizado))
+    for espaco in _espacos_ativos(config):
+        nome_normalizado = _normalizar_busca(espaco.nome)
+        tokens_nome = set(re.findall(r"\w+", nome_normalizado))
+        descricao_normalizada = _normalizar_busca(espaco.descricao)
+        score = 0
+        if nome_normalizado and re.search(rf"\b{re.escape(nome_normalizado)}\b", normalizado):
+            score += 100
+        score += 20 * len(tokens_mensagem & tokens_nome)
+        if descricao_normalizada and any(token in descricao_normalizada for token in tokens_mensagem if len(token) > 4):
+            score += 5
+        if score <= 0:
+            continue
+        if melhor is None or score > melhor[0]:
+            melhor = (score, espaco)
+    return melhor[1] if melhor else None
+
+
+def _mensagem_solicita_preferencia_espaco(texto: str) -> bool:
+    normalizado = _normalizar_busca(texto)
+    return bool(
+        re.search(
+            r"\b(prefiro|preferia|preferencia|preferir|escolher|escolho|quero|queria|"
+            r"pode ser|coloca|coloque|anota|anote|fica|ficar|mesa|reserva)\b",
+            normalizado,
+        )
+    )
+
+
+def _espaco_por_id(
+    config: config_restaurante.ConfigRestaurante,
+    espaco_id: str,
+) -> config_restaurante.EspacoRestaurante | None:
+    if not espaco_id:
+        return None
+    for espaco in _espacos_ativos(config):
+        if espaco.id == espaco_id:
+            return espaco
+    return None
+
+
+def _motivo_regra_espaco_nao_garantido(
+    espaco: config_restaurante.EspacoRestaurante,
+    estado: Mapping[str, Any],
+) -> str:
+    return _motivo_texto_regra_nao_garantido(str(espaco.regras or ""), estado)
+
+
+def _regra_faq_espaco_aplicavel(
+    estado: Mapping[str, Any],
+    config: config_restaurante.ConfigRestaurante,
+) -> str:
+    motivos: list[str] = []
+    for faq in config.faq_conteudos:
+        if not faq.ativo or not _faq_relacionada_espaco(faq):
+            continue
+        motivo_nao_garantido = _motivo_texto_regra_nao_garantido(faq.conteudo, estado)
+        if motivo_nao_garantido:
+            motivos.append(motivo_nao_garantido)
+
+        motivo_direcionamento = _motivo_direcionamento_operacional_faq(faq.conteudo, estado)
+        if motivo_direcionamento:
+            motivos.append(motivo_direcionamento)
+
+    return " ".join(dict.fromkeys(motivos))
+
+
+def _motivo_texto_regra_nao_garantido(texto: str, estado: Mapping[str, Any]) -> str:
+    horario = str(estado.get("horario") or "").strip()
+    if not texto or not horario:
+        return ""
+    horarios_regra = _horarios_citados_no_texto(texto)
+    normalizado = _normalizar_busca(texto)
+    if horario in horarios_regra and re.search(r"\b(nao|sem)\b.{0,80}\b(garantid\w*|garantia|preferencia)\b", normalizado):
+        return "Regra cadastrada informa que a preferencia de local nesse horario nao e garantida."
+    return ""
+
+
+def _motivo_direcionamento_operacional_faq(texto: str, estado: Mapping[str, Any]) -> str:
+    pessoas = _pessoas_json(estado.get("pessoas"))
+    dia_semana = _dia_semana_texto(str(estado.get("data_reserva") or ""))
+    if not texto or pessoas is None or dia_semana not in {"sabado", "domingo"}:
+        return ""
+
+    normalizado = _normalizar_busca(texto)
+    if not re.search(r"\b(sabado|domingos?|domingo|finais de semana|fim de semana)\b", normalizado):
+        return ""
+    match = re.search(r"\bacima\s+de\s+(\d{1,4})\s+pessoas?\b", normalizado)
+    if not match:
+        return ""
+    limite = int(match.group(1))
+    if pessoas <= limite:
+        return ""
+    return f"FAQ ativa informa regra operacional para grupos acima de {limite} pessoas em {dia_semana}."
+
+
+def _registrar_conflitos_espaco_faq(config: config_restaurante.ConfigRestaurante) -> None:
+    faqs_espacos = [faq for faq in config.faq_conteudos if faq.ativo and _faq_relacionada_espaco(faq)]
+    if not faqs_espacos:
+        return
+    for espaco in _espacos_ativos(config):
+        if espaco.capacidade_maxima is None:
+            continue
+        for faq in faqs_espacos:
+            for limite in _limites_operacionais_faq(faq.conteudo):
+                if limite != espaco.capacidade_maxima:
+                    logger.warning(
+                        "conflito_espaco_faq_detectado espaco_id=%s capacidade_maxima=%s faq_id=%s limite_textual=%s observacao=podem_ser_conceitos_diferentes",
+                        espaco.id,
+                        espaco.capacidade_maxima,
+                        faq.id,
+                        limite,
+                    )
+
+
+def _limites_operacionais_faq(texto: str) -> list[int]:
+    normalizado = _normalizar_busca(texto)
+    return [int(match.group(1)) for match in re.finditer(r"\bacima\s+de\s+(\d{1,4})\s+pessoas?\b", normalizado)]
+
+
 def _mesclar_dict_contexto(anterior: dict[str, Any], novo: dict[str, Any]) -> dict[str, Any]:
     mesclado = dict(anterior)
     for chave, valor in novo.items():
@@ -2320,7 +2553,17 @@ def _campos_obrigatorios_faltantes(estado: EstadoReserva, telefone: str) -> list
 
 def _dados_reserva_do_estado(estado: EstadoReserva) -> DadosReserva:
     dados: DadosReserva = {}
-    for campo in ("data_reserva", "horario", "pessoas", "nome_cliente", "observacoes"):
+    for campo in (
+        "data_reserva",
+        "horario",
+        "pessoas",
+        "nome_cliente",
+        "observacoes",
+        "preferencia_espaco_id",
+        "preferencia_espaco_nome",
+        "espaco_confirmado",
+        "local_garantido",
+    ):
         valor = estado.get(campo)
         if valor not in (None, "", []):
             dados[campo] = valor  # type: ignore[literal-required]
@@ -3246,6 +3489,12 @@ def _categoria_pergunta_restaurante(texto: str) -> str | None:
         return "bolo"
     if re.search(r"\b(aniversario|bolo|decoracao|decorar|parabens|comemorar)\b", normalizado):
         return "aniversario"
+    if re.search(
+        r"\b(salao|areia|espaco|espacos|local|preferencia|preferir|escolher|"
+        r"area interna|area externa|capacidade|cabem|cabe|garantido|garantida|garantia)\b",
+        normalizado,
+    ):
+        return "espacos"
     if re.search(r"\b(quantas pessoas|maximo|maxima|limite|grupo grande|muita gente)\b", normalizado):
         return "limite_pessoas"
     if marcador_pergunta and re.search(r"\b(cancelamento|cancelar|desmarcar|remarcar)\b", normalizado):
@@ -3663,24 +3912,115 @@ def _texto_modelo_eh_fallback_tecnico(texto_modelo: str) -> bool:
     )
 
 
+def _json_contexto(valor: Mapping[str, Any] | Sequence[Any]) -> str:
+    return json.dumps(valor, ensure_ascii=False, separators=(",", ":"))
+
+
+def _espacos_ativos(config: config_restaurante.ConfigRestaurante) -> list[config_restaurante.EspacoRestaurante]:
+    return [espaco for espaco in config.espacos if espaco.ativo]
+
+
 def _contexto_espacos_restaurante(config: config_restaurante.ConfigRestaurante) -> str:
-    partes: list[str] = []
-    for espaco in config.espacos:
-        if not espaco.ativo:
-            continue
-        capacidade = (
-            f"capacidade maxima {espaco.capacidade_maxima}"
-            if espaco.capacidade_maxima is not None
-            else "capacidade maxima indefinida"
+    espacos = [
+        {
+            "id": espaco.id,
+            "nome": espaco.nome,
+            "descricao": espaco.descricao,
+            "capacidade_maxima": espaco.capacidade_maxima,
+            "permite_preferencia": espaco.permite_preferencia,
+            "ativo": espaco.ativo,
+        }
+        for espaco in _espacos_ativos(config)
+    ]
+    return _json_contexto({"espacos_ativos": espacos})
+
+
+def _contexto_regras_espacos(config: config_restaurante.ConfigRestaurante) -> str:
+    regras = [
+        {
+            "origem": "espacos.regras",
+            "espaco_id": espaco.id,
+            "espaco_nome": espaco.nome,
+            "texto": espaco.regras,
+        }
+        for espaco in _espacos_ativos(config)
+        if espaco.regras
+    ]
+    return _json_contexto({"regras_espaco": regras})
+
+
+def _contexto_faqs_espacos(faqs: Sequence[config_restaurante.FaqConteudo]) -> str:
+    regras = [
+        {
+            "origem": "faq_conteudos",
+            "faq_id": faq.id,
+            "categoria": faq.categoria,
+            "titulo": faq.titulo,
+            "conteudo": faq.conteudo,
+            "tags": list(faq.tags),
+        }
+        for faq in faqs
+        if _faq_relacionada_espaco(faq)
+    ]
+    return _json_contexto({"faqs_espacos_relevantes": regras})
+
+
+def _contexto_reserva_espacos(estado: Mapping[str, Any], config: config_restaurante.ConfigRestaurante) -> str:
+    data_reserva = str(estado.get("data_reserva") or "")
+    horario = str(estado.get("horario") or "")
+    pessoas = _pessoas_json(estado.get("pessoas"))
+    espaco = _espaco_por_id(config, str(estado.get("preferencia_espaco_id") or ""))
+    capacidade_maxima = espaco.capacidade_maxima if espaco is not None else None
+    capacidade_comporta = None
+    if capacidade_maxima is not None and pessoas is not None:
+        capacidade_comporta = pessoas <= capacidade_maxima
+        logger.info(
+            "capacidade_espaco_consultada espaco_id=%s capacidade_maxima=%s quantidade=%s comporta=%s",
+            espaco.id,
+            capacidade_maxima,
+            pessoas,
+            capacidade_comporta,
         )
-        preferencia = "permite preferencia de local" if espaco.permite_preferencia else "nao permite preferencia de local"
-        detalhes = [espaco.nome, capacidade, preferencia]
-        if espaco.descricao:
-            detalhes.append(espaco.descricao)
-        if espaco.regras:
-            detalhes.append(f"regras: {espaco.regras}")
-        partes.append("; ".join(detalhes))
-    return " | ".join(partes)
+    logger.info(
+        "disponibilidade_espaco_consultada consultado=%s espaco_id=%s",
+        bool(estado.get("disponibilidade_espaco_consultada")),
+        str(estado.get("preferencia_espaco_id") or ""),
+    )
+
+    contexto = {
+        "contexto_reserva": {
+            "data": data_reserva or None,
+            "dia_semana": _dia_semana_texto(data_reserva),
+            "horario": horario or None,
+            "quantidade": pessoas,
+            "preferencia_espaco_id": str(estado.get("preferencia_espaco_id") or "") or None,
+            "preferencia_espaco_nome": str(estado.get("preferencia_espaco_nome") or "") or None,
+            "espaco_confirmado": bool(estado.get("espaco_confirmado")),
+            "local_garantido": bool(estado.get("local_garantido")),
+        },
+        "resultado_disponibilidade": {
+            "consultado": bool(estado.get("disponibilidade_espaco_consultada")),
+            "espaco_id": str(estado.get("preferencia_espaco_id") or "") or None,
+            "ocupacao_atual": None,
+            "ocupacao_resultante": None,
+            "capacidade_maxima": capacidade_maxima,
+            "quantidade_solicitada": pessoas,
+            "disponivel_por_capacidade": capacidade_comporta,
+            "preferencia_registrada": bool(estado.get("preferencia_espaco_id")),
+            "local_garantido": bool(estado.get("local_garantido")),
+            "motivo_local_nao_garantido": str(estado.get("motivo_local_nao_garantido") or ""),
+        },
+    }
+    return _json_contexto(contexto)
+
+
+def _dia_semana_texto(data_reserva: str) -> str | None:
+    try:
+        data = date.fromisoformat(data_reserva[:10])
+    except ValueError:
+        return None
+    nomes = {1: "segunda", 2: "terca", 3: "quarta", 4: "quinta", 5: "sexta", 6: "sabado", 7: "domingo"}
+    return nomes.get(data.isoweekday())
 
 
 def _selecionar_faqs_relevantes(
@@ -3713,12 +4053,19 @@ def _selecionar_faqs_relevantes(
 
     pontuadas.sort(key=lambda item: (item[0], item[1]), reverse=True)
     selecionadas = [faq for _, _, faq in pontuadas[: max(1, min(limite, 5))]]
+    faqs_espacos = [faq for faq in selecionadas if _faq_relacionada_espaco(faq)]
     logger.info(
         "FAQs relevantes selecionadas: total_ativas=%s selecionadas=%s titulos=%s metodo=busca_lexica",
         len(faqs_ativas),
         len(selecionadas),
         [faq.titulo for faq in selecionadas],
     )
+    if faqs_espacos:
+        logger.info(
+            "faqs_espacos_selecionadas total=%s titulos=%s",
+            len(faqs_espacos),
+            [faq.titulo for faq in faqs_espacos],
+        )
     return selecionadas
 
 
@@ -3806,7 +4153,28 @@ def _sinonimos_faq(tokens: set[str]) -> set[str]:
         {"lista"},
         {"entrada", "entrar", "valor", "valores", "preco", "precos", "custa", "crianca", "criancas"},
         {"gympass"},
-        {"salao", "areia", "espaco", "espacos", "local", "preferencia"},
+        {
+            "salao",
+            "areia",
+            "espaco",
+            "espacos",
+            "local",
+            "preferencia",
+            "garantia",
+            "garantido",
+            "garantida",
+            "capacidade",
+            "cabem",
+            "cabe",
+            "interno",
+            "interna",
+            "externo",
+            "externa",
+            "area",
+            "lugar",
+            "direcionado",
+            "direcionada",
+        },
         {"estacionamento", "estacionar", "carro", "vaga"},
     ]
     expandidos: set[str] = set()
@@ -3833,7 +4201,44 @@ def _pontuar_faq(faq: config_restaurante.FaqConteudo, tokens_consulta: set[str])
             score += 20
         if "lista" in tokens_faq_resumo and "lista" not in tokens_consulta:
             score -= 12
+    tokens_espaco = _tokens_espaco()
+    if tokens_consulta & tokens_espaco:
+        tokens_faq_resumo = tokens_titulo | tokens_tags | tokens_categoria
+        if tokens_faq_resumo & tokens_espaco:
+            score += 20
+        if "preferencia" in tokens_faq_resumo and tokens_consulta & {"garantia", "garantido", "garantida", "local", "salao", "areia", "espaco"}:
+            score += 12
     return score
+
+
+def _tokens_espaco() -> set[str]:
+    return {
+        "salao",
+        "areia",
+        "espaco",
+        "espacos",
+        "local",
+        "preferencia",
+        "garantia",
+        "garantido",
+        "garantida",
+        "capacidade",
+        "cabem",
+        "cabe",
+        "interno",
+        "interna",
+        "externo",
+        "externa",
+        "area",
+        "lugar",
+        "direcionado",
+        "direcionada",
+    }
+
+
+def _faq_relacionada_espaco(faq: config_restaurante.FaqConteudo) -> bool:
+    texto = " ".join([faq.categoria, faq.titulo, faq.conteudo, " ".join(faq.tags)])
+    return bool(_tokens_busca_faq(texto, expandir=True) & _tokens_espaco())
 
 
 def _contexto_faqs_relevantes(faqs: Sequence[config_restaurante.FaqConteudo]) -> str:
@@ -3859,6 +4264,20 @@ def _mensagem_sistema(
     estado = _estados_reserva.get(telefone_limpo, {}) if telefone_limpo else {}
     historico = _historicos.get(telefone_limpo, []) if telefone_limpo else []
     espacos_contexto = _contexto_espacos_restaurante(config)
+    regras_espacos_contexto = _contexto_regras_espacos(config)
+    contexto_reserva_espacos = _contexto_reserva_espacos(estado, config)
+    espacos_ativos = _espacos_ativos(config)
+    logger.info(
+        "espacos_contexto_carregado source=%s estabelecimento_id=%s",
+        config.fonte,
+        config.estabelecimento_id,
+    )
+    logger.info(
+        "espacos_ativos_encontrados total=%s nomes=%s",
+        len(espacos_ativos),
+        [espaco.nome for espaco in espacos_ativos],
+    )
+    _registrar_conflitos_espaco_faq(config)
     faqs_selecionadas = _selecionar_faqs_relevantes(
         config=config,
         mensagem_cliente=mensagem_cliente,
@@ -3867,6 +4286,7 @@ def _mensagem_sistema(
         limite=5,
     )
     faqs_contexto = _contexto_faqs_relevantes(faqs_selecionadas)
+    faqs_espacos_contexto = _contexto_faqs_espacos(faqs_selecionadas)
     perfil_nome = str((perfil_cliente or {}).get("nome") or "").strip()
     perfil_prompt = str((perfil_cliente or {}).get("prompt_ia") or "").strip()
     instrucao_perfil = ""
@@ -3944,8 +4364,14 @@ def _mensagem_sistema(
             f"- Instrucoes de reserva: {config.regras_reservas_imediatas}\n"
             f"- Estacionamento: {config.estacionamento}\n"
             f"- Aniversarios: {config.aniversario}\n"
-            f"- Espacos ativos: {espacos_contexto or 'Nenhum espaco estruturado cadastrado.'}\n"
+            f"- Espacos ativos estruturados: {espacos_contexto}\n"
+            f"- Regras cadastradas em espacos.regras: {regras_espacos_contexto}\n"
+            f"- FAQs de espacos/preferencia selecionadas: {faqs_espacos_contexto}\n"
+            f"- Contexto da reserva para espacos: {contexto_reserva_espacos}\n"
             f"- FAQs relevantes para a mensagem atual: {faqs_contexto or 'Nenhuma FAQ especifica selecionada para esta mensagem.'}\n"
+            "Sobre espacos: use a tabela de espacos para fatos estruturados como nome, descricao, ativo, capacidade_maxima e permite_preferencia. "
+            "Use espacos.regras e FAQs de espacos como regras operacionais complementares. "
+            "Preferencia de local nao significa local confirmado. Nunca garanta espaco sem consulta real de disponibilidade. "
             "Se o cliente fizer uma pergunta normal sobre o restaurante, responda e retome o campo da reserva que faltava. "
             "Se o cliente perguntar como voce sabe uma informacao, explique que os dados foram cadastrados pela equipe no sistema. "
             "Nunca diga que um horario esta disponivel sem uma agenda real integrada; diga que atende dentro do funcionamento e vai verificar a solicitacao. "

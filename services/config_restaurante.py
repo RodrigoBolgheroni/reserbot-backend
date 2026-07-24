@@ -88,6 +88,7 @@ class EspacoRestaurante:
 
 @dataclass(frozen=True)
 class FaqConteudo:
+    id: str
     categoria: str
     titulo: str
     conteudo: str
@@ -429,6 +430,7 @@ def _mapear_faq_conteudos(valor: Any) -> list[FaqConteudo]:
     for item in _lista_dicts(valor):
         faqs.append(
             FaqConteudo(
+                id=_texto(item.get("id")),
                 categoria=_texto(item.get("categoria")),
                 titulo=_texto(item.get("titulo")),
                 conteudo=_texto(item.get("conteudo")),

@@ -96,7 +96,7 @@ def carregar_configuracao_bruta() -> ResultadoConfigBruta:
     faq_conteudos = _consultar_lista(
         TABELA_FAQ_CONTEUDOS,
         filtros={"estabelecimento_id": f"eq.{estabelecimento_id}", "ativo": "eq.true"},
-        colunas="categoria,titulo,conteudo,tags,ativo",
+        colunas="id,categoria,titulo,conteudo,tags,ativo",
         limite=200,
         order="categoria.asc,titulo.asc",
         erros_parciais=erros_parciais,

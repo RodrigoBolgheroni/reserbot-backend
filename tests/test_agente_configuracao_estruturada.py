@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import unittest
@@ -69,9 +70,19 @@ def _config_bruta_reserva() -> dict:
                 "regras": "Para 20 pessoas as 19h, Salao e Areia podem ser possiveis conforme disponibilidade.",
                 "ativo": True,
             },
+            {
+                "id": "espaco-varanda",
+                "nome": "Varanda",
+                "descricao": "Espaco inativo para teste.",
+                "capacidade_maxima": 10,
+                "permite_preferencia": True,
+                "regras": "Nao deve aparecer no contexto ativo.",
+                "ativo": False,
+            },
         ],
         "faq_conteudos": [
             {
+                "id": "faq-quadras",
                 "categoria": "esportes",
                 "titulo": "Locacao de quadras",
                 "conteudo": "Temos locacao de quadras para esportes e Day Use conforme programacao.",
@@ -79,6 +90,7 @@ def _config_bruta_reserva() -> dict:
                 "ativo": True,
             },
             {
+                "id": "faq-bolo",
                 "categoria": "aniversario",
                 "titulo": "Bolo e utensilios",
                 "conteudo": "Pode trazer bolo. Guardamos na geladeira ate o momento do parabens e recomendamos trazer pratos e garfos.",
@@ -86,6 +98,7 @@ def _config_bruta_reserva() -> dict:
                 "ativo": True,
             },
             {
+                "id": "faq-lista-aniversario",
                 "categoria": "aniversario",
                 "titulo": "Lista de aniversario",
                 "conteudo": "Nao trabalhamos com lista de aniversario.",
@@ -93,6 +106,7 @@ def _config_bruta_reserva() -> dict:
                 "ativo": True,
             },
             {
+                "id": "faq-entrada",
                 "categoria": "entrada",
                 "titulo": "Valores de entrada",
                 "conteudo": "Os valores de entrada variam por dia e condicao. Consulte a equipe para o valor atualizado.",
@@ -100,13 +114,19 @@ def _config_bruta_reserva() -> dict:
                 "ativo": True,
             },
             {
+                "id": "faq-preferencia-espacos",
                 "categoria": "espacos",
-                "titulo": "Regras dos espacos",
-                "conteudo": "Salao e areia dependem de disponibilidade; em horarios de 18h e 19h nao ha garantia de preferencia.",
-                "tags": ["salao", "areia", "preferencia", "local"],
+                "titulo": "Preferencia entre salao e areia",
+                "conteudo": (
+                    "O cliente pode informar preferencia entre salao e areia. Aos sabados e domingos, "
+                    "grupos acima de 25 pessoas sao direcionados para a areia. Nas reservas das 18h e 19h, "
+                    "a preferencia de local nao e garantida e depende da disponibilidade."
+                ),
+                "tags": ["salao", "areia", "local", "preferencia", "reserva"],
                 "ativo": True,
             },
             {
+                "id": "faq-musica",
                 "categoria": "musica",
                 "titulo": "Programacao musical",
                 "conteudo": "A programacao musical muda conforme a agenda da casa.",
@@ -114,6 +134,7 @@ def _config_bruta_reserva() -> dict:
                 "ativo": True,
             },
             {
+                "id": "faq-gympass",
                 "categoria": "gympass",
                 "titulo": "Gympass",
                 "conteudo": "Informacoes sobre Gympass devem ser confirmadas com a equipe.",
@@ -123,6 +144,12 @@ def _config_bruta_reserva() -> dict:
         ],
         "erros_parciais": [],
     }
+
+
+def _config_bruta_custom(mutator) -> dict:
+    dados = copy.deepcopy(_config_bruta_reserva())
+    mutator(dados)
+    return dados
 
 
 def _payload_ia(texto: str) -> str:
@@ -264,8 +291,9 @@ class AgenteConfiguracaoEstruturadaTest(unittest.TestCase):
         self.assertIn("Quantidade minima", prompt)
         self.assertIn("Comprovante de Pix", prompt)
         self.assertIn("Salao", prompt)
-        self.assertIn("capacidade maxima 25", prompt)
+        self.assertIn('"capacidade_maxima":25', prompt)
         self.assertIn("Areia", prompt)
+        self.assertNotIn("Varanda", prompt)
         self.assertNotIn("pix-nao-deve-aparecer", prompt)
         self.assertIn("source=supabase", logs_texto)
         self.assertIn("estabelecimento_id=" + ESTABELECIMENTO_ID, logs_texto)
@@ -314,7 +342,7 @@ class AgenteConfiguracaoEstruturadaTest(unittest.TestCase):
                 "Locacao de quadras",
                 "Bolo e utensilios",
                 "Valores de entrada",
-                "Regras dos espacos",
+                "Preferencia entre salao e areia",
                 "Programacao musical",
                 "Gympass",
             )
@@ -652,7 +680,183 @@ class AgenteConfiguracaoEstruturadaTest(unittest.TestCase):
 
         self.assertIn("Salao", prompt)
         self.assertIn("Areia", prompt)
-        self.assertIn("Regras dos espacos", prompt)
+        self.assertIn("Preferencia entre salao e areia", prompt)
+
+    def test_contexto_espacos_usa_json_estruturado_e_apenas_ativos(self) -> None:
+        prompt = self._capturar_prompt("Quais espacos voces tem?")
+
+        self.assertIn('"espacos_ativos"', prompt)
+        self.assertIn('"nome":"Salao"', prompt)
+        self.assertIn('"descricao":"Area interna."', prompt)
+        self.assertIn('"nome":"Areia"', prompt)
+        self.assertIn('"descricao":"Area externa."', prompt)
+        self.assertNotIn("Varanda", prompt)
+
+    def test_capacidade_vem_de_capacidade_maxima_e_reflete_alteracao_da_configuracao(self) -> None:
+        def alterar_capacidade(dados: dict) -> None:
+            dados["espacos"][0]["capacidade_maxima"] = 30
+
+        capturado: dict[str, str] = {}
+
+        def chamar_groq_fake(*, mensagens: list[agente.Mensagem], modelo: str, response_format_json: bool) -> str:
+            capturado["prompt"] = mensagens[0]["content"]
+            return _payload_ia("O salao comporta ate 30 pessoas conforme o cadastro.")
+
+        with (
+            patch.object(
+                config_restaurante.repositorio,
+                "carregar_configuracao_bruta",
+                return_value=_config_bruta_custom(alterar_capacidade),
+            ),
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 23)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste"}, clear=False),
+            patch.object(agente, "_chamar_groq", side_effect=chamar_groq_fake),
+        ):
+            agente.processar_mensagem("5511993680823", "Quantas pessoas cabem no salao?", nome_cliente="Rodrigo")
+
+        self.assertIn('"capacidade_maxima":30', capturado["prompt"])
+        self.assertNotIn('"capacidade_maxima":25', capturado["prompt"])
+
+    def test_capacidade_null_nao_cria_numero_inventado_no_contexto(self) -> None:
+        prompt = self._capturar_prompt("Quantas pessoas cabem na areia?")
+
+        self.assertIn('"nome":"Areia"', prompt)
+        self.assertIn('"capacidade_maxima":null', prompt)
+
+    def test_prefiro_salao_registra_preferencia_sem_confirmar_espaco_e_preserva_resposta_da_ia(self) -> None:
+        telefone = "5511993680823"
+        agente._estados_reserva[telefone] = {
+            "data_reserva": "2030-02-28",
+            "horario": "18:00",
+            "pessoas": 14,
+            "nome_cliente": "Rodrigo",
+            "campo_pendente": "confirmacao",
+            "etapa": "aguardando_confirmacao",
+            "aguardando_confirmacao": True,
+        }
+        texto_ia = (
+            "Vou registrar o salao como preferencia. Como a reserva e as 18h, "
+            "o local nao e garantido e depende da disponibilidade."
+        )
+        payload = _payload_custom(
+            texto_ia,
+            intencao="pergunta_restaurante",
+            campo_sugerido="confirmacao",
+        )
+
+        with (
+            patch.object(config_restaurante.repositorio, "carregar_configuracao_bruta", return_value=_config_bruta_reserva()),
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 23)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste"}, clear=False),
+            patch.object(agente, "_chamar_groq", return_value=payload),
+            self.assertLogs("services.agente", level="INFO") as logs,
+        ):
+            resposta = agente.processar_mensagem(telefone, "Prefiro o salao.", nome_cliente="Rodrigo")
+
+        estado = agente._estados_reserva[telefone]
+        logs_texto = "\n".join(logs.output)
+        self.assertEqual(resposta["texto"], texto_ia)
+        self.assertEqual(estado["data_reserva"], "2030-02-28")
+        self.assertEqual(estado["horario"], "18:00")
+        self.assertEqual(estado["pessoas"], 14)
+        self.assertEqual(estado["preferencia_espaco_id"], "espaco-salao")
+        self.assertEqual(estado["preferencia_espaco_nome"], "Salao")
+        self.assertTrue(estado["preferencia_espaco_permitida"])
+        self.assertFalse(estado["espaco_confirmado"])
+        self.assertFalse(estado["local_garantido"])
+        self.assertFalse(estado["disponibilidade_espaco_consultada"])
+        self.assertIn("nesse horario nao e garantida", estado["motivo_local_nao_garantido"])
+        self.assertIn("espaco_identificado_na_mensagem", logs_texto)
+        self.assertIn("faqs_espacos_selecionadas", logs_texto)
+        self.assertIn("preferencia_espaco_solicitada", logs_texto)
+        self.assertIn("preferencia_espaco_permitida", logs_texto)
+        self.assertIn("regra_espaco_aplicada", logs_texto)
+        self.assertIn("regra_faq_aplicada", logs_texto)
+        self.assertIn("espaco_preferencia_registrada", logs_texto)
+
+    def test_preferencia_nao_permitida_nao_registra_preferencia(self) -> None:
+        telefone = "5511993680823"
+        agente._estados_reserva[telefone] = {
+            "data_reserva": "2030-02-28",
+            "horario": "18:00",
+            "pessoas": 14,
+            "nome_cliente": "Rodrigo",
+            "campo_pendente": "confirmacao",
+            "etapa": "aguardando_confirmacao",
+            "aguardando_confirmacao": True,
+        }
+
+        def bloquear_preferencia(dados: dict) -> None:
+            dados["espacos"][0]["permite_preferencia"] = False
+
+        payload = _payload_custom(
+            "Esse espaco nao pode ser escolhido como preferencia no momento.",
+            intencao="pergunta_restaurante",
+            campo_sugerido="confirmacao",
+        )
+
+        with (
+            patch.object(
+                config_restaurante.repositorio,
+                "carregar_configuracao_bruta",
+                return_value=_config_bruta_custom(bloquear_preferencia),
+            ),
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 23)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste"}, clear=False),
+            patch.object(agente, "_chamar_groq", return_value=payload),
+            self.assertLogs("services.agente", level="WARNING") as logs,
+        ):
+            agente.processar_mensagem(telefone, "Prefiro o salao.", nome_cliente="Rodrigo")
+
+        estado = agente._estados_reserva[telefone]
+        logs_texto = "\n".join(logs.output)
+        self.assertNotIn("preferencia_espaco_id", estado)
+        self.assertFalse(estado["preferencia_espaco_permitida"])
+        self.assertFalse(estado["espaco_confirmado"])
+        self.assertIn("preferencia_espaco_nao_permitida", logs_texto)
+        self.assertIn("espaco_confirmacao_bloqueada", logs_texto)
+
+    def test_regras_de_espaco_e_faqs_sao_enviadas_separadamente(self) -> None:
+        prompt = self._capturar_prompt("As 18h consigo ficar no salao?")
+
+        self.assertIn('"regras_espaco"', prompt)
+        self.assertIn('"origem":"espacos.regras"', prompt)
+        self.assertIn('"faqs_espacos_relevantes"', prompt)
+        self.assertIn('"origem":"faq_conteudos"', prompt)
+        self.assertIn("Preferencia entre salao e areia", prompt)
+
+    def test_sabado_acima_do_limite_da_faq_aplica_regra_operacional_sem_usar_capacidade_fixa(self) -> None:
+        telefone = "5511993680823"
+        agente._estados_reserva[telefone] = {
+            "data_reserva": "2026-07-25",
+            "horario": "19:00",
+            "pessoas": 26,
+            "nome_cliente": "Rodrigo",
+            "campo_pendente": "confirmacao",
+            "etapa": "aguardando_confirmacao",
+            "aguardando_confirmacao": True,
+        }
+        payload = _payload_custom(
+            "Posso registrar o salao como preferencia, mas no fim de semana grupos acima de 25 pessoas seguem a regra cadastrada.",
+            intencao="pergunta_restaurante",
+            campo_sugerido="confirmacao",
+        )
+
+        with (
+            patch.object(config_restaurante.repositorio, "carregar_configuracao_bruta", return_value=_config_bruta_reserva()),
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 23)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste"}, clear=False),
+            patch.object(agente, "_chamar_groq", return_value=payload),
+            self.assertLogs("services.agente", level="INFO") as logs,
+        ):
+            agente.processar_mensagem(telefone, "Prefiro o salao.", nome_cliente="Rodrigo")
+
+        estado = agente._estados_reserva[telefone]
+        logs_texto = "\n".join(logs.output)
+        self.assertIn("acima de 25 pessoas", estado["motivo_local_nao_garantido"])
+        self.assertFalse(estado["espaco_confirmado"])
+        self.assertFalse(estado["local_garantido"])
+        self.assertIn("regra_faq_aplicada", logs_texto)
 
 
 if __name__ == "__main__":
