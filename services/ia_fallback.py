@@ -18,6 +18,7 @@ from services import supabase
 logger = logging.getLogger(__name__)
 
 MODELO_GROQ_PADRAO: Final[str] = "llama-3.3-70b-versatile"
+MODELOS_GPT_OSS: Final[set[str]] = {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}
 TABELA_STATUS_IA: Final[str] = "ai_provider_status"
 MENSAGEM_HANDOFF_IA: Final[str] = (
     "Estou com uma instabilidade no atendimento automatico. "
@@ -31,6 +32,45 @@ INSTRUCAO_JSON_TOLERANTE: Final[str] = (
     '"dados_confirmados":{},"dados_mencionados":{},"acao":"responder",'
     '"deve_avancar_estado":false}.'
 )
+SCHEMA_RESERVA_BOT_RESPONSE: Final[dict[str, Any]] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "resposta",
+        "intencao",
+        "dados_confirmados",
+        "dados_mencionados",
+        "acao",
+        "deve_avancar_estado",
+    ],
+    "properties": {
+        "resposta": {"type": "string"},
+        "intencao": {"type": "string"},
+        "dados_confirmados": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["data", "horario", "quantidade", "nome"],
+            "properties": {
+                "data": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "horario": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "quantidade": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                "nome": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            },
+        },
+        "dados_mencionados": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["data", "horario", "quantidade"],
+            "properties": {
+                "data": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "horario": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "quantidade": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+            },
+        },
+        "acao": {"type": "string"},
+        "deve_avancar_estado": {"type": "boolean"},
+    },
+}
 
 _cooldown_lock = threading.RLock()
 _cooldowns_memoria: dict[tuple[str, str], dict[str, Any]] = {}
@@ -50,6 +90,18 @@ class ResultadoIA(TypedDict, total=False):
     encaminhar_humano: bool
     erro_codigo: str
     erro: str
+
+
+class CompletionExhaustedDuringReasoning(RuntimeError):
+    pass
+
+
+class ContentEmpty(RuntimeError):
+    pass
+
+
+class JsonRepairFailed(RuntimeError):
+    pass
 
 
 def tem_provedor_configurado() -> bool:
@@ -121,7 +173,17 @@ def executar_ia_com_fallback(
                     conversa_id or "",
                 )
                 continue
-            if codigo in {"connection", "timeout", "server_error", "response_format", "bad_request", "json_validate_failed"}:
+            if codigo in {
+                "connection",
+                "timeout",
+                "server_error",
+                "response_format",
+                "bad_request",
+                "json_validate_failed",
+                "completion_exhausted_during_reasoning",
+                "content_empty",
+                "json_repair_failed",
+            }:
                 logger.warning(
                     "ai_%s_failed provider=groq model=%s erro_codigo=%s telefone=%s conversa_id=%s",
                     papel,
@@ -235,13 +297,23 @@ def _executar_groq_modelo(
     )
 
     try:
-        resposta = _criar_completion_groq(client, kwargs)
+        return _executar_completion_groq_final(
+            client,
+            kwargs,
+            modelo=modelo,
+            retry_completion_exhausted=_modelo_gpt_oss(modelo),
+        )
     except TypeError:
         if not response_format_json:
             raise
         logger.warning("Groq SDK nao aceitou response_format JSON. Repetindo sem response_format.")
         kwargs.pop("response_format", None)
-        resposta = _criar_completion_groq(client, kwargs)
+        return _executar_completion_groq_final(
+            client,
+            kwargs,
+            modelo=modelo,
+            retry_completion_exhausted=_modelo_gpt_oss(modelo),
+        )
     except Exception as exc:
         if response_format_json and _erro_json_validate_failed(exc):
             logger.warning(
@@ -261,14 +333,14 @@ def _executar_groq_modelo(
                 modelo,
                 codigo,
             )
-            resposta = _criar_completion_groq(client, kwargs)
+            return _executar_completion_groq_final(
+                client,
+                kwargs,
+                modelo=modelo,
+                retry_completion_exhausted=_modelo_gpt_oss(modelo),
+            )
         else:
             raise
-
-    conteudo = resposta.choices[0].message.content
-    if not conteudo:
-        raise RuntimeError("Groq retornou resposta vazia.")
-    return str(conteudo).strip()
 
 
 def _kwargs_chat_groq(
@@ -277,16 +349,83 @@ def _kwargs_chat_groq(
     modelo: str,
     response_format_json: bool,
     temperature: float,
+    max_completion_tokens: int | None = None,
 ) -> dict[str, Any]:
+    modelo_nome = modelo.strip() or MODELO_GROQ_PADRAO
+    modelo_gpt_oss = _modelo_gpt_oss(modelo_nome)
     kwargs: dict[str, Any] = {
-        "model": modelo.strip() or MODELO_GROQ_PADRAO,
+        "model": modelo_nome,
         "messages": [dict(mensagem) for mensagem in mensagens],
         "temperature": temperature,
-        "max_tokens": 500,
     }
+    if modelo_gpt_oss:
+        kwargs["reasoning_effort"] = "low"
+        kwargs["reasoning_format"] = "hidden"
+        kwargs["max_completion_tokens"] = max(max_completion_tokens or 2048, 2048)
+    else:
+        kwargs["max_tokens"] = 500
     if response_format_json:
-        kwargs["response_format"] = {"type": "json_object"}
+        kwargs["response_format"] = _response_format_groq(modelo_nome)
     return kwargs
+
+
+def _modelo_gpt_oss(modelo: str) -> bool:
+    return str(modelo or "").strip().lower() in MODELOS_GPT_OSS
+
+
+def _response_format_groq(modelo: str) -> dict[str, Any]:
+    if _modelo_gpt_oss(modelo):
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "reserva_bot_response",
+                "strict": True,
+                "schema": SCHEMA_RESERVA_BOT_RESPONSE,
+            },
+        }
+    return {"type": "json_object"}
+
+
+def _executar_completion_groq_final(
+    client: Any,
+    kwargs: Mapping[str, Any],
+    *,
+    modelo: str,
+    retry_completion_exhausted: bool,
+) -> str:
+    kwargs_execucao = dict(kwargs)
+    ja_repetiu_length = False
+    while True:
+        resposta = _criar_completion_groq(client, kwargs_execucao)
+        conteudo, diagnostico = _extrair_conteudo_completion(resposta)
+        _log_diagnostico_completion(modelo, kwargs_execucao, conteudo, diagnostico)
+        if conteudo:
+            return conteudo
+
+        if _completion_exhausted_during_reasoning(modelo, diagnostico):
+            if retry_completion_exhausted and not ja_repetiu_length and _max_completion_tokens_kwargs(kwargs_execucao) < 4096:
+                ja_repetiu_length = True
+                kwargs_execucao = {**kwargs_execucao, "max_completion_tokens": 4096}
+                logger.warning(
+                    "ai_groq_completion_exhausted_retry_started provider=groq model=%s codigo=completion_exhausted_during_reasoning max_completion_tokens=4096",
+                    modelo,
+                )
+                continue
+            logger.warning(
+                "ai_groq_completion_exhausted_during_reasoning provider=groq model=%s finish_reason=%s reasoning_tokens=%s",
+                modelo,
+                diagnostico.get("finish_reason", ""),
+                diagnostico.get("reasoning_tokens", ""),
+            )
+            raise CompletionExhaustedDuringReasoning("completion_exhausted_during_reasoning")
+
+        logger.warning(
+            "ai_groq_content_empty provider=groq model=%s finish_reason=%s has_reasoning=%s",
+            modelo,
+            diagnostico.get("finish_reason", ""),
+            bool(diagnostico.get("has_reasoning")),
+        )
+        raise ContentEmpty("content_empty")
 
 
 def _criar_completion_groq(client: Any, kwargs: Mapping[str, Any]) -> Any:
@@ -315,22 +454,19 @@ def _executar_groq_sem_json_mode_tolerante(
         response_format_json=False,
         temperature=0.0,
     )
-    resposta = _criar_completion_groq(client, kwargs)
-    conteudo, diagnostico = _extrair_conteudo_completion(resposta)
-    _log_diagnostico_conteudo_retry(modelo, conteudo, diagnostico)
-    if not conteudo:
-        logger.warning(
-            "ai_fallback_json_repair_failed provider=groq model=%s motivo=conteudo_vazio",
-            modelo,
-        )
-        raise RuntimeError("json_repair_failed")
+    conteudo = _executar_completion_groq_final(
+        client,
+        kwargs,
+        modelo=modelo,
+        retry_completion_exhausted=_modelo_gpt_oss(modelo),
+    )
     payload = extrair_json_resposta(conteudo)
     if payload is None:
         logger.warning(
             "ai_fallback_json_repair_failed provider=groq model=%s",
             modelo,
         )
-        raise RuntimeError("json_repair_failed")
+        raise JsonRepairFailed("json_repair_failed")
     if not _json_texto_completo_valido(conteudo):
         logger.info(
             "ai_fallback_json_repair_success provider=groq model=%s",
@@ -356,6 +492,8 @@ def _mensagens_json_tolerante(mensagens: Sequence[Mapping[str, str]]) -> list[di
 def _extrair_conteudo_completion(resposta: Any) -> tuple[str, dict[str, Any]]:
     choice = _primeira_choice(resposta)
     message = _campo_objeto(choice, "message") if choice is not None else None
+    usage = _campo_objeto(resposta, "usage")
+    completion_tokens_details = _campo_objeto(usage, "completion_tokens_details")
     candidatos = [
         _campo_objeto(message, "content"),
         _campo_objeto(resposta, "output_text"),
@@ -370,6 +508,9 @@ def _extrair_conteudo_completion(resposta: Any) -> tuple[str, dict[str, Any]]:
             break
     diagnostico = {
         "finish_reason": _campo_objeto(choice, "finish_reason") if choice is not None else "",
+        "completion_tokens": _campo_objeto(usage, "completion_tokens"),
+        "reasoning_tokens": _campo_objeto(completion_tokens_details, "reasoning_tokens")
+        or _campo_objeto(usage, "reasoning_tokens"),
         "has_message_content": bool(_texto_candidato_completion(_campo_objeto(message, "content"))),
         "has_output_text": bool(_texto_candidato_completion(_campo_objeto(resposta, "output_text")))
         or bool(_texto_candidato_completion(_campo_objeto(message, "output_text"))),
@@ -430,6 +571,53 @@ def _log_diagnostico_conteudo_retry(modelo: str, conteudo: str, diagnostico: Map
         bool(diagnostico.get("has_output_text")),
         bool(diagnostico.get("has_reasoning")),
     )
+
+
+def _log_diagnostico_completion(
+    modelo: str,
+    kwargs: Mapping[str, Any],
+    conteudo: str,
+    diagnostico: Mapping[str, Any],
+) -> None:
+    logger.info(
+        "ai_groq_completion_diagnostic provider=groq model=%s reasoning_effort=%s reasoning_format=%s "
+        "max_completion_tokens=%s response_format=%s finish_reason=%s completion_tokens=%s reasoning_tokens=%s content_length=%s",
+        modelo,
+        kwargs.get("reasoning_effort", ""),
+        kwargs.get("reasoning_format", ""),
+        kwargs.get("max_completion_tokens", kwargs.get("max_tokens", "")),
+        _response_format_log(kwargs.get("response_format")),
+        diagnostico.get("finish_reason", ""),
+        diagnostico.get("completion_tokens", ""),
+        diagnostico.get("reasoning_tokens", ""),
+        len(conteudo),
+    )
+
+
+def _response_format_log(response_format: Any) -> str:
+    if not response_format:
+        return "none"
+    if isinstance(response_format, Mapping):
+        tipo = str(response_format.get("type") or "")
+        if tipo == "json_schema":
+            schema = response_format.get("json_schema")
+            nome = schema.get("name") if isinstance(schema, Mapping) else ""
+            return f"json_schema:{nome or 'unnamed'}"
+        return tipo or "mapping"
+    return str(type(response_format).__name__)
+
+
+def _completion_exhausted_during_reasoning(modelo: str, diagnostico: Mapping[str, Any]) -> bool:
+    finish_reason = str(diagnostico.get("finish_reason") or "").strip().lower()
+    return finish_reason == "length" and (_modelo_gpt_oss(modelo) or bool(diagnostico.get("has_reasoning")))
+
+
+def _max_completion_tokens_kwargs(kwargs: Mapping[str, Any]) -> int:
+    valor = kwargs.get("max_completion_tokens") or kwargs.get("max_tokens") or 0
+    try:
+        return int(valor)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _executar_provider_alternativo(
@@ -577,6 +765,12 @@ def _classificar_erro_ia(exc: Exception) -> str:
     nome = exc.__class__.__name__
     status = _status_code(exc)
     texto = str(exc).lower()
+    if isinstance(exc, CompletionExhaustedDuringReasoning) or "completion_exhausted_during_reasoning" in texto:
+        return "completion_exhausted_during_reasoning"
+    if isinstance(exc, ContentEmpty) or "content_empty" in texto:
+        return "content_empty"
+    if isinstance(exc, JsonRepairFailed) or "json_repair_failed" in texto:
+        return "json_repair_failed"
     if nome == "RateLimitError" or status == 429 or "rate_limit_exceeded" in texto:
         return "rate_limit"
     if _erro_json_validate_failed(exc):

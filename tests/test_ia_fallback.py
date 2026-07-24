@@ -32,8 +32,25 @@ class BadRequestPermanente(Exception):
     status_code = 400
 
 
-def resposta_chat(conteudo: str):
-    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=conteudo))])
+def resposta_chat(
+    conteudo: str,
+    *,
+    finish_reason: str = "stop",
+    reasoning: str = "",
+    output_text: str = "",
+    completion_tokens: int = 12,
+    reasoning_tokens: int = 0,
+):
+    message = SimpleNamespace(content=conteudo)
+    if reasoning:
+        message.reasoning = reasoning
+    if output_text:
+        message.output_text = output_text
+    usage = SimpleNamespace(
+        completion_tokens=completion_tokens,
+        completion_tokens_details=SimpleNamespace(reasoning_tokens=reasoning_tokens),
+    )
+    return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason=finish_reason)], usage=usage)
 
 
 class IaFallbackTest(unittest.TestCase):
@@ -165,6 +182,140 @@ class IaFallbackTest(unittest.TestCase):
         fallback_kwargs = criar.call_args_list[1].args[1]
         self.assertIn("response_format", fallback_kwargs)
         self.assertEqual(fallback_kwargs["temperature"], 0.4)
+
+    def test_gpt_oss_usa_reasoning_hidden_schema_strict_e_tokens_maiores(self) -> None:
+        resposta_schema = resposta_chat(
+            json.dumps(
+                {
+                    "resposta": "Tudo certo",
+                    "intencao": "comentario",
+                    "dados_confirmados": {"data": None, "horario": None, "quantidade": None, "nome": None},
+                    "dados_mencionados": {"data": None, "horario": None, "quantidade": None},
+                    "acao": "responder",
+                    "deve_avancar_estado": False,
+                }
+            )
+        )
+        with (
+            patch.dict(os.environ, self._env(GROQ_PRIMARY_MODEL="openai/gpt-oss-20b"), clear=True),
+            self._sem_cooldown_supabase(),
+            patch.object(ia_fallback, "_criar_cliente_groq", return_value=object()),
+            patch.object(ia_fallback, "_criar_completion_groq", return_value=resposta_schema) as criar,
+        ):
+            resultado = ia_fallback.executar_ia_com_fallback(
+                [{"role": "system", "content": "Sistema"}, {"role": "user", "content": "oi"}],
+                response_format_json=True,
+            )
+
+        self.assertTrue(resultado["ok"])
+        kwargs = criar.call_args.args[1]
+        self.assertEqual(kwargs["reasoning_effort"], "low")
+        self.assertEqual(kwargs["reasoning_format"], "hidden")
+        self.assertNotIn("include_reasoning", kwargs)
+        self.assertNotIn("max_tokens", kwargs)
+        self.assertGreaterEqual(kwargs["max_completion_tokens"], 2048)
+        self.assertEqual(kwargs["response_format"]["type"], "json_schema")
+        schema_payload = kwargs["response_format"]["json_schema"]
+        self.assertTrue(schema_payload["strict"])
+        self.assertEqual(schema_payload["name"], "reserva_bot_response")
+        self.assertFalse(schema_payload["schema"]["additionalProperties"])
+        self.assertIn("dados_confirmados", schema_payload["schema"]["required"])
+        self.assertFalse(schema_payload["schema"]["properties"]["dados_confirmados"]["additionalProperties"])
+
+    def test_gpt_oss_finish_length_repete_uma_vez_com_4096_e_usa_content_final(self) -> None:
+        primeiro = resposta_chat(
+            "",
+            finish_reason="length",
+            reasoning="raciocinio interno nao deve sair",
+            completion_tokens=2048,
+            reasoning_tokens=2048,
+        )
+        segundo = resposta_chat(
+            '{"resposta":"Agora sim","intencao":"comentario","acao":"responder"}',
+            finish_reason="stop",
+            reasoning="outro raciocinio interno",
+            completion_tokens=42,
+            reasoning_tokens=8,
+        )
+        with (
+            patch.dict(os.environ, self._env(GROQ_PRIMARY_MODEL="openai/gpt-oss-20b"), clear=True),
+            self._sem_cooldown_supabase(),
+            patch.object(ia_fallback, "_criar_cliente_groq", return_value=object()),
+            patch.object(ia_fallback, "_criar_completion_groq", side_effect=[primeiro, segundo]) as criar,
+        ):
+            resultado = ia_fallback.executar_ia_com_fallback(
+                [{"role": "system", "content": "Sistema"}, {"role": "user", "content": "oi"}],
+                response_format_json=True,
+            )
+
+        self.assertTrue(resultado["ok"])
+        self.assertEqual(criar.call_count, 2)
+        self.assertEqual(criar.call_args_list[0].args[1]["max_completion_tokens"], 2048)
+        self.assertEqual(criar.call_args_list[1].args[1]["max_completion_tokens"], 4096)
+        self.assertIn("Agora sim", str(resultado["conteudo"]))
+        self.assertNotIn("raciocinio interno", str(resultado["conteudo"]))
+
+    def test_gpt_oss_content_vazio_length_nao_tenta_reparo_json(self) -> None:
+        vazio = resposta_chat(
+            "",
+            finish_reason="length",
+            reasoning="raciocinio interno",
+            completion_tokens=2048,
+            reasoning_tokens=2048,
+        )
+        with (
+            self.assertLogs("services.ia_fallback", level="WARNING") as logs,
+            patch.dict(os.environ, self._env(GROQ_PRIMARY_MODEL="openai/gpt-oss-20b"), clear=True),
+            self._sem_cooldown_supabase(),
+            patch.object(ia_fallback, "_criar_cliente_groq", return_value=object()),
+            patch.object(ia_fallback, "_criar_completion_groq", side_effect=[vazio, vazio]) as criar,
+        ):
+            resultado = ia_fallback.executar_ia_com_fallback(
+                [{"role": "system", "content": "Sistema"}, {"role": "user", "content": "oi"}],
+                response_format_json=True,
+            )
+
+        self.assertFalse(resultado["ok"])
+        self.assertTrue(resultado["encaminhar_humano"])
+        self.assertEqual(criar.call_count, 2)
+        texto_logs = "\n".join(logs.output)
+        self.assertIn("completion_exhausted_during_reasoning", texto_logs)
+        self.assertNotIn("json_repair_failed", texto_logs)
+
+    def test_gpt_oss_duas_falhas_seguem_para_provider_alternativo(self) -> None:
+        vazio = resposta_chat(
+            "",
+            finish_reason="length",
+            reasoning="raciocinio interno",
+            completion_tokens=2048,
+            reasoning_tokens=2048,
+        )
+        with (
+            patch.dict(
+                os.environ,
+                self._env(
+                    GROQ_PRIMARY_MODEL="openai/gpt-oss-20b",
+                    AI_FALLBACK_PROVIDER="openai",
+                    AI_FALLBACK_API_KEY="fallback-key",
+                    AI_FALLBACK_MODEL="modelo-alt",
+                ),
+                clear=True,
+            ),
+            self._sem_cooldown_supabase(),
+            patch.object(ia_fallback, "_criar_cliente_groq", return_value=object()),
+            patch.object(ia_fallback, "_criar_completion_groq", side_effect=[vazio, vazio]) as criar,
+            patch.object(ia_fallback, "_executar_fallback_provider", return_value='{"resposta":"provider"}') as provider,
+        ):
+            resultado = ia_fallback.executar_ia_com_fallback(
+                [{"role": "system", "content": "Sistema"}, {"role": "user", "content": "oi"}],
+                response_format_json=True,
+            )
+
+        self.assertTrue(resultado["ok"])
+        self.assertEqual(resultado["provider"], "openai")
+        self.assertEqual(resultado["model"], "modelo-alt")
+        self.assertEqual(criar.call_count, 2)
+        provider.assert_called_once()
 
     def test_modelo_em_cooldown_nao_e_chamado_novamente(self) -> None:
         agora = datetime(2026, 7, 23, 12, 0, tzinfo=timezone.utc)
