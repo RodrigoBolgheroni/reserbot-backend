@@ -64,11 +64,15 @@ def iniciar_conversa(
 ) -> Conversa:
     agora = _agora()
     telefone = str(cliente.get("telefone") or "").strip()
+    status_conversa = status if status in STATUS_CONVERSA_PERMITIDOS else "bot_ativo"
+    if telefone and status_conversa in STATUS_BOT_ATIVO:
+        _finalizar_conversas_ativas_por_telefone(telefone, motivo="nova_conversa_bot")
+        agente.limpar_historico(telefone)
     perfil_cliente = _resolver_perfil_seguro(cliente)
     conversa: Conversa = {
         "cliente_id": str(cliente.get("id") or ""),
         "cliente_telefone": telefone,
-        "status": status if status in STATUS_CONVERSA_PERMITIDOS else "bot_ativo",
+        "status": status_conversa,
         "data_inicio": agora,
         "origem": origem,
         "metadata": {
@@ -840,6 +844,26 @@ def finalizar_conversa(conversa: Mapping[str, Any], *, status: str = "finalizada
         logger.warning("Nao foi possivel finalizar conversa %s: %s", conversa_id, resultado.get("erro"))
 
 
+def _finalizar_conversas_ativas_por_telefone(telefone: str, *, motivo: str) -> None:
+    telefone_limpo = str(telefone or "").strip()
+    if not telefone_limpo:
+        return
+
+    resultado = supabase.atualizar(
+        _tabela_conversas(),
+        {"status": "finalizada", "data_fim": _agora()},
+        filtros={
+            "cliente_telefone": f"eq.{telefone_limpo}",
+            "status": f"in.({','.join(sorted(STATUS_BOT_ATIVO))})",
+        },
+        retornar=False,
+    )
+    if resultado.get("ok"):
+        logger.info("Conversas ativas anteriores finalizadas para telefone=%s motivo=%s.", telefone_limpo, motivo)
+    else:
+        logger.debug("Nenhuma conversa ativa anterior finalizada para telefone=%s: %s", telefone_limpo, resultado.get("erro"))
+
+
 def buscar_conversa_ativa_por_telefone(telefone: str) -> Conversa | None:
     return buscar_conversa_por_telefone(telefone, statuses=STATUS_BOT_ATIVO)
 
@@ -857,6 +881,7 @@ def buscar_conversa_por_telefone(telefone: str, *, statuses: set[str] | None = N
         _tabela_conversas(),
         filtros=filtros,
         limite=25,
+        order="updated_at.desc,data_inicio.desc",
     )
     if not resultado.get("ok"):
         logger.debug("Sem conversa recuperada para %s: %s", telefone_limpo, resultado.get("erro"))
@@ -878,7 +903,11 @@ def buscar_conversa_por_telefone(telefone: str, *, statuses: set[str] | None = N
             sorted(statuses),
         )
 
-    return dict(max(conversas, key=lambda item: str(item.get("data_inicio") or "")))
+    return dict(max(conversas, key=_chave_ordenacao_conversa))
+
+
+def _chave_ordenacao_conversa(conversa: Mapping[str, Any]) -> str:
+    return str(conversa.get("updated_at") or conversa.get("data_inicio") or conversa.get("created_at") or "")
 
 
 def atualizar_status_conversa(conversa: Mapping[str, Any], *, status: str) -> None:

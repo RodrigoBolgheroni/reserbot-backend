@@ -905,6 +905,36 @@ class AgenteIAOrquestradoraTest(unittest.TestCase):
         self.assertEqual(resposta["dados_reserva"]["horario"], "18:00")
         self.assertEqual(resposta["dados_reserva"]["pessoas"], 14)
 
+    def test_prefiro_salao_nao_pausa_por_pedido_humano_falso_da_ia(self) -> None:
+        telefone = "5511990010042"
+        agente._estados_reserva[telefone] = {
+            "data_reserva": "2030-02-28",
+            "horario": "18:00",
+            "pessoas": 14,
+            "nome_cliente": "Rodrigo",
+            "campo_pendente": "confirmacao",
+            "etapa": "aguardando_confirmacao",
+            "aguardando_confirmacao": True,
+        }
+        payload = {
+            "resposta": "Entendido, prefere o salao. 28/02/2030, 18:00, 14 pessoas — confirma?",
+            "intencao": "pedido_humano",
+            "dados_confirmados": {"data": "2030-02-28", "horario": "18:00", "quantidade": 14, "nome": "Rodrigo"},
+            "dados_mencionados": {"data": "2030-02-28", "horario": "18:00", "quantidade": 14},
+            "correcoes": {},
+            "acao": "pedir_confirmacao",
+            "deve_avancar_estado": True,
+            "campo_sugerido": "confirmacao",
+            "confianca": 0.91,
+        }
+
+        resposta = self._processar(telefone, "prefiro o salao", payload)
+
+        self.assertEqual(resposta["texto"], payload["resposta"])
+        self.assertEqual(resposta["status_reserva"], "aguardando_confirmacao")
+        self.assertEqual(agente._estados_reserva[telefone]["horario"], "18:00")
+        self.assertTrue(agente._estados_reserva[telefone]["aguardando_confirmacao"])
+
 
 if __name__ == "__main__":
     unittest.main()

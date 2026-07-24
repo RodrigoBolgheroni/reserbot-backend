@@ -1033,7 +1033,11 @@ def aplicar_guardrails_reserva(
     ):
         intencao_conversacional = intencao_modelo
 
-    if intencao_modelo == "pedido_humano" or str(interpretacao.get("acao") or "") == "encaminhar_humano":
+    pediu_humano = _mensagem_pede_atendimento_humano(mensagem_cliente)
+    handoff_tecnico = _texto_ia_ou_fallback_tecnico(interpretacao) == _resposta_contingencia()
+    if (pediu_humano or handoff_tecnico) and (
+        intencao_modelo == "pedido_humano" or str(interpretacao.get("acao") or "") == "encaminhar_humano"
+    ):
         estado["aguardando_confirmacao"] = False
         estado["cliente_autorizou_confirmacao"] = False
         logger.info("Atendimento humano solicitado pela IA ou fallback tecnico. telefone=%s", telefone_limpo)
@@ -1041,6 +1045,13 @@ def aplicar_guardrails_reserva(
             estado=estado,
             interpretacao=interpretacao,
             status_reserva="aguardando_humano",
+        )
+    if intencao_modelo == "pedido_humano" or str(interpretacao.get("acao") or "") == "encaminhar_humano":
+        logger.info(
+            "Pedido de humano sugerido pela IA ignorado por falta de pedido explicito do cliente. telefone=%s intencao=%s acao=%s",
+            telefone_limpo,
+            intencao_modelo,
+            str(interpretacao.get("acao") or ""),
         )
 
     resposta_confirmacao = _resolver_mensagem_confirmacao_pendente(
@@ -3014,6 +3025,23 @@ def _intencao_conversacional(texto: str) -> str | None:
     if _eh_saudacao_simples(normalizado):
         return "saudacao"
     return None
+
+
+def _mensagem_pede_atendimento_humano(texto: str) -> bool:
+    normalizado = _normalizar_busca(texto)
+    if not normalizado:
+        return False
+    return bool(
+        re.search(
+            r"\b(atendente|humano|funcionario|funcionaria|equipe|pessoa|alguem)\b",
+            normalizado,
+        )
+        and re.search(
+            r"\b(falar|chamar|quero|preciso|pode|passa|transferir|atendimento|assumir|conversar)\b",
+            normalizado,
+        )
+        or re.search(r"\b(cancelar bot|nao quero bot|quero falar com alguem|falar com alguem|falar com funcionario)\b", normalizado)
+    )
 
 
 def _responder_intencao_conversacional(

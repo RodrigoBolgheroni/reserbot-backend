@@ -349,6 +349,64 @@ class FluxoCoexistenciaTest(unittest.TestCase):
         self.assertEqual(resultado["status"], "humano")
         atualizar.assert_called_once_with(buscar.return_value, status="humano")
 
+    @patch.object(fluxo_reservas.supabase, "atualizar")
+    @patch.object(fluxo_reservas.supabase, "inserir")
+    def test_iniciar_conversa_bot_ativo_finaliza_conversas_ativas_antigas(self, inserir, atualizar) -> None:
+        atualizar.return_value = {"ok": True}
+        inserir.return_value = {
+            "ok": True,
+            "data": [
+                {
+                    "id": "conv-nova",
+                    "cliente_telefone": "5511999999999",
+                    "status": "bot_ativo",
+                    "data_inicio": "2026-07-24T02:20:00+00:00",
+                }
+            ],
+        }
+        fluxo_reservas.agente._historicos["5511999999999"] = [{"role": "user", "content": "conversa antiga"}]
+
+        conversa = fluxo_reservas.iniciar_conversa(
+            {"id": "cliente-1", "telefone": "5511999999999", "nome": "Rodrigo"},
+            origem="aniversario",
+            status="bot_ativo",
+        )
+
+        self.assertEqual(conversa["id"], "conv-nova")
+        atualizar.assert_called_once()
+        self.assertEqual(atualizar.call_args.args[0], "conversas")
+        self.assertEqual(atualizar.call_args.args[1]["status"], "finalizada")
+        self.assertEqual(atualizar.call_args.kwargs["filtros"]["cliente_telefone"], "eq.5511999999999")
+        self.assertIn("bot_ativo", atualizar.call_args.kwargs["filtros"]["status"])
+        self.assertNotIn("5511999999999", fluxo_reservas.agente._historicos)
+
+    @patch.object(fluxo_reservas.supabase, "selecionar")
+    def test_buscar_conversa_ativa_usa_conversa_mais_recente(self, selecionar) -> None:
+        selecionar.return_value = {
+            "ok": True,
+            "data": [
+                {
+                    "id": "conv-antiga",
+                    "cliente_telefone": "5511999999999",
+                    "status": "bot_ativo",
+                    "data_inicio": "2026-07-24T01:00:00+00:00",
+                    "updated_at": "2026-07-24T01:10:00+00:00",
+                },
+                {
+                    "id": "conv-nova",
+                    "cliente_telefone": "5511999999999",
+                    "status": "bot_ativo",
+                    "data_inicio": "2026-07-24T02:00:00+00:00",
+                    "updated_at": "2026-07-24T02:10:00+00:00",
+                },
+            ],
+        }
+
+        conversa = fluxo_reservas.buscar_conversa_ativa_por_telefone("5511999999999")
+
+        self.assertEqual(conversa["id"], "conv-nova")
+        self.assertEqual(selecionar.call_args.kwargs["order"], "updated_at.desc,data_inicio.desc")
+
     @patch.object(fluxo_reservas, "_mensagem_ja_processada", return_value=False)
     @patch.object(fluxo_reservas, "registrar_mensagem")
     @patch.object(fluxo_reservas, "atualizar_status_conversa")
