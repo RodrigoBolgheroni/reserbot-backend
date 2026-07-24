@@ -872,6 +872,39 @@ class AgenteIAOrquestradoraTest(unittest.TestCase):
         self.assertFalse(agente._eh_pedido_imediato("pode confirmar agora"))
         self.assertTrue(agente._eh_pedido_imediato("quero reservar agora"))
 
+    def test_pode_seguir_confirma_reserva_pendente(self) -> None:
+        telefone = "5511990010041"
+        agente._estados_reserva[telefone] = {
+            "data_reserva": "2030-02-28",
+            "data_reserva_original": "28 de fevereiro de 2030",
+            "horario": "18:00",
+            "pessoas": 14,
+            "nome_cliente": "Rodrigo",
+            "preferencia_local": "Salao",
+            "campo_pendente": "confirmacao",
+            "etapa": "aguardando_confirmacao",
+            "aguardando_confirmacao": True,
+        }
+        payload = {
+            "resposta": "28 de fevereiro de 2030 as 18h, 14 pessoas, preferencia pelo salao. Confirma?",
+            "intencao": "pedir_confirmacao",
+            "dados_confirmados": {},
+            "dados_mencionados": {},
+            "correcoes": {},
+            "acao": "pedir_confirmacao",
+            "deve_avancar_estado": True,
+            "campo_sugerido": "confirmacao",
+            "confianca": 0.91,
+        }
+
+        resposta = self._processar(telefone, "pode seguir", payload)
+
+        self.assertTrue(resposta["reserva_confirmada"])
+        self.assertEqual(resposta["status_reserva"], "confirmada")
+        self.assertEqual(resposta["dados_reserva"]["data_reserva"], "2030-02-28")
+        self.assertEqual(resposta["dados_reserva"]["horario"], "18:00")
+        self.assertEqual(resposta["dados_reserva"]["pessoas"], 14)
+
 
 if __name__ == "__main__":
     unittest.main()

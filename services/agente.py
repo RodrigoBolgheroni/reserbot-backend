@@ -2879,10 +2879,13 @@ def _eh_confirmacao_cliente(texto: str) -> bool:
     normalizado = _normalizar_busca(texto)
     return bool(
         re.fullmatch(
-            r"(sim|s|confirmo|confirmado|pode confirmar|agora pode confirmar|confirma|pode fechar|tudo certo|sim confirma|sim pode confirmar|isso|isso mesmo|ok|fechado|beleza|perfeito)",
+            r"(sim|s|confirmo|confirmado|pode confirmar|agora pode confirmar|confirma|pode fechar|pode seguir|pode continuar|pode dar andamento|segue|seguir|tudo certo|sim confirma|sim pode confirmar|isso|isso mesmo|ok|fechado|beleza|perfeito)",
             normalizado,
         )
-        or re.search(r"\b(pode confirmar|agora pode confirmar|confirmo|confirma|pode fechar|tudo certo|esta certo|ta certo|fechado)\b", normalizado)
+        or re.search(
+            r"\b(pode confirmar|agora pode confirmar|confirmo|confirma|pode fechar|pode seguir|pode continuar|pode dar andamento|segue com|tudo certo|esta certo|ta certo|fechado)\b",
+            normalizado,
+        )
     )
 
 
@@ -3211,6 +3214,8 @@ def _categoria_pergunta_restaurante(texto: str) -> str | None:
         return "taxa_reserva"
     if re.search(r"\b(pagamento|pagar|pix|cartao|debito|credito|dinheiro|voucher|vale refeicao)\b", normalizado):
         return "pagamento"
+    if re.search(r"\b(bolo|decoracao|decorar|parabens)\b", normalizado):
+        return "bolo"
     if re.search(r"\b(aniversario|bolo|decoracao|decorar|parabens|comemorar)\b", normalizado):
         return "aniversario"
     if re.search(r"\b(quantas pessoas|maximo|maxima|limite|grupo grande|muita gente)\b", normalizado):
@@ -3768,7 +3773,9 @@ def _singular_simples(token: str) -> str:
 def _sinonimos_faq(tokens: set[str]) -> set[str]:
     grupos = [
         {"quadra", "quadras", "locacao", "locar", "alugar", "aluguel", "esporte", "esportes", "volei", "futebol", "beach", "day", "use"},
-        {"bolo", "decoracao", "decorar", "aniversario", "utensilios", "lista"},
+        {"bolo", "decoracao", "decorar", "utensilios", "garfos", "pratos", "geladeira", "parabens"},
+        {"aniversario", "comemorar"},
+        {"lista"},
         {"entrada", "entrar", "valor", "valores", "preco", "precos", "custa", "crianca", "criancas"},
         {"gympass"},
         {"salao", "areia", "espaco", "espacos", "local", "preferencia"},
@@ -3791,6 +3798,13 @@ def _pontuar_faq(faq: config_restaurante.FaqConteudo, tokens_consulta: set[str])
     score += 5 * len(tokens_consulta & tokens_tags)
     score += 4 * len(tokens_consulta & tokens_categoria)
     score += len(tokens_consulta & tokens_conteudo)
+    tokens_bolo = {"bolo", "decoracao", "decorar", "utensilios", "garfos", "pratos", "geladeira", "parabens"}
+    if tokens_consulta & tokens_bolo:
+        tokens_faq_resumo = tokens_titulo | tokens_tags | tokens_categoria
+        if tokens_faq_resumo & tokens_bolo:
+            score += 20
+        if "lista" in tokens_faq_resumo and "lista" not in tokens_consulta:
+            score -= 12
     return score
 
 

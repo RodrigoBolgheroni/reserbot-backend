@@ -81,8 +81,15 @@ def _config_bruta_reserva() -> dict:
             {
                 "categoria": "aniversario",
                 "titulo": "Bolo e utensilios",
-                "conteudo": "Pode levar bolo, mas utensilios e detalhes precisam ser combinados com a equipe.",
-                "tags": ["bolo", "aniversario", "decoracao"],
+                "conteudo": "Pode trazer bolo. Guardamos na geladeira ate o momento do parabens e recomendamos trazer pratos e garfos.",
+                "tags": ["bolo", "decoracao", "garfos", "pratos", "geladeira"],
+                "ativo": True,
+            },
+            {
+                "categoria": "aniversario",
+                "titulo": "Lista de aniversario",
+                "conteudo": "Nao trabalhamos com lista de aniversario.",
+                "tags": ["lista", "aniversario"],
                 "ativo": True,
             },
             {
@@ -280,7 +287,17 @@ class AgenteConfiguracaoEstruturadaTest(unittest.TestCase):
         prompt = self._capturar_prompt("Pode levar bolo?")
 
         self.assertIn("Bolo e utensilios", prompt)
+        self.assertIn("Pode trazer bolo", prompt)
+        self.assertIn("Guardamos na geladeira", prompt)
+        self.assertNotIn("Lista de aniversario", prompt)
         self.assertNotIn("Locacao de quadras", prompt)
+
+    def test_pergunta_bolo_nao_confunde_com_lista_de_aniversario(self) -> None:
+        prompt = self._capturar_prompt("Quanto custa a reserva? E posso levar bolo?")
+
+        self.assertIn("Bolo e utensilios", prompt)
+        self.assertIn("Pode trazer bolo", prompt)
+        self.assertNotIn("Nao trabalhamos com lista de aniversario", prompt)
 
     def test_pergunta_entrada_seleciona_faq_de_entrada(self) -> None:
         prompt = self._capturar_prompt("Quanto custa para entrar domingo?")
