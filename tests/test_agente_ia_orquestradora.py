@@ -626,6 +626,106 @@ class AgenteIAOrquestradoraTest(unittest.TestCase):
             self.assertEqual(agente._extrair_data("talvez 30/07", permitir_dia_isolado=True), "2026-07-30")
             self.assertEqual(agente._extrair_data("dia 30", permitir_dia_isolado=True), "2026-07-30")
 
+    def test_parser_data_aceita_mes_extenso_iso_e_rejeita_data_impossivel(self) -> None:
+        with patch.object(agente, "_hoje", return_value=date(2026, 7, 22)):
+            self.assertEqual(agente._extrair_data("entao coloca 28 de fevereiro de 2030"), "2030-02-28")
+            self.assertEqual(agente._extrair_data("25 de julho de 2026"), "2026-07-25")
+            self.assertEqual(agente._extrair_data("sábado, 25 de julho de 2026"), "2026-07-25")
+            self.assertEqual(agente._extrair_data("28/02/2030"), "2030-02-28")
+            self.assertEqual(agente._extrair_data("2030-02-28"), "2030-02-28")
+            self.assertIsNone(agente._extrair_data("31/02/2030"))
+
+    def test_data_iso_mencionada_pela_ia_tem_prioridade_mesmo_sem_parser_textual(self) -> None:
+        telefone = "5511990010032"
+        agente._estados_reserva[telefone] = {
+            "horario": "18:00",
+            "pessoas": 12,
+            "nome_cliente": "Rodrigo Teste",
+            "campo_pendente": "data_reserva",
+            "etapa": "aguardando_data",
+        }
+        payload = {
+            "resposta": "Resumo: 28/02/2030, 18:00, 12 pessoas. Posso confirmar?",
+            "intencao": "fornecimento_dados",
+            "dados_confirmados": {},
+            "dados_mencionados": {"data": "2030-02-28", "horario": "18:00", "quantidade": 12},
+            "correcoes": {},
+            "acao": "pedir_confirmacao",
+            "deve_avancar_estado": False,
+            "campo_sugerido": "confirmacao",
+            "confianca": 0.95,
+        }
+
+        with patch.object(agente, "_extrair_data", return_value=None):
+            resposta = self._processar(telefone, "entao coloca 28 de fevereiro de 2030", payload)
+
+        estado = agente._estados_reserva[telefone]
+        self.assertEqual(resposta["texto"], payload["resposta"])
+        self.assertEqual(estado["data_reserva"], "2030-02-28")
+        self.assertEqual(estado["horario"], "18:00")
+        self.assertEqual(estado["pessoas"], 12)
+        self.assertEqual(estado["campo_pendente"], "confirmacao")
+
+    def test_data_valida_nao_chama_ia_pos_validacao(self) -> None:
+        telefone = "5511990010033"
+        agente._estados_reserva[telefone] = {
+            "horario": "18:00",
+            "pessoas": 12,
+            "nome_cliente": "Rodrigo Teste",
+            "campo_pendente": "data_reserva",
+            "etapa": "aguardando_data",
+        }
+        payload = {
+            "resposta": "Resumo: 28/02/2030, 18:00, 12 pessoas. Posso confirmar?",
+            "intencao": "fornecimento_dados",
+            "dados_confirmados": {},
+            "dados_mencionados": {"data": "2030-02-28", "horario": "18:00", "quantidade": 12},
+            "correcoes": {},
+            "acao": "pedir_confirmacao",
+            "deve_avancar_estado": False,
+            "campo_sugerido": "confirmacao",
+            "confianca": 0.95,
+        }
+        retorno = self._json(payload)
+
+        with (
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 22)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste", "RESERVA_HORARIO_INICIO": "10:00", "RESERVA_HORARIO_FIM": "23:59"}),
+            patch.object(agente, "_chamar_groq", return_value=retorno) as chamar,
+        ):
+            resposta = agente.processar_mensagem(telefone, "entao coloca 28 de fevereiro de 2030", nome_cliente="Rodrigo Teste")
+
+        self.assertEqual(resposta["texto"], payload["resposta"])
+        self.assertEqual(chamar.call_count, 1)
+        self.assertEqual(agente._estados_reserva[telefone]["data_reserva"], "2030-02-28")
+
+    def test_data_invalida_chama_ia_pos_validacao_uma_vez(self) -> None:
+        telefone = "5511990010034"
+        agente._estados_reserva[telefone] = {"campo_pendente": "data_reserva", "etapa": "aguardando_data"}
+        primeira = {
+            "resposta": "Resumo: 31/02/2030, 18:00, 12 pessoas. Posso confirmar?",
+            "intencao": "fornecimento_dados",
+            "dados_confirmados": {"data": "2030-02-31", "horario": "18:00", "quantidade": 12},
+            "dados_mencionados": {},
+            "correcoes": {},
+            "acao": "pedir_confirmacao",
+            "deve_avancar_estado": True,
+            "campo_sugerido": "confirmacao",
+            "confianca": 0.95,
+        }
+        segunda = {"resposta": "31 de fevereiro não existe. Me fala outra data válida para eu verificar."}
+
+        with (
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 22)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste", "RESERVA_HORARIO_INICIO": "10:00", "RESERVA_HORARIO_FIM": "23:59"}),
+            patch.object(agente, "_chamar_groq", side_effect=[self._json(primeira), self._json(segunda)]) as chamar,
+        ):
+            resposta = agente.processar_mensagem(telefone, "entao coloca 31/02/2030", nome_cliente="Rodrigo Teste")
+
+        self.assertEqual(resposta["texto"], segunda["resposta"])
+        self.assertEqual(chamar.call_count, 2)
+        self.assertNotIn("data_reserva", agente._estados_reserva[telefone])
+
     def test_ia_informar_data_confirmada_e_salva_sem_regex(self) -> None:
         telefone = "5511990010031"
         agente._estados_reserva[telefone] = {"campo_pendente": "data_reserva", "etapa": "aguardando_data"}

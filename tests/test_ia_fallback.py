@@ -227,10 +227,32 @@ class IaFallbackTest(unittest.TestCase):
         self.assertIsNotNone(payload)
         self.assertEqual(payload["acao"], "responder")
 
+    def test_remove_texto_antes_e_depois_do_json(self) -> None:
+        payload = ia_fallback.extrair_json_resposta(
+            'Claro, segue: {"resposta":"Oi","intencao":"saudacao","acao":"responder"} pronto.'
+        )
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["resposta"], "Oi")
+        self.assertEqual(payload["acao"], "responder")
+
+    def test_repara_json_com_aspas_tipograficas_e_virgula_final(self) -> None:
+        payload = ia_fallback.extrair_json_resposta('{\u201cresposta\u201d:\u201cOi\u201d,\u201cacao\u201d:\u201cresponder\u201d,}')
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["resposta"], "Oi")
+        self.assertEqual(payload["acao"], "responder")
+
     def test_json_parcial_recebe_defaults(self) -> None:
         payload = ia_fallback.extrair_json_resposta('{"resposta":"Anotado"}')
         self.assertIsNotNone(payload)
-        self.assertEqual(payload["intencao"], "comentario")
+        self.assertEqual(payload["intencao"], "continuar_conversa")
+        self.assertEqual(payload["acao"], "responder")
+        self.assertEqual(payload["dados_confirmados"], {})
+
+    def test_resposta_natural_sem_json_recebe_contrato_minimo(self) -> None:
+        payload = ia_fallback.extrair_json_resposta("Pode deixar, sigo por aqui.")
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["resposta"], "Pode deixar, sigo por aqui.")
+        self.assertEqual(payload["intencao"], "continuar_conversa")
         self.assertEqual(payload["acao"], "responder")
         self.assertEqual(payload["dados_confirmados"], {})
 
@@ -281,7 +303,7 @@ class IaFallbackTest(unittest.TestCase):
             patch.object(
                 ia_fallback,
                 "_criar_completion_groq",
-                side_effect=[RateLimitError(), BadRequestJsonValidate(), resposta_chat("nao e json")],
+                side_effect=[RateLimitError(), BadRequestJsonValidate(), resposta_chat("")],
             ) as criar,
         ):
             resultado = ia_fallback.executar_ia_com_fallback(
@@ -293,6 +315,32 @@ class IaFallbackTest(unittest.TestCase):
         self.assertTrue(resultado["encaminhar_humano"])
         self.assertEqual(criar.call_count, 3)
         upsert.assert_called_once()
+        self.assertIsNone(ia_fallback.cooldown_memoria("groq", "openai/gpt-oss-20b"))
+
+    def test_json_validate_plain_text_natural_vira_resposta_minima(self) -> None:
+        with (
+            patch.dict(os.environ, self._env(GROQ_FALLBACK_MODEL="openai/gpt-oss-20b"), clear=True),
+            self._sem_cooldown_supabase(),
+            patch.object(ia_fallback.supabase, "upsert", return_value={"ok": True}),
+            patch.object(ia_fallback, "_criar_cliente_groq", return_value=object()),
+            patch.object(
+                ia_fallback,
+                "_criar_completion_groq",
+                side_effect=[RateLimitError(), BadRequestJsonValidate(), resposta_chat("Pode deixar, sigo por aqui.")],
+            ) as criar,
+        ):
+            resultado = ia_fallback.executar_ia_com_fallback(
+                [{"role": "system", "content": "Sistema"}, {"role": "user", "content": "oi"}],
+                response_format_json=True,
+            )
+
+        self.assertTrue(resultado["ok"])
+        self.assertEqual(criar.call_count, 3)
+        payload = json.loads(resultado["conteudo"])
+        self.assertEqual(payload["resposta"], "Pode deixar, sigo por aqui.")
+        self.assertEqual(payload["intencao"], "continuar_conversa")
+        self.assertEqual(payload["acao"], "responder")
+        self.assertFalse(payload["deve_avancar_estado"])
         self.assertIsNone(ia_fallback.cooldown_memoria("groq", "openai/gpt-oss-20b"))
 
     def test_provider_alternativo_responde_quando_groq_falha(self) -> None:
@@ -416,7 +464,7 @@ class IaFallbackTest(unittest.TestCase):
             patch.object(
                 ia_fallback,
                 "_criar_completion_groq",
-                side_effect=[BadRequestJsonValidate(), resposta_chat("nao e json")],
+                side_effect=[BadRequestJsonValidate(), resposta_chat("")],
             ) as criar,
         ):
             resposta = agente.processar_mensagem(telefone, "sim", nome_cliente="Rodrigo")

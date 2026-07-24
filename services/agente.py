@@ -113,6 +113,7 @@ class ResultadoReservaEstruturada(TypedDict):
 class EstadoReserva(TypedDict, total=False):
     data_reserva: str
     data_reserva_original: str
+    data_reserva_fonte: str
     horario: str
     horario_invalido: str
     pessoas: int
@@ -191,6 +192,7 @@ MAPA_CAMPO_IA: Final[dict[str, str]] = {
 CHAVES_ESTADO_PERSISTIDO: Final[set[str]] = {
     "data_reserva",
     "data_reserva_original",
+    "data_reserva_fonte",
     "horario",
     "horario_invalido",
     "pessoas",
@@ -1548,9 +1550,17 @@ def _atualizar_estado_reserva(
     deve_avancar = bool(interpretacao.get("deve_avancar_estado")) or _mensagem_indica_correcao(mensagem_cliente, interpretacao)
     dados_confirmados = _dados_reserva_de_json(dict(interpretacao.get("dados_confirmados") or {}))
     correcoes_confirmadas = _dados_reserva_de_json(dict(interpretacao.get("correcoes") or {}))
+    dados_mencionados = _dados_reserva_de_json(dict(interpretacao.get("dados_mencionados") or {}))
     dados_modelo_confirmados: DadosReserva = {}
     dados_modelo_confirmados.update(dados_confirmados)  # type: ignore[arg-type]
     dados_modelo_confirmados.update(correcoes_confirmadas)
+    campos_mencionados_promovidos = _promover_dados_mencionados_confirmaveis(
+        dados_modelo_confirmados,
+        dados_mencionados,
+        estado=estado,
+        mensagem_cliente=mensagem_cliente,
+        interpretacao=interpretacao,
+    )
     contrato_novo = bool(interpretacao.get("contrato_novo"))
     usar_fallback_extracao = deve_avancar and not mensagem_eh_conversa and (not dados_modelo_confirmados or not contrato_novo)
     data_parser = _extrair_data(
@@ -1647,10 +1657,15 @@ def _atualizar_estado_reserva(
         and tem_sinal_data
         and not mensagem_eh_conversa
         and not dados_usuario.get("data_reserva")
+        and not dados_modelo_confirmados.get("data_reserva")
     ):
         invalidos.add("data_reserva")
 
-    if data_promovida or _pode_aplicar_dado_confirmado("data_reserva", estado, interpretacao, mensagem_cliente):
+    if (
+        data_promovida
+        or "data_reserva" in campos_mencionados_promovidos
+        or _pode_aplicar_dado_confirmado("data_reserva", estado, interpretacao, mensagem_cliente)
+    ):
         _definir_data_estado(
             estado,
             dados_modelo_confirmados.get("data_reserva"),
@@ -1659,9 +1674,13 @@ def _atualizar_estado_reserva(
             fonte="ia_confirmado",
             permitir_sobrescrever=_mensagem_indica_correcao(mensagem_cliente, interpretacao),
         )
-    if promover_horario or _pode_aplicar_dado_confirmado("horario", estado, interpretacao, mensagem_cliente):
+    if (
+        promover_horario
+        or "horario" in campos_mencionados_promovidos
+        or _pode_aplicar_dado_confirmado("horario", estado, interpretacao, mensagem_cliente)
+    ):
         _definir_horario_estado(estado, dados_modelo_confirmados.get("horario"), invalidos=invalidos, fonte="ia_confirmado")
-    if _pode_aplicar_dado_confirmado("pessoas", estado, interpretacao, mensagem_cliente):
+    if "pessoas" in campos_mencionados_promovidos or _pode_aplicar_dado_confirmado("pessoas", estado, interpretacao, mensagem_cliente):
         _definir_pessoas_estado(estado, dados_modelo_confirmados.get("pessoas"), invalidos=invalidos)
     if _pode_aplicar_dado_confirmado("nome_cliente", estado, interpretacao, mensagem_cliente) and _nome_parece_valido(
         str(dados_modelo_confirmados.get("nome_cliente") or "")
@@ -1683,6 +1702,54 @@ def _atualizar_estado_reserva(
     if observacoes:
         estado["observacoes"] = observacoes
     _sincronizar_dados_confirmados_estado(estado)
+
+
+def _promover_dados_mencionados_confirmaveis(
+    destino: DadosReserva,
+    mencionados: Mapping[str, Any],
+    *,
+    estado: EstadoReserva,
+    mensagem_cliente: str,
+    interpretacao: Mapping[str, Any],
+) -> set[str]:
+    if not mencionados:
+        return set()
+    intencao = _normalizar_intencao_ia(str(interpretacao.get("intencao") or ""))
+    if intencao in {"pergunta_contextual", "pergunta_restaurante", "pergunta_bot", "pergunta_fonte", "brincadeira"}:
+        return set()
+
+    campo_aguardado = _campo_aguardado(estado)
+    correcao_ou_escolha = _mensagem_indica_correcao(mensagem_cliente, interpretacao)
+    acao = str(interpretacao.get("acao") or "").strip().lower()
+    mensagem_contextual = _mensagem_eh_pergunta_contextual(mensagem_cliente)
+    fornecimento_direto = intencao in {"fornecimento_dados", "correcao", "informar_data", "informar_horario", "informar_quantidade"}
+    pode_promover_por_acao = acao in {"pedir_confirmacao", "confirmar_reserva", "continuar_reserva"} or (
+        acao == "continuar_conversa" and fornecimento_direto
+    )
+    promovidos: set[str] = set()
+
+    for campo, sinal in (
+        ("data_reserva", _mensagem_tem_sinal_data),
+        ("horario", _mensagem_tem_sinal_horario),
+        ("pessoas", _mensagem_tem_sinal_pessoas),
+    ):
+        valor = mencionados.get(campo)
+        if valor in (None, "", []):
+            continue
+        if destino.get(campo):  # type: ignore[literal-required]
+            continue
+        sinal_do_campo = sinal(mensagem_cliente)
+        direto_no_campo = campo_aguardado == campo and fornecimento_direto and sinal_do_campo and not mensagem_contextual
+        if correcao_ou_escolha or direto_no_campo or (pode_promover_por_acao and sinal_do_campo and not mensagem_contextual):
+            destino[campo] = valor  # type: ignore[literal-required]
+            promovidos.add(campo)
+            logger.info(
+                "DIAG_RESERVA dados_mencionados_promovidos campo=%s valor=%s motivo=mensagem_confirmavel",
+                campo,
+                valor,
+            )
+
+    return promovidos
 
 
 def _definir_data_estado(
@@ -1733,6 +1800,7 @@ def _definir_data_estado(
         )
         return
     estado["data_reserva"] = data_texto
+    estado["data_reserva_fonte"] = fonte
     if valor_original:
         estado["data_reserva_original"] = valor_original.strip()
     _limpar_tentativas_campo(estado, "data_reserva")
@@ -3304,6 +3372,7 @@ def _mensagem_tem_sinal_data(texto: str) -> bool:
     return bool(
         re.search(
             r"\b(hoje|amanha|dia\s+\d{1,2}|\d{1,2}[/-]\d{1,2}|"
+            r"\d{4}-\d{2}-\d{2}|"
             r"segunda(?: feira)?|terca(?: feira)?|quarta(?: feira)?|quinta(?: feira)?|"
             r"sexta(?: feira)?|sabado|domingo|proxim[ao]\s+(?:segunda|terca|quarta|quinta|sexta|sabado|domingo))\b",
             normalizado,
@@ -3387,6 +3456,8 @@ def _data_reserva_valida(valor: str) -> bool:
 
 
 def _data_estado_confere_origem(estado: Mapping[str, Any]) -> bool:
+    if str(estado.get("data_reserva_fonte") or "").startswith("ia_"):
+        return True
     data_estado = str(estado.get("data_reserva") or "")
     original = str(estado.get("data_reserva_original") or "")
     if not data_estado or not original:
@@ -3898,8 +3969,8 @@ def _extrair_json_resposta(texto: str) -> dict[str, Any] | None:
 def _dados_reserva_de_json(reserva: dict[str, Any]) -> DadosReserva:
     dados: DadosReserva = {}
     data_reserva = reserva.get("data_reserva") or reserva.get("data") or reserva.get("dia")
-    if isinstance(data_reserva, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", data_reserva):
-        dados["data_reserva"] = data_reserva
+    if isinstance(data_reserva, str) and _texto_iso_data(data_reserva):
+        dados["data_reserva"] = data_reserva.strip()[:10]
     elif isinstance(data_reserva, str):
         data_interpretada = _extrair_data(data_reserva, permitir_dia_isolado=True)
         if data_interpretada:
@@ -3957,9 +4028,9 @@ def _limitar_historico(historico: list[Mensagem]) -> None:
 
 
 def _extrair_data(texto: str, *, permitir_dia_isolado: bool = False) -> str | None:
-    data_relativa = _extrair_data_relativa(texto)
-    if data_relativa:
-        return data_relativa
+    data_iso = _extrair_data_iso(texto)
+    if data_iso:
+        return data_iso
 
     data_mes_extenso = _extrair_data_mes_extenso(texto)
     if data_mes_extenso:
@@ -3978,6 +4049,10 @@ def _extrair_data(texto: str, *, permitir_dia_isolado: bool = False) -> str | No
 
         return _formatar_data_futura(dia, mes, ano)
 
+    data_relativa = _extrair_data_relativa(texto)
+    if data_relativa:
+        return data_relativa
+
     match_dia = re.search(r"\bdia\s+(\d{1,2})\b", texto, flags=re.IGNORECASE)
     if match_dia:
         hoje = _hoje()
@@ -3992,6 +4067,30 @@ def _extrair_data(texto: str, *, permitir_dia_isolado: bool = False) -> str | No
             return _formatar_data_futura(dia, hoje.month, hoje.year)
 
     return None
+
+
+def _texto_iso_data(valor: str) -> bool:
+    texto = str(valor or "").strip()[:10]
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", texto):
+        return False
+    try:
+        date.fromisoformat(texto)
+    except ValueError:
+        return False
+    return True
+
+
+def _extrair_data_iso(texto: str) -> str | None:
+    match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", str(texto or ""))
+    if not match:
+        return None
+    try:
+        data_reserva = date.fromisoformat(match.group(1))
+    except ValueError:
+        return None
+    if data_reserva < _hoje():
+        return None
+    return data_reserva.isoformat()
 
 
 def _extrair_data_relativa(texto: str) -> str | None:
@@ -4028,21 +4127,23 @@ def _extrair_data_relativa(texto: str) -> str | None:
 
 
 def _extrair_data_mes_extenso(texto: str) -> str | None:
+    texto_normalizado = _normalizar_busca(texto)
     match = re.search(
-        r"\b(\d{1,2})\s+de\s+([A-Za-zÀ-ÿ]{3,})\b",
-        texto,
+        r"\b(?:(?:segunda|terca|quarta|quinta|sexta|sabado|domingo)(?:\s+feira)?\s*,?\s*)?"
+        r"(\d{1,2})\s+de\s+([a-z]{3,})(?:\s+de\s+(\d{4}))?\b",
+        texto_normalizado,
         flags=re.IGNORECASE,
     )
     if not match:
         return None
 
     dia = int(match.group(1))
-    mes_texto = _normalizar_busca(match.group(2))
-    mes = MESES.get(mes_texto)
+    mes = MESES.get(match.group(2))
     if mes is None:
         return None
+    ano = int(match.group(3)) if match.group(3) else _hoje().year
 
-    return _formatar_data_futura(dia, mes, _hoje().year)
+    return _formatar_data_futura(dia, mes, ano)
 
 
 def _formatar_data_futura(dia: int, mes: int, ano: int) -> str | None:

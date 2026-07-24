@@ -316,7 +316,14 @@ def _executar_groq_sem_json_mode_tolerante(
         temperature=0.0,
     )
     resposta = _criar_completion_groq(client, kwargs)
-    conteudo = str(resposta.choices[0].message.content or "").strip()
+    conteudo, diagnostico = _extrair_conteudo_completion(resposta)
+    _log_diagnostico_conteudo_retry(modelo, conteudo, diagnostico)
+    if not conteudo:
+        logger.warning(
+            "ai_fallback_json_repair_failed provider=groq model=%s motivo=conteudo_vazio",
+            modelo,
+        )
+        raise RuntimeError("json_repair_failed")
     payload = extrair_json_resposta(conteudo)
     if payload is None:
         logger.warning(
@@ -344,6 +351,85 @@ def _mensagens_json_tolerante(mensagens: Sequence[Mapping[str, str]]) -> list[di
             mensagens_tolerantes[indice]["content"] = f"{conteudo}\n\n{INSTRUCAO_JSON_TOLERANTE}"
             return mensagens_tolerantes
     return [{"role": "system", "content": INSTRUCAO_JSON_TOLERANTE}, *mensagens_tolerantes]
+
+
+def _extrair_conteudo_completion(resposta: Any) -> tuple[str, dict[str, Any]]:
+    choice = _primeira_choice(resposta)
+    message = _campo_objeto(choice, "message") if choice is not None else None
+    candidatos = [
+        _campo_objeto(message, "content"),
+        _campo_objeto(resposta, "output_text"),
+        _campo_objeto(message, "output_text"),
+        _campo_objeto(resposta, "text"),
+        _campo_objeto(choice, "text") if choice is not None else None,
+    ]
+    conteudo = ""
+    for candidato in candidatos:
+        conteudo = _texto_candidato_completion(candidato)
+        if conteudo:
+            break
+    diagnostico = {
+        "finish_reason": _campo_objeto(choice, "finish_reason") if choice is not None else "",
+        "has_message_content": bool(_texto_candidato_completion(_campo_objeto(message, "content"))),
+        "has_output_text": bool(_texto_candidato_completion(_campo_objeto(resposta, "output_text")))
+        or bool(_texto_candidato_completion(_campo_objeto(message, "output_text"))),
+        "has_reasoning": bool(_texto_candidato_completion(_campo_objeto(message, "reasoning")))
+        or bool(_texto_candidato_completion(_campo_objeto(resposta, "reasoning"))),
+    }
+    return conteudo, diagnostico
+
+
+def _primeira_choice(resposta: Any) -> Any | None:
+    choices = getattr(resposta, "choices", None)
+    if isinstance(choices, Sequence) and choices:
+        return choices[0]
+    if isinstance(resposta, Mapping):
+        choices_map = resposta.get("choices")
+        if isinstance(choices_map, Sequence) and choices_map:
+            return choices_map[0]
+    return None
+
+
+def _campo_objeto(objeto: Any, campo: str) -> Any:
+    if isinstance(objeto, Mapping):
+        return objeto.get(campo)
+    return getattr(objeto, campo, None)
+
+
+def _texto_candidato_completion(valor: Any) -> str:
+    if isinstance(valor, str):
+        return valor.strip()
+    if isinstance(valor, Sequence) and not isinstance(valor, (str, bytes, bytearray)):
+        partes: list[str] = []
+        for item in valor:
+            if isinstance(item, Mapping):
+                texto = item.get("text") or item.get("content") or item.get("output_text")
+                if isinstance(texto, str):
+                    partes.append(texto)
+            elif isinstance(item, str):
+                partes.append(item)
+        return "\n".join(parte.strip() for parte in partes if parte and parte.strip()).strip()
+    if isinstance(valor, Mapping):
+        texto = valor.get("text") or valor.get("content") or valor.get("output_text")
+        return str(texto or "").strip()
+    return ""
+
+
+def _log_diagnostico_conteudo_retry(modelo: str, conteudo: str, diagnostico: Mapping[str, Any]) -> None:
+    logger.info(
+        "ai_fallback_plain_text_retry_diagnostic provider=groq model=%s tamanho=%s prefixo=%r finish_reason=%s "
+        "tem_conteudo=%s primeiro_json=%s ultimo_json=%s has_message_content=%s has_output_text=%s has_reasoning=%s",
+        modelo,
+        len(conteudo),
+        _sanitizar_texto_log(conteudo[:500]),
+        diagnostico.get("finish_reason", ""),
+        bool(conteudo),
+        conteudo.find("{") if conteudo else -1,
+        conteudo.rfind("}") if conteudo else -1,
+        bool(diagnostico.get("has_message_content")),
+        bool(diagnostico.get("has_output_text")),
+        bool(diagnostico.get("has_reasoning")),
+    )
 
 
 def _executar_provider_alternativo(
@@ -529,7 +615,7 @@ def extrair_json_resposta(texto: str) -> dict[str, Any] | None:
         return None
 
     for candidato in _candidatos_json_texto(texto_limpo):
-        payload = _loads_json_objeto(candidato)
+        payload = _loads_json_objeto(_normalizar_aspas_json(candidato))
         if payload is not None:
             normalizado = _normalizar_contrato_fallback(payload)
             if normalizado is not None:
@@ -537,9 +623,11 @@ def extrair_json_resposta(texto: str) -> dict[str, Any] | None:
 
     reparado = _reparar_json_simples(texto_limpo)
     if reparado:
-        payload = _loads_json_objeto(reparado)
+        payload = _loads_json_objeto(_normalizar_aspas_json(reparado))
         if payload is not None:
             return _normalizar_contrato_fallback(payload)
+    if "{" not in texto_limpo and "}" not in texto_limpo:
+        return _normalizar_contrato_fallback({"resposta": texto_limpo})
     return None
 
 
@@ -556,8 +644,13 @@ def _candidatos_json_texto(texto: str) -> list[str]:
 
 
 def _remover_cerca_json(texto: str) -> str:
-    match = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", texto.strip(), flags=re.IGNORECASE | re.DOTALL)
-    return match.group(1).strip() if match else texto
+    texto_limpo = texto.strip()
+    match = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", texto_limpo, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    texto_limpo = re.sub(r"^\s*```(?:json)?\s*", "", texto_limpo, flags=re.IGNORECASE)
+    texto_limpo = re.sub(r"\s*```\s*$", "", texto_limpo)
+    return texto_limpo.strip()
 
 
 def _loads_json_objeto(texto: str) -> dict[str, Any] | None:
@@ -573,8 +666,21 @@ def _reparar_json_simples(texto: str) -> str:
     ultimo = texto.rfind("}")
     candidato = texto[primeiro : ultimo + 1] if primeiro != -1 and ultimo != -1 and ultimo > primeiro else texto
     candidato = _remover_cerca_json(candidato)
+    candidato = _normalizar_aspas_json(candidato)
     candidato = re.sub(r",\s*([}\]])", r"\1", candidato)
     return candidato.strip()
+
+
+def _normalizar_aspas_json(texto: str) -> str:
+    return (
+        str(texto or "")
+        .replace("“", '"')
+        .replace("”", '"')
+        .replace("„", '"')
+        .replace("‟", '"')
+        .replace("‘", "'")
+        .replace("’", "'")
+    )
 
 
 def _normalizar_contrato_fallback(payload: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -589,7 +695,7 @@ def _normalizar_contrato_fallback(payload: Mapping[str, Any]) -> dict[str, Any] 
         return None
     normalizado = dict(payload)
     normalizado["resposta"] = resposta
-    normalizado.setdefault("intencao", "comentario")
+    normalizado.setdefault("intencao", "continuar_conversa")
     normalizado.setdefault("acao", "responder")
     normalizado.setdefault("dados_confirmados", {})
     normalizado.setdefault("dados_mencionados", {})
@@ -758,6 +864,17 @@ def _sanitizar_erro(exc: Exception) -> str:
     texto = re.sub(r"\s+", " ", str(exc or "")).strip()
     texto = re.sub(r"(api[-_ ]?key|token|bearer)\s*[:=]\s*\S+", r"\1=<redacted>", texto, flags=re.IGNORECASE)
     return texto[:500]
+
+
+def _sanitizar_texto_log(texto: str) -> str:
+    texto_limpo = re.sub(r"\s+", " ", str(texto or "")).strip()
+    texto_limpo = re.sub(
+        r"(api[-_ ]?key|token|bearer)\s*[:=]\s*\S+",
+        r"\1=<redacted>",
+        texto_limpo,
+        flags=re.IGNORECASE,
+    )
+    return texto_limpo[:500]
 
 
 def _mascarar_telefone(telefone: str | None) -> str:
