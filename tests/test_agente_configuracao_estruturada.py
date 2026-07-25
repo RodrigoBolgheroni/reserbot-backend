@@ -858,6 +858,271 @@ class AgenteConfiguracaoEstruturadaTest(unittest.TestCase):
         self.assertFalse(estado["local_garantido"])
         self.assertIn("regra_faq_aplicada", logs_texto)
 
+    def test_quantidade_abaixo_minima_nao_avanca_e_preserva_preferencia(self) -> None:
+        telefone = "5511993680823"
+        payload = _payload_custom(
+            "Perfeito, vou confirmar sua reserva no salao. Qual nome e telefone?",
+            intencao="fornecimento_dados",
+            dados_confirmados={"data": "2026-08-01", "horario": "18:00", "quantidade": 8},
+            deve_avancar_estado=True,
+            campo_sugerido="confirmacao",
+        )
+
+        with (
+            patch.object(config_restaurante.repositorio, "carregar_configuracao_bruta", return_value=_config_bruta_reserva()),
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 25)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste"}, clear=False),
+            patch.object(agente, "_chamar_groq", return_value=payload),
+        ):
+            resposta = agente.processar_mensagem(
+                telefone,
+                "Quero reservar para sabado, 1º de agosto de 2026, as 18h, para 8 pessoas. Prefiro o salao.",
+                nome_cliente="Rodrigo",
+            )
+
+        estado = agente._estados_reserva[telefone]
+        texto = agente._normalizar_busca(resposta["texto"])
+        self.assertFalse(resposta["reserva_confirmada"])
+        self.assertEqual(estado["data_reserva"], "2026-08-01")
+        self.assertEqual(estado["horario"], "18:00")
+        self.assertEqual(estado["pessoas"], 8)
+        self.assertEqual(estado["preferencia_espaco_id"], "espaco-salao")
+        self.assertFalse(estado["espaco_confirmado"])
+        self.assertFalse(estado["local_garantido"])
+        self.assertEqual(estado["campo_pendente"], "pessoas")
+        self.assertIn("nao precisa fazer reserva", texto)
+        self.assertIn("a partir de 11 pessoas", texto)
+        self.assertIn("apenas como preferencia", texto)
+        self.assertNotIn("pix", texto)
+        self.assertNotIn("qual nome", texto)
+        self.assertNotIn("telefone", texto)
+        self.assertNotIn("confirma", texto)
+
+    def test_quantidade_minima_vem_da_configuracao_reserva(self) -> None:
+        def alterar_minimo(dados: dict) -> None:
+            dados["configuracao_reserva"]["quantidade_minima"] = 15
+
+        payload = _payload_custom(
+            "Vou confirmar.",
+            intencao="fornecimento_dados",
+            dados_confirmados={"data": "2026-08-01", "horario": "18:00", "quantidade": 14},
+            deve_avancar_estado=True,
+            campo_sugerido="confirmacao",
+        )
+        with (
+            patch.object(
+                config_restaurante.repositorio,
+                "carregar_configuracao_bruta",
+                return_value=_config_bruta_custom(alterar_minimo),
+            ),
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 25)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste"}, clear=False),
+            patch.object(agente, "_chamar_groq", return_value=payload),
+        ):
+            resposta = agente.processar_mensagem(
+                "5511993680823",
+                "Quero reservar para sabado, 1º de agosto de 2026, as 18h, para 14 pessoas.",
+                nome_cliente="Rodrigo",
+            )
+
+        self.assertIn("a partir de 15 pessoas", agente._normalizar_busca(resposta["texto"]))
+
+    def test_sabado_acima_do_limite_direciona_para_areia_e_pede_autorizacao(self) -> None:
+        telefone = "5511993680823"
+        agente._estados_reserva[telefone] = {
+            "data_reserva": "2026-08-01",
+            "horario": "18:00",
+            "pessoas": 8,
+            "nome_cliente": "Rodrigo",
+            "preferencia_espaco_id": "espaco-salao",
+            "preferencia_espaco_nome": "Salao",
+            "campo_pendente": "pessoas",
+            "etapa": "aguardando_quantidade",
+        }
+        payload = _payload_custom(
+            "Perfeito, 26 pessoas no salao. Confirma?",
+            intencao="correcao",
+            dados_confirmados={"quantidade": 26},
+            deve_avancar_estado=True,
+            campo_sugerido="confirmacao",
+        )
+
+        with (
+            patch.object(config_restaurante.repositorio, "carregar_configuracao_bruta", return_value=_config_bruta_reserva()),
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 25)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste"}, clear=False),
+            patch.object(agente, "_chamar_groq", return_value=payload),
+        ):
+            resposta = agente.processar_mensagem(telefone, "Na verdade, serao 26 pessoas.", nome_cliente="Rodrigo")
+
+        estado = agente._estados_reserva[telefone]
+        texto = agente._normalizar_busca(resposta["texto"])
+        self.assertFalse(resposta["reserva_confirmada"])
+        self.assertEqual(estado["data_reserva"], "2026-08-01")
+        self.assertEqual(estado["horario"], "18:00")
+        self.assertEqual(estado["pessoas"], 26)
+        self.assertEqual(estado["espaco_direcionado_id"], "espaco-areia")
+        self.assertEqual(estado["espaco_direcionado_nome"], "Areia")
+        self.assertTrue(estado["aguardando_confirmacao_espaco"])
+        self.assertFalse(estado["espaco_confirmado"])
+        self.assertIn("acima de 25 pessoas", texto)
+        self.assertIn("areia", texto)
+        self.assertIn("posso seguir", texto)
+
+    def test_domingo_acima_do_limite_direciona_para_areia(self) -> None:
+        telefone = "5511993680823"
+        agente._estados_reserva[telefone] = {
+            "data_reserva": "2026-08-02",
+            "horario": "18:00",
+            "pessoas": 26,
+            "nome_cliente": "Rodrigo",
+            "preferencia_espaco_id": "espaco-salao",
+            "preferencia_espaco_nome": "Salao",
+            "campo_pendente": "confirmacao",
+            "etapa": "aguardando_confirmacao",
+        }
+        payload = _payload_custom(
+            "Confirmo no salao.",
+            intencao="pergunta_restaurante",
+            campo_sugerido="confirmacao",
+        )
+
+        with (
+            patch.object(config_restaurante.repositorio, "carregar_configuracao_bruta", return_value=_config_bruta_reserva()),
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 25)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste"}, clear=False),
+            patch.object(agente, "_chamar_groq", return_value=payload),
+        ):
+            agente.processar_mensagem(telefone, "Prefiro o salao.", nome_cliente="Rodrigo")
+
+        estado = agente._estados_reserva[telefone]
+        self.assertEqual(estado["espaco_direcionado_nome"], "Areia")
+        self.assertTrue(estado["aguardando_confirmacao_espaco"])
+
+    def test_sexta_acima_do_limite_nao_aplica_regra_de_fim_de_semana(self) -> None:
+        telefone = "5511993680823"
+        agente._estados_reserva[telefone] = {
+            "data_reserva": "2026-07-31",
+            "horario": "18:00",
+            "pessoas": 26,
+            "nome_cliente": "Rodrigo",
+            "preferencia_espaco_id": "espaco-salao",
+            "preferencia_espaco_nome": "Salao",
+            "campo_pendente": "confirmacao",
+            "etapa": "aguardando_confirmacao",
+        }
+        payload = _payload_custom(
+            "Vou registrar o salao como preferencia.",
+            intencao="pergunta_restaurante",
+            campo_sugerido="confirmacao",
+        )
+
+        with (
+            patch.object(config_restaurante.repositorio, "carregar_configuracao_bruta", return_value=_config_bruta_reserva()),
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 25)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste"}, clear=False),
+            patch.object(agente, "_chamar_groq", return_value=payload),
+        ):
+            resposta = agente.processar_mensagem(telefone, "Prefiro o salao.", nome_cliente="Rodrigo")
+
+        estado = agente._estados_reserva[telefone]
+        self.assertFalse(resposta["reserva_confirmada"])
+        self.assertNotIn("espaco_direcionado_id", estado)
+
+    def test_cliente_insiste_no_salao_mantem_regra_de_direcionamento(self) -> None:
+        telefone = "5511993680823"
+        agente._estados_reserva[telefone] = {
+            "data_reserva": "2026-08-01",
+            "horario": "18:00",
+            "pessoas": 26,
+            "nome_cliente": "Rodrigo",
+            "preferencia_espaco_id": "espaco-salao",
+            "preferencia_espaco_nome": "Salao",
+            "espaco_direcionado_id": "espaco-areia",
+            "espaco_direcionado_nome": "Areia",
+            "limite_operacional_espaco": 25,
+            "motivo_direcionamento_espaco": "FAQ ativa direciona grupos acima de 25 pessoas em sabado para Areia.",
+            "aguardando_confirmacao_espaco": True,
+            "campo_pendente": "espaco",
+            "etapa": "aguardando_espaco",
+        }
+        payload = _payload_custom(
+            "Tudo bem, deixo confirmado no salao.",
+            intencao="pergunta_restaurante",
+            campo_sugerido="confirmacao",
+        )
+
+        with (
+            patch.object(config_restaurante.repositorio, "carregar_configuracao_bruta", return_value=_config_bruta_reserva()),
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 25)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste"}, clear=False),
+            patch.object(agente, "_chamar_groq", return_value=payload),
+        ):
+            resposta = agente.processar_mensagem(telefone, "Mas eu queria ficar no salao mesmo.", nome_cliente="Rodrigo")
+
+        texto = agente._normalizar_busca(resposta["texto"])
+        self.assertFalse(resposta["reserva_confirmada"])
+        self.assertIn("areia", texto)
+        self.assertIn("precisa", texto)
+        self.assertFalse(agente._estados_reserva[telefone]["espaco_confirmado"])
+
+    def test_nome_e_telefone_conhecidos_nao_sao_pedidos_novamente(self) -> None:
+        telefone = "5511993680823"
+        payload = _payload_custom(
+            "Qual nome e telefone devo colocar na reserva?",
+            intencao="fornecimento_dados",
+            dados_confirmados={"data": "2026-07-31", "horario": "18:00", "quantidade": 14},
+            deve_avancar_estado=True,
+            campo_sugerido="confirmacao",
+        )
+
+        with (
+            patch.object(config_restaurante.repositorio, "carregar_configuracao_bruta", return_value=_config_bruta_reserva()),
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 25)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste"}, clear=False),
+            patch.object(agente, "_chamar_groq", return_value=payload),
+        ):
+            resposta = agente.processar_mensagem(
+                telefone,
+                "Quero reservar para sexta, 31 de julho de 2026 as 18h para 14 pessoas.",
+                nome_cliente="Rodrigo",
+            )
+
+        texto = agente._normalizar_busca(resposta["texto"])
+        self.assertFalse(resposta["reserva_confirmada"])
+        self.assertNotIn("qual nome", texto)
+        self.assertNotIn("telefone", texto)
+        self.assertIn("posso confirmar", texto)
+
+    def test_dia_semana_incompativel_com_data_e_detectado(self) -> None:
+        telefone = "5511993680823"
+        payload = _payload_custom(
+            "Perfeito, sexta 1 de agosto anotado.",
+            intencao="fornecimento_dados",
+            dados_confirmados={"data": "2026-08-01", "horario": "18:00", "quantidade": 14},
+            deve_avancar_estado=True,
+            campo_sugerido="confirmacao",
+        )
+
+        with (
+            patch.object(config_restaurante.repositorio, "carregar_configuracao_bruta", return_value=_config_bruta_reserva()),
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 25)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste"}, clear=False),
+            patch.object(agente, "_chamar_groq", return_value=payload),
+        ):
+            resposta = agente.processar_mensagem(
+                telefone,
+                "Quero reservar para sexta, 1º de agosto de 2026, as 18h, para 14 pessoas.",
+                nome_cliente="Rodrigo",
+            )
+
+        estado = agente._estados_reserva[telefone]
+        texto = agente._normalizar_busca(resposta["texto"])
+        self.assertFalse(resposta["reserva_confirmada"])
+        self.assertNotIn("data_reserva", estado)
+        self.assertIn("sabado", texto)
+        self.assertIn("nao em sexta", texto)
+
 
 if __name__ == "__main__":
     unittest.main()

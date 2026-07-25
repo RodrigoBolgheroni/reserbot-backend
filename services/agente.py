@@ -83,6 +83,9 @@ class DadosReserva(TypedDict, total=False):
     preferencia_espaco_nome: str
     espaco_confirmado: bool
     local_garantido: bool
+    espaco_direcionado_id: str
+    espaco_direcionado_nome: str
+    motivo_direcionamento_espaco: str
 
 
 class RespostaAgente(TypedDict):
@@ -130,6 +133,14 @@ class EstadoReserva(TypedDict, total=False):
     local_garantido: bool
     motivo_local_nao_garantido: str
     disponibilidade_espaco_consultada: bool
+    espaco_direcionado_id: str
+    espaco_direcionado_nome: str
+    motivo_direcionamento_espaco: str
+    limite_operacional_espaco: int
+    aguardando_confirmacao_espaco: bool
+    cliente_autorizou_espaco_direcionado: bool
+    quantidade_abaixo_minima: bool
+    data_dia_semana_incompativel: str
     campo_pendente: str
     etapa: str
     pedido_imediato: bool
@@ -171,6 +182,7 @@ ETAPA_POR_CAMPO: Final[dict[str, str]] = {
     "pessoas": "aguardando_quantidade",
     "nome_cliente": "aguardando_nome",
     "telefone": "aguardando_telefone",
+    "espaco": "aguardando_espaco",
     "confirmacao": "aguardando_confirmacao",
 }
 
@@ -216,6 +228,14 @@ CHAVES_ESTADO_PERSISTIDO: Final[set[str]] = {
     "local_garantido",
     "motivo_local_nao_garantido",
     "disponibilidade_espaco_consultada",
+    "espaco_direcionado_id",
+    "espaco_direcionado_nome",
+    "motivo_direcionamento_espaco",
+    "limite_operacional_espaco",
+    "aguardando_confirmacao_espaco",
+    "cliente_autorizou_espaco_direcionado",
+    "quantidade_abaixo_minima",
+    "data_dia_semana_incompativel",
     "campo_pendente",
     "etapa",
     "pedido_imediato",
@@ -531,8 +551,26 @@ def _normalizar_estado_reserva_persistido(estado: Mapping[str, Any] | None) -> E
         if chave == "validacoes" and isinstance(valor, list):
             normalizado["validacoes"] = [dict(item) for item in valor if isinstance(item, Mapping)][-10:]
             continue
-        if chave in {"pedido_imediato", "aguardando_confirmacao", "confirmacao_pausada", "cliente_autorizou_confirmacao"}:
+        if chave in {
+            "pedido_imediato",
+            "aguardando_confirmacao",
+            "confirmacao_pausada",
+            "cliente_autorizou_confirmacao",
+            "aguardando_confirmacao_espaco",
+            "cliente_autorizou_espaco_direcionado",
+            "quantidade_abaixo_minima",
+            "preferencia_espaco_permitida",
+            "espaco_confirmado",
+            "local_garantido",
+            "disponibilidade_espaco_consultada",
+        }:
             normalizado[chave] = bool(valor)  # type: ignore[literal-required]
+            continue
+        if chave == "limite_operacional_espaco":
+            try:
+                normalizado["limite_operacional_espaco"] = int(valor)
+            except (TypeError, ValueError):
+                pass
             continue
         if chave == "versao":
             try:
@@ -572,6 +610,8 @@ def _mensagem_contexto_reserva(telefone: str) -> Mensagem:
         "dados_mencionados_nao_confirmados": estado.get("dados_mencionados", {}),
         "dados_incertos": estado.get("dados_incertos", {}),
         "dados_reserva_ja_coletados": dados,
+        "nome_cliente_conhecido": bool(str(estado.get("nome_cliente") or "").strip()),
+        "telefone_cliente_conhecido": bool(str(telefone or "").strip()),
         "campo_sugerido": campo,
         "campo_pendente_orientativo": estado.get("campo_pendente", ""),
         "etapa_interna_orientativa": estado.get("etapa", ""),
@@ -584,6 +624,11 @@ def _mensagem_contexto_reserva(telefone: str) -> Mensagem:
         "resumo_conversa": estado.get("resumo_conversa", ""),
         "tom_cliente": estado.get("tom_cliente", ""),
         "validacoes_backend": estado.get("validacoes", []),
+        "preferencia_espaco_id": estado.get("preferencia_espaco_id", ""),
+        "preferencia_espaco_nome": estado.get("preferencia_espaco_nome", ""),
+        "espaco_direcionado_id": estado.get("espaco_direcionado_id", ""),
+        "espaco_direcionado_nome": estado.get("espaco_direcionado_nome", ""),
+        "motivo_direcionamento_espaco": estado.get("motivo_direcionamento_espaco", ""),
     }
     return {
         "role": "system",
@@ -593,7 +638,8 @@ def _mensagem_contexto_reserva(telefone: str) -> Mensagem:
             f"{json.dumps(payload, ensure_ascii=False)}. "
             "O campo pendente e apenas uma orientacao, nao uma ordem. "
             "Antes de extrair dados, entenda o significado da mensagem. "
-            "Dados mencionados nao sao dados confirmados."
+            "Dados mencionados nao sao dados confirmados. "
+            "Se nome_cliente_conhecido ou telefone_cliente_conhecido forem true, nao peca esses dados novamente."
         ),
     }
 
@@ -642,6 +688,207 @@ def _resposta_preservando_ia(
         "status_reserva": status_reserva,
         "confianca": float(interpretacao.get("confianca") or 0.0),
     }
+
+
+def _responder_quantidade_abaixo_minima_se_necessario(
+    *,
+    telefone: str,
+    estado: EstadoReserva,
+    interpretacao: Mapping[str, Any],
+) -> RespostaAgente | None:
+    config = _config_restaurante_atual()
+    pessoas = _pessoas_json(estado.get("pessoas"))
+    minimo = config.quantidade_minima_reserva
+    if pessoas is None or minimo is None or pessoas >= minimo:
+        estado.pop("quantidade_abaixo_minima", None)
+        return None
+
+    estado["quantidade_abaixo_minima"] = True
+    estado["aguardando_confirmacao"] = False
+    estado["cliente_autorizou_confirmacao"] = False
+    estado["aguardando_confirmacao_espaco"] = False
+    _definir_campo_pendente(estado, "pessoas")
+    texto_ia = _texto_ia_ou_fallback_tecnico(interpretacao)
+    if _texto_respeita_quantidade_minima(texto_ia, minimo):
+        return _resposta_preservando_ia(
+            estado=estado,
+            interpretacao=interpretacao,
+            status_reserva="em_coleta",
+        )
+
+    texto = _mensagem_quantidade_abaixo_minima(estado, pessoas=pessoas, minimo=minimo)
+    _log_resposta_substituida(
+        texto_ia=str(interpretacao.get("texto") or ""),
+        texto_final=texto,
+        funcao="_responder_quantidade_abaixo_minima_se_necessario",
+        motivo="quantidade_abaixo_minima",
+    )
+    return {
+        "texto": texto,
+        "reserva_confirmada": False,
+        "dados_reserva": _dados_reserva_do_estado(estado),
+        "status_reserva": "em_coleta",
+        "confianca": max(float(interpretacao.get("confianca") or 0.0), 0.9),
+    }
+
+
+def _texto_respeita_quantidade_minima(texto: str, minimo: int) -> bool:
+    normalizado = _normalizar_busca(texto)
+    if not normalizado:
+        return False
+    if _texto_tenta_confirmar_reserva(texto):
+        return False
+    if _texto_pede_nome_ou_telefone(normalizado) or re.search(r"\b(pix|comprovante|taxa|sinal)\b", normalizado):
+        return False
+    return bool(
+        re.search(r"\b(nao\s+precisa|nao\s+e\s+necessario|sem\s+reserva|vir\s+direto|so\s+vir)\b", normalizado)
+        and str(minimo) in normalizado
+    )
+
+
+def _mensagem_quantidade_abaixo_minima(estado: Mapping[str, Any], *, pessoas: int, minimo: int) -> str:
+    texto = (
+        f"Para {pessoas} pessoas nao precisa fazer reserva; as reservas sao feitas a partir de {minimo} pessoas. "
+        "Pode vir direto."
+    )
+    preferencia = str(estado.get("preferencia_espaco_nome") or "").strip()
+    horario = str(estado.get("horario") or "").strip()
+    motivo = str(estado.get("motivo_local_nao_garantido") or "").strip()
+    if preferencia and horario and motivo:
+        texto += f" Se depois virar uma reserva, deixo {preferencia} apenas como preferencia; nesse horario o local depende da disponibilidade."
+    return texto
+
+
+def _responder_direcionamento_espaco_se_necessario(
+    *,
+    telefone: str,
+    mensagem_cliente: str,
+    estado: EstadoReserva,
+    interpretacao: Mapping[str, Any],
+) -> RespostaAgente | None:
+    espaco_id = str(estado.get("espaco_direcionado_id") or "")
+    espaco_nome = str(estado.get("espaco_direcionado_nome") or "")
+    if not espaco_id or not espaco_nome:
+        return None
+
+    if estado.get("aguardando_confirmacao_espaco") and _eh_confirmacao_cliente(mensagem_cliente):
+        estado["cliente_autorizou_espaco_direcionado"] = True
+        estado["aguardando_confirmacao_espaco"] = False
+        estado["aguardando_confirmacao"] = True
+        _definir_campo_pendente(estado, "confirmacao")
+        return _resposta_preservando_ia(
+            estado=estado,
+            interpretacao=interpretacao,
+            status_reserva="aguardando_confirmacao",
+        )
+
+    texto_ia = _texto_ia_ou_fallback_tecnico(interpretacao)
+    if _texto_respeita_direcionamento_espaco(texto_ia, estado):
+        estado["aguardando_confirmacao_espaco"] = True
+        estado["aguardando_confirmacao"] = False
+        estado["cliente_autorizou_confirmacao"] = False
+        _definir_campo_pendente(estado, "espaco")
+        return _resposta_preservando_ia(
+            estado=estado,
+            interpretacao=interpretacao,
+            status_reserva="em_coleta",
+        )
+
+    if not _mensagem_solicita_preferencia_espaco(mensagem_cliente) and not _mensagem_indica_correcao(mensagem_cliente, interpretacao):
+        return None
+
+    estado["aguardando_confirmacao_espaco"] = True
+    estado["aguardando_confirmacao"] = False
+    estado["cliente_autorizou_confirmacao"] = False
+    _definir_campo_pendente(estado, "espaco")
+    texto = _mensagem_direcionamento_espaco(estado)
+    _log_resposta_substituida(
+        texto_ia=str(interpretacao.get("texto") or ""),
+        texto_final=texto,
+        funcao="_responder_direcionamento_espaco_se_necessario",
+        motivo="direcionamento_operacional_espaco",
+    )
+    return {
+        "texto": texto,
+        "reserva_confirmada": False,
+        "dados_reserva": _dados_reserva_do_estado(estado),
+        "status_reserva": "em_coleta",
+        "confianca": max(float(interpretacao.get("confianca") or 0.0), 0.9),
+    }
+
+
+def _texto_respeita_direcionamento_espaco(texto: str, estado: Mapping[str, Any]) -> bool:
+    normalizado = _normalizar_busca(texto)
+    espaco_nome = _normalizar_busca(str(estado.get("espaco_direcionado_nome") or ""))
+    if not normalizado or not espaco_nome:
+        return False
+    if _texto_tenta_confirmar_reserva(texto) and not re.search(r"\b(posso|pode)\s+(?:seguir|continuar)\b", normalizado):
+        return False
+    return bool(
+        re.search(rf"\b{re.escape(espaco_nome)}\b", normalizado)
+        and re.search(r"\b(acima\s+de|regra|precisa|direcionad|seguir|continuar|fica|ser)\b", normalizado)
+    )
+
+
+def _mensagem_direcionamento_espaco(estado: Mapping[str, Any]) -> str:
+    pessoas = _pessoas_json(estado.get("pessoas"))
+    dia = _dia_semana_texto(str(estado.get("data_reserva") or "")) or "nesse dia"
+    limite = estado.get("limite_operacional_espaco")
+    espaco = str(estado.get("espaco_direcionado_nome") or "espaco indicado")
+    if pessoas is not None and limite:
+        return (
+            f"Para {pessoas} pessoas no {dia}, a regra cadastrada direciona grupos acima de {limite} pessoas para {espaco}; "
+            f"a reserva precisa seguir com {espaco}. "
+            f"Posso seguir com {espaco}?"
+        )
+    return f"Pela regra cadastrada, essa reserva precisa seguir com {espaco}. Posso continuar assim?"
+
+
+def _responder_pedido_de_dado_conhecido_se_necessario(
+    *,
+    telefone: str,
+    estado: EstadoReserva,
+    interpretacao: Mapping[str, Any],
+) -> RespostaAgente | None:
+    texto_ia = _texto_ia_ou_fallback_tecnico(interpretacao)
+    normalizado = _normalizar_busca(texto_ia)
+    if not _texto_pede_nome_ou_telefone(normalizado):
+        return None
+    nome_conhecido = bool(str(estado.get("nome_cliente") or "").strip())
+    telefone_conhecido = bool(str(telefone or "").strip())
+    if not (nome_conhecido or telefone_conhecido):
+        return None
+
+    dados_estado = _dados_reserva_do_estado(estado)
+    faltantes = _campos_obrigatorios_faltantes(estado, telefone)
+    if not faltantes:
+        estado["aguardando_confirmacao"] = True
+        _definir_campo_pendente(estado, "confirmacao")
+        texto = _mensagem_confirmacao_previa_segura(dados_estado)
+    else:
+        campo = faltantes[0]
+        _definir_campo_pendente(estado, campo)
+        texto = _mensagem_pedir_campo(campo, estado, registrar_tentativa=False)
+    _log_resposta_substituida(
+        texto_ia=str(interpretacao.get("texto") or ""),
+        texto_final=texto,
+        funcao="_responder_pedido_de_dado_conhecido_se_necessario",
+        motivo="nome_ou_telefone_ja_conhecido",
+    )
+    return {
+        "texto": texto,
+        "reserva_confirmada": False,
+        "dados_reserva": dados_estado,
+        "status_reserva": "aguardando_confirmacao" if not faltantes else "em_coleta",
+        "confianca": max(float(interpretacao.get("confianca") or 0.0), 0.9),
+    }
+
+
+def _texto_pede_nome_ou_telefone(normalizado: str) -> bool:
+    return bool(
+        re.search(r"\b(qual|me\s+passa|me\s+diz|informa|pode\s+passar)\b.{0,50}\b(nome|telefone|whatsapp|contato)\b", normalizado)
+        or re.search(r"\b(nome|telefone|whatsapp|contato)\b.{0,50}\b(para\s+a\s+reserva|da\s+reserva)\b", normalizado)
+    )
 
 
 def _aplicar_guardrails_configuracao_resposta(
@@ -1022,7 +1269,6 @@ def aplicar_guardrails_reserva(
         estado["nome_cliente"] = nome_cliente.strip()
 
     _atualizar_contexto_conversacional_estado(estado, interpretacao)
-    _atualizar_preferencia_espaco_estado(estado, mensagem_cliente=mensagem_cliente)
     data_clara_promovivel = _mensagem_tem_data_clara_promovivel(mensagem_cliente, estado, interpretacao)
     horario_claro_promovivel = _mensagem_tem_horario_claro_promovivel(mensagem_cliente, estado, interpretacao)
 
@@ -1133,6 +1379,34 @@ def aplicar_guardrails_reserva(
             "status_reserva": status_reserva,
             "confianca": interpretacao["confianca"],
         }
+
+    _atualizar_preferencia_espaco_estado(estado, mensagem_cliente=mensagem_cliente)
+    _aplicar_regras_operacionais_espaco_estado(estado)
+
+    resposta_quantidade_minima = _responder_quantidade_abaixo_minima_se_necessario(
+        telefone=telefone_limpo,
+        estado=estado,
+        interpretacao=interpretacao,
+    )
+    if resposta_quantidade_minima is not None:
+        return resposta_quantidade_minima
+
+    resposta_espaco = _responder_direcionamento_espaco_se_necessario(
+        telefone=telefone_limpo,
+        mensagem_cliente=mensagem_cliente,
+        estado=estado,
+        interpretacao=interpretacao,
+    )
+    if resposta_espaco is not None:
+        return resposta_espaco
+
+    resposta_dados_conhecidos = _responder_pedido_de_dado_conhecido_se_necessario(
+        telefone=telefone_limpo,
+        estado=estado,
+        interpretacao=interpretacao,
+    )
+    if resposta_dados_conhecidos is not None:
+        return resposta_dados_conhecidos
 
     if intencao_conversacional:
         return _responder_intencao_conversacional(
@@ -1293,6 +1567,7 @@ def dados_reserva_obrigatorios_ok(
     nome = str(dados.get("nome_cliente") or nome_cliente or "").strip()
     telefone_limpo = str(telefone or "").strip()
     pessoas = _pessoas_json(dados.get("pessoas"))
+    config = _config_restaurante_atual()
     return bool(
         _data_reserva_valida(str(dados.get("data_reserva") or ""))
         and _horario_reserva_valido(
@@ -1300,6 +1575,7 @@ def dados_reserva_obrigatorios_ok(
             data_reserva=str(dados.get("data_reserva") or ""),
         )
         and pessoas is not None
+        and _pessoas_atende_quantidade_minima(pessoas, config)
         and nome
         and telefone_limpo
     )
@@ -1813,6 +2089,19 @@ def _definir_data_estado(
             fonte,
         )
         return
+    dia_mencionado = _dia_semana_mencionado(valor_original)
+    dia_calculado = _dia_semana_texto(data_texto)
+    if dia_mencionado and dia_calculado and dia_mencionado != dia_calculado:
+        invalidos.add("data_reserva")
+        estado["data_dia_semana_incompativel"] = f"{dia_mencionado}|{dia_calculado}|{data_texto}"
+        logger.info(
+            "DIAG_RESERVA validacao_data valor=%s valido=false motivo=dia_semana_incompativel mencionado=%s calculado=%s fonte=%s",
+            data_texto,
+            dia_mencionado,
+            dia_calculado,
+            fonte,
+        )
+        return
     data_anterior = str(estado.get("data_reserva") or "")
     if data_anterior and data_anterior != data_texto and not permitir_sobrescrever:
         logger.info(
@@ -1831,6 +2120,7 @@ def _definir_data_estado(
         return
     estado["data_reserva"] = data_texto
     estado["data_reserva_fonte"] = fonte
+    estado.pop("data_dia_semana_incompativel", None)
     if valor_original:
         estado["data_reserva_original"] = valor_original.strip()
     _limpar_tentativas_campo(estado, "data_reserva")
@@ -2439,6 +2729,105 @@ def _regra_faq_espaco_aplicavel(
     return " ".join(dict.fromkeys(motivos))
 
 
+def _aplicar_regras_operacionais_espaco_estado(estado: EstadoReserva) -> None:
+    config = _config_restaurante_atual()
+    direcionamento = _direcionamento_operacional_espaco(estado, config)
+    if direcionamento is None:
+        for chave in (
+            "espaco_direcionado_id",
+            "espaco_direcionado_nome",
+            "motivo_direcionamento_espaco",
+            "limite_operacional_espaco",
+        ):
+            estado.pop(chave, None)
+        estado["aguardando_confirmacao_espaco"] = False
+        estado["cliente_autorizou_espaco_direcionado"] = False
+        return
+
+    espaco = direcionamento["espaco"]
+    limite = int(direcionamento["limite"])
+    motivo = str(direcionamento["motivo"])
+    estado["espaco_direcionado_id"] = espaco.id
+    estado["espaco_direcionado_nome"] = espaco.nome
+    estado["motivo_direcionamento_espaco"] = motivo
+    estado["limite_operacional_espaco"] = limite
+    motivo_local = str(estado.get("motivo_local_nao_garantido") or "").strip()
+    if motivo_local:
+        if motivo not in motivo_local:
+            estado["motivo_local_nao_garantido"] = f"{motivo_local} {motivo}"
+    else:
+        estado["motivo_local_nao_garantido"] = motivo
+    estado["espaco_confirmado"] = False
+    estado["local_garantido"] = False
+    if (
+        estado.get("preferencia_espaco_id")
+        and estado.get("preferencia_espaco_id") != espaco.id
+        and not estado.get("cliente_autorizou_espaco_direcionado")
+    ):
+        estado["cliente_autorizou_espaco_direcionado"] = False
+    logger.info(
+        "regra_faq_aplicada espaco_direcionado_id=%s nome=%s limite=%s motivo=%r",
+        espaco.id,
+        espaco.nome,
+        limite,
+        motivo,
+    )
+
+
+def _direcionamento_operacional_espaco(
+    estado: Mapping[str, Any],
+    config: config_restaurante.ConfigRestaurante,
+) -> dict[str, Any] | None:
+    pessoas = _pessoas_json(estado.get("pessoas"))
+    dia_semana = _dia_semana_texto(str(estado.get("data_reserva") or ""))
+    if pessoas is None or dia_semana not in {"sabado", "domingo"}:
+        return None
+
+    for faq in config.faq_conteudos:
+        if not faq.ativo or not _faq_relacionada_espaco(faq):
+            continue
+        normalizado = _normalizar_busca(faq.conteudo)
+        if not re.search(r"\b(sabado|domingos?|domingo|finais de semana|fim de semana)\b", normalizado):
+            continue
+        for limite in _limites_operacionais_faq(faq.conteudo):
+            if pessoas <= limite:
+                continue
+            espaco_destino = _espaco_destino_direcionamento_faq(faq.conteudo, config)
+            if espaco_destino is None:
+                logger.warning(
+                    "regra_faq_aplicada sem_espaco_destino pessoas=%s limite=%s faq_id=%s",
+                    pessoas,
+                    limite,
+                    faq.id,
+                )
+                continue
+            return {
+                "espaco": espaco_destino,
+                "limite": limite,
+                "faq_id": faq.id,
+                "motivo": f"FAQ ativa direciona grupos acima de {limite} pessoas em {dia_semana} para {espaco_destino.nome}.",
+            }
+    return None
+
+
+def _espaco_destino_direcionamento_faq(
+    texto: str,
+    config: config_restaurante.ConfigRestaurante,
+) -> config_restaurante.EspacoRestaurante | None:
+    normalizado = _normalizar_busca(texto)
+    for espaco in _espacos_ativos(config):
+        nome = _normalizar_busca(espaco.nome)
+        if not nome:
+            continue
+        if re.search(
+            rf"\b(?:direcionad\w*|realizad\w*|feit\w*|ficam?|seguem?)\b.{{0,120}}"
+            rf"\b(?:para|pra|no|na|em)\s+(?:o|a)?\s*{re.escape(nome)}\b",
+            normalizado,
+        ):
+            return espaco
+    return None
+
+
 def _motivo_texto_regra_nao_garantido(texto: str, estado: Mapping[str, Any]) -> str:
     horario = str(estado.get("horario") or "").strip()
     if not texto or not horario:
@@ -2535,6 +2924,7 @@ def _mensagem_indica_correcao(mensagem_cliente: str, interpretacao: Mapping[str,
 
 def _campos_obrigatorios_faltantes(estado: EstadoReserva, telefone: str) -> list[str]:
     faltantes: list[str] = []
+    config = _config_restaurante_atual()
     if not _data_reserva_valida(str(estado.get("data_reserva") or "")):
         faltantes.append("data_reserva")
     if not _horario_reserva_valido(
@@ -2542,13 +2932,22 @@ def _campos_obrigatorios_faltantes(estado: EstadoReserva, telefone: str) -> list
         data_reserva=str(estado.get("data_reserva") or ""),
     ):
         faltantes.append("horario")
-    if _pessoas_json(estado.get("pessoas")) is None:
+    pessoas = _pessoas_json(estado.get("pessoas"))
+    if pessoas is None or not _pessoas_atende_quantidade_minima(pessoas, config):
         faltantes.append("pessoas")
     if not estado.get("nome_cliente"):
         faltantes.append("nome_cliente")
     if not telefone.strip():
         faltantes.append("telefone")
     return faltantes
+
+
+def _pessoas_atende_quantidade_minima(pessoas: int | None, config: config_restaurante.ConfigRestaurante | None = None) -> bool:
+    if pessoas is None:
+        return False
+    config_atual = config or _config_restaurante_atual()
+    minimo = config_atual.quantidade_minima_reserva
+    return minimo is None or pessoas >= minimo
 
 
 def _dados_reserva_do_estado(estado: EstadoReserva) -> DadosReserva:
@@ -2563,6 +2962,9 @@ def _dados_reserva_do_estado(estado: EstadoReserva) -> DadosReserva:
         "preferencia_espaco_nome",
         "espaco_confirmado",
         "local_garantido",
+        "espaco_direcionado_id",
+        "espaco_direcionado_nome",
+        "motivo_direcionamento_espaco",
     ):
         valor = estado.get(campo)
         if valor not in (None, "", []):
@@ -2606,6 +3008,13 @@ def _mensagem_validacao_falhou(
     *,
     mensagem_cliente: str,
 ) -> str:
+    if campo == "data_reserva" and estado.get("data_dia_semana_incompativel"):
+        return _mensagem_data_dia_semana_incompativel(estado)
+    if campo == "pessoas" and estado.get("quantidade_abaixo_minima"):
+        pessoas = _pessoas_json(estado.get("pessoas")) or 0
+        minimo = _config_restaurante_atual().quantidade_minima_reserva or 0
+        return _mensagem_quantidade_abaixo_minima(estado, pessoas=pessoas, minimo=minimo)
+
     texto_modelo = _texto_modelo_para_validacao(str(interpretacao.get("texto") or ""), campo)
     if texto_modelo:
         _registrar_tentativa_campo(estado, campo)
@@ -2627,6 +3036,17 @@ def _mensagem_validacao_falhou(
     _registrar_tentativa_campo(estado, campo)
     _registrar_validacao_estado(estado, campo=campo, resposta="fallback_tecnico")
     return _resposta_contingencia()
+
+
+def _mensagem_data_dia_semana_incompativel(estado: Mapping[str, Any]) -> str:
+    partes = str(estado.get("data_dia_semana_incompativel") or "").split("|")
+    if len(partes) == 3:
+        mencionado, calculado, data_iso = partes
+        return (
+            f"Essa data cai em {calculado}, nao em {mencionado}. "
+            f"Me confirma uma data valida para eu seguir com a reserva?"
+        )
+    return "O dia da semana informado nao combina com a data. Me confirma a data correta para eu seguir?"
 
 
 def _gerar_resposta_ia_pos_validacao(
@@ -2702,6 +3122,16 @@ def _resultado_validacao(campo: str, estado: Mapping[str, Any]) -> dict[str, Any
             "fecha": fechamento,
         }
     if campo == "data_reserva":
+        if estado.get("data_dia_semana_incompativel"):
+            partes = str(estado.get("data_dia_semana_incompativel") or "").split("|")
+            return {
+                "valido": False,
+                "campo": "data",
+                "motivo": "dia_semana_incompativel",
+                "dia_mencionado": partes[0] if len(partes) == 3 else "",
+                "dia_calculado": partes[1] if len(partes) == 3 else "",
+                "data_interpretada": partes[2] if len(partes) == 3 else "",
+            }
         return {
             "valido": False,
             "campo": "data",
@@ -2709,6 +3139,16 @@ def _resultado_validacao(campo: str, estado: Mapping[str, Any]) -> dict[str, Any
             "hoje": _hoje().isoformat(),
         }
     if campo == "pessoas":
+        pessoas = _pessoas_json(estado.get("pessoas"))
+        minimo = _config_restaurante_atual().quantidade_minima_reserva
+        if pessoas is not None and minimo is not None and pessoas < minimo:
+            return {
+                "valido": False,
+                "campo": "quantidade",
+                "motivo": "abaixo_da_quantidade_minima",
+                "quantidade": pessoas,
+                "quantidade_minima": minimo,
+            }
         return {
             "valido": False,
             "campo": "quantidade",
@@ -2860,6 +3300,29 @@ def _resolver_mensagem_confirmacao_pendente(
 ) -> RespostaAgente | None:
     if not _confirmacao_ativa(estado):
         return None
+
+    _atualizar_preferencia_espaco_estado(estado, mensagem_cliente=mensagem_cliente)
+    _aplicar_regras_operacionais_espaco_estado(estado)
+
+    if estado.get("aguardando_confirmacao_espaco") and _eh_confirmacao_cliente(mensagem_cliente):
+        estado["cliente_autorizou_espaco_direcionado"] = True
+        estado["aguardando_confirmacao_espaco"] = False
+        estado["aguardando_confirmacao"] = True
+        _definir_campo_pendente(estado, "confirmacao")
+        return _resposta_preservando_ia(
+            estado=estado,
+            interpretacao=interpretacao,
+            status_reserva="aguardando_confirmacao",
+        )
+
+    resposta_espaco = _responder_direcionamento_espaco_se_necessario(
+        telefone=telefone,
+        mensagem_cliente=mensagem_cliente,
+        estado=estado,
+        interpretacao=interpretacao,
+    )
+    if resposta_espaco is not None:
+        return resposta_espaco
 
     if _eh_pausa_confirmacao(mensagem_cliente):
         return _responder_pausa_confirmacao(
@@ -3654,6 +4117,7 @@ def _mensagem_tem_sinal_data(texto: str) -> bool:
     return bool(
         re.search(
             r"\b(hoje|amanha|dia\s+\d{1,2}|\d{1,2}[/-]\d{1,2}|"
+            r"\d{1,2}(?:o|º|°)?\s+de\s+(?:janeiro|fevereiro|marco|março|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)|"
             r"\d{4}-\d{2}-\d{2}|"
             r"segunda(?: feira)?|terca(?: feira)?|quarta(?: feira)?|quinta(?: feira)?|"
             r"sexta(?: feira)?|sabado|domingo|proxim[ao]\s+(?:segunda|terca|quarta|quinta|sexta|sabado|domingo))\b",
@@ -3995,8 +4459,11 @@ def _contexto_reserva_espacos(estado: Mapping[str, Any], config: config_restaura
             "quantidade": pessoas,
             "preferencia_espaco_id": str(estado.get("preferencia_espaco_id") or "") or None,
             "preferencia_espaco_nome": str(estado.get("preferencia_espaco_nome") or "") or None,
+            "espaco_direcionado_id": str(estado.get("espaco_direcionado_id") or "") or None,
+            "espaco_direcionado_nome": str(estado.get("espaco_direcionado_nome") or "") or None,
             "espaco_confirmado": bool(estado.get("espaco_confirmado")),
             "local_garantido": bool(estado.get("local_garantido")),
+            "motivo_direcionamento_espaco": str(estado.get("motivo_direcionamento_espaco") or ""),
         },
         "resultado_disponibilidade": {
             "consultado": bool(estado.get("disponibilidade_espaco_consultada")),
@@ -4021,6 +4488,12 @@ def _dia_semana_texto(data_reserva: str) -> str | None:
         return None
     nomes = {1: "segunda", 2: "terca", 3: "quarta", 4: "quinta", 5: "sexta", 6: "sabado", 7: "domingo"}
     return nomes.get(data.isoweekday())
+
+
+def _dia_semana_mencionado(texto: str) -> str | None:
+    normalizado = _normalizar_busca(texto)
+    match = re.search(r"\b(segunda|terca|quarta|quinta|sexta|sabado|domingo)(?:\s+feira)?\b", normalizado)
+    return match.group(1) if match else None
 
 
 def _selecionar_faqs_relevantes(
@@ -4346,6 +4819,8 @@ def _mensagem_sistema(
             "Pergunte data e horário juntos na primeira pergunta quando a conversa ainda estiver iniciando. "
             "Depois pergunte o total de pessoas. "
             "Nunca confirme uma reserva sem data, horario, quantidade de pessoas, nome e telefone. "
+            "O telefone do cliente vem do WhatsApp; nao peca telefone se ele ja estiver conhecido pelo sistema. "
+            "Se o nome do cliente ja veio do cadastro ou webhook, nao peca o nome novamente. "
             "Se o cliente disser sim mas faltar algum campo, pergunte o campo faltante. "
             "Se o horario ou a quantidade forem invalidos, nao use esse valor. "
             "Antes da confirmacao final, envie um resumo com data, horario e pessoas e pergunte se pode confirmar. "
@@ -4598,7 +5073,7 @@ def _extrair_data_mes_extenso(texto: str) -> str | None:
     texto_normalizado = _normalizar_busca(texto)
     match = re.search(
         r"\b(?:(?:segunda|terca|quarta|quinta|sexta|sabado|domingo)(?:\s+feira)?\s*,?\s*)?"
-        r"(\d{1,2})\s+de\s+([a-z]{3,})(?:\s+de\s+(\d{4}))?\b",
+        r"(\d{1,2})(?:o|º|°)?\s+de\s+([a-z]{3,})(?:\s+de\s+(\d{4}))?\b",
         texto_normalizado,
         flags=re.IGNORECASE,
     )
