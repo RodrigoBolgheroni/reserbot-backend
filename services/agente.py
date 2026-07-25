@@ -85,7 +85,10 @@ class DadosReserva(TypedDict, total=False):
     local_garantido: bool
     espaco_direcionado_id: str
     espaco_direcionado_nome: str
+    espaco_sugerido_id: str
+    espaco_sugerido_nome: str
     motivo_direcionamento_espaco: str
+    regra_espaco_obrigatoria: bool
 
 
 class RespostaAgente(TypedDict):
@@ -135,10 +138,13 @@ class EstadoReserva(TypedDict, total=False):
     disponibilidade_espaco_consultada: bool
     espaco_direcionado_id: str
     espaco_direcionado_nome: str
+    espaco_sugerido_id: str
+    espaco_sugerido_nome: str
     motivo_direcionamento_espaco: str
     limite_operacional_espaco: int
     aguardando_confirmacao_espaco: bool
     cliente_autorizou_espaco_direcionado: bool
+    regra_espaco_obrigatoria: bool
     quantidade_abaixo_minima: bool
     data_dia_semana_incompativel: str
     campo_pendente: str
@@ -230,10 +236,13 @@ CHAVES_ESTADO_PERSISTIDO: Final[set[str]] = {
     "disponibilidade_espaco_consultada",
     "espaco_direcionado_id",
     "espaco_direcionado_nome",
+    "espaco_sugerido_id",
+    "espaco_sugerido_nome",
     "motivo_direcionamento_espaco",
     "limite_operacional_espaco",
     "aguardando_confirmacao_espaco",
     "cliente_autorizou_espaco_direcionado",
+    "regra_espaco_obrigatoria",
     "quantidade_abaixo_minima",
     "data_dia_semana_incompativel",
     "campo_pendente",
@@ -558,6 +567,7 @@ def _normalizar_estado_reserva_persistido(estado: Mapping[str, Any] | None) -> E
             "cliente_autorizou_confirmacao",
             "aguardando_confirmacao_espaco",
             "cliente_autorizou_espaco_direcionado",
+            "regra_espaco_obrigatoria",
             "quantidade_abaixo_minima",
             "preferencia_espaco_permitida",
             "espaco_confirmado",
@@ -628,7 +638,10 @@ def _mensagem_contexto_reserva(telefone: str) -> Mensagem:
         "preferencia_espaco_nome": estado.get("preferencia_espaco_nome", ""),
         "espaco_direcionado_id": estado.get("espaco_direcionado_id", ""),
         "espaco_direcionado_nome": estado.get("espaco_direcionado_nome", ""),
+        "espaco_sugerido_id": estado.get("espaco_sugerido_id", ""),
+        "espaco_sugerido_nome": estado.get("espaco_sugerido_nome", ""),
         "motivo_direcionamento_espaco": estado.get("motivo_direcionamento_espaco", ""),
+        "regra_espaco_obrigatoria": bool(estado.get("regra_espaco_obrigatoria")),
     }
     return {
         "role": "system",
@@ -783,7 +796,7 @@ def _responder_direcionamento_espaco_se_necessario(
         )
 
     texto_ia = _texto_ia_ou_fallback_tecnico(interpretacao)
-    if _texto_respeita_direcionamento_espaco(texto_ia, estado):
+    if _texto_respeita_direcionamento_espaco(texto_ia, estado) and not _mensagem_tenta_espaco_proibido(mensagem_cliente, estado):
         estado["aguardando_confirmacao_espaco"] = True
         estado["aguardando_confirmacao"] = False
         estado["cliente_autorizou_confirmacao"] = False
@@ -794,7 +807,11 @@ def _responder_direcionamento_espaco_se_necessario(
             status_reserva="em_coleta",
         )
 
-    if not _mensagem_solicita_preferencia_espaco(mensagem_cliente) and not _mensagem_indica_correcao(mensagem_cliente, interpretacao):
+    if (
+        not _mensagem_solicita_preferencia_espaco(mensagem_cliente)
+        and not _mensagem_tenta_espaco_proibido(mensagem_cliente, estado)
+        and not _mensagem_indica_correcao(mensagem_cliente, interpretacao)
+    ):
         return None
 
     estado["aguardando_confirmacao_espaco"] = True
@@ -822,6 +839,8 @@ def _texto_respeita_direcionamento_espaco(texto: str, estado: Mapping[str, Any])
     espaco_nome = _normalizar_busca(str(estado.get("espaco_direcionado_nome") or ""))
     if not normalizado or not espaco_nome:
         return False
+    if _texto_contraria_regra_espaco_obrigatoria(texto, estado):
+        return False
     if _texto_tenta_confirmar_reserva(texto) and not re.search(r"\b(posso|pode)\s+(?:seguir|continuar)\b", normalizado):
         return False
     return bool(
@@ -837,11 +856,54 @@ def _mensagem_direcionamento_espaco(estado: Mapping[str, Any]) -> str:
     espaco = str(estado.get("espaco_direcionado_nome") or "espaco indicado")
     if pessoas is not None and limite:
         return (
-            f"Para {pessoas} pessoas no {dia}, a regra cadastrada direciona grupos acima de {limite} pessoas para {espaco}; "
-            f"a reserva precisa seguir com {espaco}. "
-            f"Posso seguir com {espaco}?"
+            f"Entendo, mas para {pessoas} pessoas no {dia}, pela regra de grupos acima de {limite} pessoas, a reserva precisa ser em {espaco}. "
+            "Posso seguir assim para o mesmo dia e horario?"
         )
-    return f"Pela regra cadastrada, essa reserva precisa seguir com {espaco}. Posso continuar assim?"
+    return f"Pela regra cadastrada, essa reserva precisa seguir em {espaco}. Posso seguir assim para o mesmo dia e horario?"
+
+
+def _texto_contraria_regra_espaco_obrigatoria(texto: str, estado: Mapping[str, Any]) -> bool:
+    if not estado.get("regra_espaco_obrigatoria"):
+        return False
+    return _texto_tenta_espaco_diferente_do_sugerido(texto, estado)
+
+
+def _mensagem_tenta_espaco_proibido(texto: str, estado: Mapping[str, Any]) -> bool:
+    if not estado.get("regra_espaco_obrigatoria"):
+        return False
+    return _texto_tenta_espaco_diferente_do_sugerido(texto, estado)
+
+
+def _texto_tenta_espaco_diferente_do_sugerido(texto: str, estado: Mapping[str, Any]) -> bool:
+    normalizado = _normalizar_busca(texto)
+    if not normalizado:
+        return False
+    espaco_sugerido = _normalizar_busca(
+        str(estado.get("espaco_sugerido_nome") or estado.get("espaco_direcionado_nome") or "")
+    )
+    if not espaco_sugerido:
+        return False
+    verbos_acao = (
+        r"\b(prefiro|preferia|preferencia|queria|quero|ficar|fica|ver|veja|verificar|"
+        r"consulta|consultar|disponibilidade|possivel|possivelmente|talvez|da\s+pra|"
+        r"tem\s+como|vou|posso|pode|deixo|registro|registrar|confirmo|confirmar|"
+        r"garantir|garantido)\b"
+    )
+    if not re.search(verbos_acao, normalizado):
+        return False
+    config = _config_restaurante_atual()
+    for espaco in _espacos_ativos(config):
+        nome = _normalizar_busca(espaco.nome)
+        if not nome or nome == espaco_sugerido:
+            continue
+        if re.search(rf"\b{re.escape(nome)}\b", normalizado):
+            logger.info(
+                "regra_espaco_obrigatoria_bloqueou_espaco espaco_sugerido=%s espaco_bloqueado=%s",
+                espaco_sugerido,
+                nome,
+            )
+            return True
+    return False
 
 
 def _responder_pedido_de_dado_conhecido_se_necessario(
@@ -2736,12 +2798,15 @@ def _aplicar_regras_operacionais_espaco_estado(estado: EstadoReserva) -> None:
         for chave in (
             "espaco_direcionado_id",
             "espaco_direcionado_nome",
+            "espaco_sugerido_id",
+            "espaco_sugerido_nome",
             "motivo_direcionamento_espaco",
             "limite_operacional_espaco",
         ):
             estado.pop(chave, None)
         estado["aguardando_confirmacao_espaco"] = False
         estado["cliente_autorizou_espaco_direcionado"] = False
+        estado["regra_espaco_obrigatoria"] = False
         return
 
     espaco = direcionamento["espaco"]
@@ -2749,6 +2814,8 @@ def _aplicar_regras_operacionais_espaco_estado(estado: EstadoReserva) -> None:
     motivo = str(direcionamento["motivo"])
     estado["espaco_direcionado_id"] = espaco.id
     estado["espaco_direcionado_nome"] = espaco.nome
+    estado["espaco_sugerido_id"] = espaco.id
+    estado["espaco_sugerido_nome"] = espaco.nome
     estado["motivo_direcionamento_espaco"] = motivo
     estado["limite_operacional_espaco"] = limite
     motivo_local = str(estado.get("motivo_local_nao_garantido") or "").strip()
@@ -2757,8 +2824,13 @@ def _aplicar_regras_operacionais_espaco_estado(estado: EstadoReserva) -> None:
             estado["motivo_local_nao_garantido"] = f"{motivo_local} {motivo}"
     else:
         estado["motivo_local_nao_garantido"] = motivo
+    estado.pop("preferencia_espaco_id", None)
+    estado.pop("preferencia_espaco_nome", None)
+    estado["preferencia_espaco_permitida"] = False
+    estado["regra_espaco_obrigatoria"] = True
     estado["espaco_confirmado"] = False
     estado["local_garantido"] = False
+    estado["disponibilidade_espaco_consultada"] = False
     if (
         estado.get("preferencia_espaco_id")
         and estado.get("preferencia_espaco_id") != espaco.id
@@ -2964,7 +3036,10 @@ def _dados_reserva_do_estado(estado: EstadoReserva) -> DadosReserva:
         "local_garantido",
         "espaco_direcionado_id",
         "espaco_direcionado_nome",
+        "espaco_sugerido_id",
+        "espaco_sugerido_nome",
         "motivo_direcionamento_espaco",
+        "regra_espaco_obrigatoria",
     ):
         valor = estado.get(campo)
         if valor not in (None, "", []):
@@ -4461,9 +4536,12 @@ def _contexto_reserva_espacos(estado: Mapping[str, Any], config: config_restaura
             "preferencia_espaco_nome": str(estado.get("preferencia_espaco_nome") or "") or None,
             "espaco_direcionado_id": str(estado.get("espaco_direcionado_id") or "") or None,
             "espaco_direcionado_nome": str(estado.get("espaco_direcionado_nome") or "") or None,
+            "espaco_sugerido_id": str(estado.get("espaco_sugerido_id") or "") or None,
+            "espaco_sugerido_nome": str(estado.get("espaco_sugerido_nome") or "") or None,
             "espaco_confirmado": bool(estado.get("espaco_confirmado")),
             "local_garantido": bool(estado.get("local_garantido")),
             "motivo_direcionamento_espaco": str(estado.get("motivo_direcionamento_espaco") or ""),
+            "regra_espaco_obrigatoria": bool(estado.get("regra_espaco_obrigatoria")),
         },
         "resultado_disponibilidade": {
             "consultado": bool(estado.get("disponibilidade_espaco_consultada")),
@@ -4847,6 +4925,7 @@ def _mensagem_sistema(
             "Sobre espacos: use a tabela de espacos para fatos estruturados como nome, descricao, ativo, capacidade_maxima e permite_preferencia. "
             "Use espacos.regras e FAQs de espacos como regras operacionais complementares. "
             "Preferencia de local nao significa local confirmado. Nunca garanta espaco sem consulta real de disponibilidade. "
+            "Se contexto_reserva.regra_espaco_obrigatoria for true, nao ofereca nem prometa verificar outro espaco; explique a regra e peca autorizacao para seguir com espaco_sugerido_nome. "
             "Se o cliente fizer uma pergunta normal sobre o restaurante, responda e retome o campo da reserva que faltava. "
             "Se o cliente perguntar como voce sabe uma informacao, explique que os dados foram cadastrados pela equipe no sistema. "
             "Nunca diga que um horario esta disponivel sem uma agenda real integrada; diga que atende dentro do funcionamento e vai verificar a solicitacao. "

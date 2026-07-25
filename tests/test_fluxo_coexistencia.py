@@ -625,6 +625,100 @@ class FluxoCoexistenciaTest(unittest.TestCase):
         self.assertEqual(registrar.call_count, 1)
         processar.assert_not_called()
 
+    def test_debounce_persistente_processa_duas_mensagens_com_uma_resposta(self) -> None:
+        telefone = "5511999999999"
+        conversa = {"id": "conv-1", "status": "bot_ativo", "cliente_telefone": telefone, "metadata": {}}
+        pendentes = [
+            {
+                "id": "msg-1",
+                "conversa_id": "conv-1",
+                "remetente": "cliente",
+                "conteudo": "Entao da pra ver se tem como ir pro salao?",
+                "timestamp": "2026-07-22T20:00:00+00:00",
+                "metadata": {
+                    "debounce_pending": True,
+                    "telefone": telefone,
+                    "provider_message_id_original": "wamid.1",
+                    "timestamp_provider": "2026-07-22T20:00:00+00:00",
+                    "remetente_whatsapp": "Rodrigo",
+                },
+            },
+            {
+                "id": "msg-2",
+                "conversa_id": "conv-1",
+                "remetente": "cliente",
+                "conteudo": "por favor",
+                "timestamp": "2026-07-22T20:00:01+00:00",
+                "metadata": {
+                    "debounce_pending": True,
+                    "telefone": telefone,
+                    "provider_message_id_original": "wamid.2",
+                    "timestamp_provider": "2026-07-22T20:00:01+00:00",
+                    "remetente_whatsapp": "Rodrigo",
+                },
+            },
+        ]
+        fluxo_reservas._debounce_lotes[telefone] = {
+            "mensagens": [
+                {"telefone": telefone, "texto": "Entao da pra ver se tem como ir pro salao?", "provider_message_id": "wamid.1"},
+                {"telefone": telefone, "texto": "por favor", "provider_message_id": "wamid.2"},
+            ],
+            "timer": None,
+            "processando": False,
+            "persistente": True,
+        }
+
+        def selecionar(tabela, **kwargs):
+            filtros = kwargs.get("filtros") or {}
+            if filtros.get("metadata->>debounce_pending") == "eq.true":
+                return {"ok": True, "data": [dict(item) for item in pendentes]}
+            return {"ok": True, "data": []}
+
+        with (
+            patch.object(fluxo_reservas, "buscar_conversa_ativa_por_telefone", return_value=conversa),
+            patch.object(fluxo_reservas, "buscar_conversa_por_telefone", return_value=conversa),
+            patch.object(fluxo_reservas, "_mensagem_ja_processada", return_value=False),
+            patch.object(fluxo_reservas.clientes_supabase, "buscar_cliente_por_telefone", return_value={"id": "cliente-1", "telefone": telefone, "nome": "Rodrigo"}),
+            patch.object(fluxo_reservas.agente, "processar_mensagem", return_value=self.resposta_agente) as processar_ia,
+            patch.object(fluxo_reservas.whatsapp, "enviar_com_resultado", return_value={"ok": True, "provider_message_id": "wamid.bot"}) as enviar,
+            patch.object(fluxo_reservas.supabase, "selecionar", side_effect=selecionar),
+            patch.object(fluxo_reservas.supabase, "atualizar", return_value={"ok": True, "data": []}) as atualizar,
+            patch.object(fluxo_reservas.supabase, "inserir", return_value={"ok": True, "data": []}),
+        ):
+            fluxo_reservas._processar_lote_debounce(telefone)
+
+        processar_ia.assert_called_once()
+        enviar.assert_called_once()
+        chamada = processar_ia.call_args.kwargs
+        self.assertEqual(
+            chamada["mensagem_cliente"],
+            "Entao da pra ver se tem como ir pro salao?\npor favor",
+        )
+        self.assertGreaterEqual(atualizar.call_count, 4)
+
+    def test_mensagens_fora_da_janela_nao_sao_agrupadas(self) -> None:
+        with patch.dict(os.environ, {"RESERVABOT_COALESCENCIA_SEGUNDOS": "2"}):
+            agrupadas = fluxo_reservas._agrupar_mensagens_rapidas(
+                [
+                    {
+                        "telefone": "5511999999999",
+                        "texto": "Primeira",
+                        "remetente": "Rodrigo",
+                        "timestamp": "2026-07-22T20:00:00+00:00",
+                        "provider_message_id": "wamid.1",
+                    },
+                    {
+                        "telefone": "5511999999999",
+                        "texto": "Segunda",
+                        "remetente": "Rodrigo",
+                        "timestamp": "2026-07-22T20:00:03+00:00",
+                        "provider_message_id": "wamid.2",
+                    },
+                ]
+            )
+
+        self.assertEqual(len(agrupadas), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

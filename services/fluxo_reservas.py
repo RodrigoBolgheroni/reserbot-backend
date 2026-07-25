@@ -7,6 +7,7 @@ import threading
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any, TypedDict
+from uuid import uuid4
 
 from services import agente, clientes_supabase, dados, perfis, supabase, whatsapp
 from services.comunicacao import MensagemRecebida
@@ -114,10 +115,10 @@ def registrar_mensagem(
     conteudo: str,
     provider_message_id: str = "",
     metadata: Mapping[str, Any] | None = None,
-) -> None:
+) -> bool:
     texto = conteudo.strip()
     if not texto:
-        return
+        return False
 
     payload = {
         "conversa_id": conversa.get("id"),
@@ -130,8 +131,10 @@ def registrar_mensagem(
     resultado = supabase.inserir(_tabela_mensagens(), _sem_vazios(payload), retornar=False)
     if resultado.get("ok"):
         logger.info("Mensagem %s registrada para conversa %s.", remetente, conversa.get("id"))
+        return True
     else:
         logger.warning("Mensagem nao registrada no Supabase: %s", resultado.get("erro"))
+        return False
 
 
 def processar_resposta_cliente(
@@ -329,6 +332,10 @@ def _registrar_mensagens_cliente(
     provider_message_id: str,
     metadata: Mapping[str, Any] | None,
 ) -> None:
+    if isinstance(metadata, Mapping) and metadata.get("cliente_ja_registrado"):
+        _finalizar_mensagens_debounce_persistidas(metadata)
+        return
+
     agrupadas = _mensagens_agrupadas_metadata(metadata)
     if not agrupadas:
         registrar_mensagem(
@@ -363,6 +370,62 @@ def _mensagens_agrupadas_metadata(metadata: Mapping[str, Any] | None) -> list[Ma
     if not isinstance(agrupadas, list):
         return []
     return [item for item in agrupadas if isinstance(item, Mapping)]
+
+
+def _mensagens_debounce_persistidas_metadata(mensagens_agrupadas: Sequence[Any]) -> list[dict[str, Any]]:
+    persistidas: list[dict[str, Any]] = []
+    for item in mensagens_agrupadas:
+        if not isinstance(item, Mapping):
+            continue
+        raw = item.get("raw") if isinstance(item.get("raw"), Mapping) else {}
+        mensagem_id = str(raw.get("debounce_mensagem_id") or "").strip()
+        if not mensagem_id:
+            continue
+        metadata = raw.get("debounce_metadata") if isinstance(raw.get("debounce_metadata"), Mapping) else {}
+        persistidas.append(
+            {
+                "id": mensagem_id,
+                "provider_message_id": str(item.get("provider_message_id") or metadata.get("provider_message_id_original") or ""),
+                "metadata": dict(metadata),
+            }
+        )
+    return persistidas
+
+
+def _finalizar_mensagens_debounce_persistidas(metadata: Mapping[str, Any]) -> None:
+    persistidas = metadata.get("mensagens_debounce_persistidas")
+    if not isinstance(persistidas, list):
+        return
+    for item in persistidas:
+        if not isinstance(item, Mapping):
+            continue
+        mensagem_id = str(item.get("id") or "").strip()
+        if not mensagem_id:
+            continue
+        metadata_item = item.get("metadata") if isinstance(item.get("metadata"), Mapping) else {}
+        metadata_final = dict(metadata_item)
+        metadata_final.update(
+            {
+                "debounce_pending": False,
+                "debounce_processing": False,
+                "debounce_processed": True,
+                "debounce_processed_at": _agora(),
+            }
+        )
+        provider_message_id = str(item.get("provider_message_id") or metadata_final.get("provider_message_id_original") or "").strip()
+        payload: dict[str, Any] = {"metadata": metadata_final}
+        if provider_message_id:
+            payload["provider_message_id"] = provider_message_id
+        resultado = supabase.atualizar(
+            _tabela_mensagens(),
+            payload,
+            filtros={"id": f"eq.{mensagem_id}"},
+            retornar=False,
+        )
+        if resultado.get("ok"):
+            logger.info("Mensagem debounce persistida finalizada id=%s provider_message_id=%s.", mensagem_id, provider_message_id)
+        else:
+            logger.warning("Mensagem debounce persistida nao finalizada id=%s: %s", mensagem_id, resultado.get("erro"))
 
 
 def _carregar_estado_reserva_conversa(conversa: Mapping[str, Any], telefone: str) -> None:
@@ -561,8 +624,10 @@ def _enfileirar_mensagem_debounce(mensagem: MensagemRecebida) -> ResultadoWebhoo
                 }
 
     conversa = buscar_conversa_ativa_por_telefone(telefone) or buscar_conversa_por_telefone(telefone)
+    pendente_persistido = False
     if conversa is not None:
-        registrar_mensagem(
+        conversa_id = str(conversa.get("id") or "")
+        pendente_persistido = registrar_mensagem(
             conversa,
             remetente="cliente",
             conteudo=str(mensagem.get("texto") or ""),
@@ -570,17 +635,20 @@ def _enfileirar_mensagem_debounce(mensagem: MensagemRecebida) -> ResultadoWebhoo
             metadata={
                 "provider": "cloud",
                 "debounce_pending": True,
+                "debounce_key": _debounce_key(telefone, conversa_id),
+                "telefone": telefone,
                 "provider_message_id_original": provider_message_id,
                 "timestamp_provider": mensagem.get("timestamp", ""),
                 "remetente_whatsapp": mensagem.get("remetente", ""),
             },
-        )
+        ) is True
 
     with _debounce_lock:
         lote = _debounce_lotes.get(telefone)
         if lote is None:
-            lote = {"mensagens": [], "timer": None, "processando": False}
+            lote = {"mensagens": [], "timer": None, "processando": False, "persistente": False}
             _debounce_lotes[telefone] = lote
+        lote["persistente"] = bool(lote.get("persistente")) or pendente_persistido
         timer_antigo = lote.get("timer")
         if isinstance(timer_antigo, threading.Timer):
             timer_antigo.cancel()
@@ -613,28 +681,129 @@ def _processar_lote_debounce(telefone: str) -> None:
             return
         lote["processando"] = True
         mensagens = [dict(item) for item in lote.get("mensagens", []) if isinstance(item, Mapping)]
+        usar_persistente = bool(lote.get("persistente"))
         _debounce_lotes.pop(telefone, None)
 
     if not mensagens:
         return
 
-    for mensagem in mensagens:
+    mensagens_persistidas = _carregar_lote_debounce_persistente(telefone) if usar_persistente else []
+    mensagens_processamento = mensagens_persistidas or mensagens
+
+    for mensagem in mensagens_processamento:
         provider_message_id = str(mensagem.get("provider_message_id") or "").strip()
         if provider_message_id:
             _provider_ids_pendentes.discard(provider_message_id)
 
-    mensagem_agrupada = _montar_mensagem_agrupada(mensagens)
+    mensagem_agrupada = _montar_mensagem_agrupada(mensagens_processamento)
     raw = mensagem_agrupada.get("raw") if isinstance(mensagem_agrupada.get("raw"), Mapping) else {}
-    mensagem_agrupada["raw"] = {**dict(raw), "debounce_processado": True}
+    mensagem_agrupada["raw"] = {
+        **dict(raw),
+        "debounce_processado": True,
+        "debounce_persistente": bool(mensagens_persistidas),
+    }
     logger.info(
-        "Processando lote debounce: telefone=%s mensagens=%s.",
+        "Processando lote debounce: telefone=%s mensagens=%s fonte=%s.",
         telefone,
-        len(mensagens),
+        len(mensagens_processamento),
+        "supabase" if mensagens_persistidas else "memoria",
     )
     try:
         processar_mensagem_webhook(mensagem_agrupada)
     except Exception:
         logger.exception("Falha ao processar lote debounce telefone=%s.", telefone)
+
+
+def _carregar_lote_debounce_persistente(telefone: str) -> list[MensagemRecebida]:
+    conversa = buscar_conversa_ativa_por_telefone(telefone) or buscar_conversa_por_telefone(telefone)
+    conversa_id = str((conversa or {}).get("id") or "")
+    if not conversa_id or conversa_id.startswith("local:"):
+        return []
+
+    resultado = supabase.selecionar(
+        _tabela_mensagens(),
+        filtros={
+            "conversa_id": f"eq.{conversa_id}",
+            "remetente": "eq.cliente",
+            "metadata->>debounce_pending": "eq.true",
+        },
+        colunas="id,conversa_id,remetente,conteudo,timestamp,provider_message_id,metadata,created_at",
+        limite=20,
+        order="timestamp.asc,created_at.asc",
+    )
+    if not resultado.get("ok"):
+        logger.warning("Debounce persistente nao consultado para telefone=%s: %s", telefone, resultado.get("erro"))
+        return []
+
+    dados = resultado.get("data")
+    pendentes = [item for item in dados if isinstance(item, dict)] if isinstance(dados, list) else []
+    if not pendentes:
+        return []
+
+    lock_id = f"{_agora()}:{uuid4()}"
+    travadas = [_travar_mensagem_debounce_pendente(item, lock_id=lock_id) for item in pendentes]
+    mensagens = [_mensagem_debounce_persistida_para_recebida(item) for item in travadas if item]
+    if mensagens:
+        logger.info(
+            "Debounce persistente travado: telefone=%s conversa_id=%s mensagens=%s lock_id=%s.",
+            telefone,
+            conversa_id,
+            len(mensagens),
+            lock_id,
+        )
+    return mensagens
+
+
+def _travar_mensagem_debounce_pendente(mensagem: Mapping[str, Any], *, lock_id: str) -> dict[str, Any] | None:
+    mensagem_id = str(mensagem.get("id") or "").strip()
+    if not mensagem_id:
+        return None
+    metadata = _metadata_mensagem(mensagem)
+    metadata.update(
+        {
+            "debounce_pending": False,
+            "debounce_processing": True,
+            "debounce_lock": lock_id,
+            "debounce_processing_started_at": _agora(),
+        }
+    )
+    resultado = supabase.atualizar(
+        _tabela_mensagens(),
+        {"metadata": metadata},
+        filtros={
+            "id": f"eq.{mensagem_id}",
+            "metadata->>debounce_pending": "eq.true",
+        },
+    )
+    if not resultado.get("ok"):
+        logger.warning("Mensagem pendente de debounce nao travada id=%s: %s", mensagem_id, resultado.get("erro"))
+        return None
+    atualizada = _primeiro(resultado.get("data"))
+    return dict(atualizada or {**dict(mensagem), "metadata": metadata})
+
+
+def _mensagem_debounce_persistida_para_recebida(mensagem: Mapping[str, Any]) -> MensagemRecebida:
+    metadata = _metadata_mensagem(mensagem)
+    return {
+        "telefone": str(metadata.get("telefone") or ""),
+        "texto": str(mensagem.get("conteudo") or ""),
+        "remetente": str(metadata.get("remetente_whatsapp") or ""),
+        "timestamp": str(metadata.get("timestamp_provider") or mensagem.get("timestamp") or ""),
+        "provider_message_id": str(metadata.get("provider_message_id_original") or ""),
+        "raw": {
+            "debounce_mensagem_id": str(mensagem.get("id") or ""),
+            "debounce_metadata": metadata,
+        },
+    }
+
+
+def _metadata_mensagem(mensagem: Mapping[str, Any]) -> dict[str, Any]:
+    metadata = mensagem.get("metadata")
+    return dict(metadata) if isinstance(metadata, Mapping) else {}
+
+
+def _debounce_key(telefone: str, conversa_id: str) -> str:
+    return f"{str(conversa_id or '').strip()}:{str(telefone or '').strip()}"
 
 
 def _janela_debounce_segundos() -> float:
@@ -685,6 +854,12 @@ def processar_mensagem_webhook(mensagem: MensagemRecebida) -> ResultadoWebhook:
             for item in mensagens_agrupadas
             if isinstance(item, Mapping)
         ]
+    if raw.get("debounce_persistente"):
+        metadata["cliente_ja_registrado"] = True
+        if isinstance(mensagens_agrupadas, list):
+            metadata["mensagens_debounce_persistidas"] = _mensagens_debounce_persistidas_metadata(mensagens_agrupadas)
+        else:
+            metadata["mensagens_debounce_persistidas"] = _mensagens_debounce_persistidas_metadata([mensagem])
     resposta = processar_resposta_cliente(
         telefone=telefone,
         mensagem_cliente=texto,

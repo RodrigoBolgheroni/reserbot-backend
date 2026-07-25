@@ -963,8 +963,13 @@ class AgenteConfiguracaoEstruturadaTest(unittest.TestCase):
         self.assertEqual(estado["pessoas"], 26)
         self.assertEqual(estado["espaco_direcionado_id"], "espaco-areia")
         self.assertEqual(estado["espaco_direcionado_nome"], "Areia")
+        self.assertNotIn("preferencia_espaco_id", estado)
+        self.assertEqual(estado["espaco_sugerido_id"], "espaco-areia")
+        self.assertEqual(estado["espaco_sugerido_nome"], "Areia")
+        self.assertTrue(estado["regra_espaco_obrigatoria"])
         self.assertTrue(estado["aguardando_confirmacao_espaco"])
         self.assertFalse(estado["espaco_confirmado"])
+        self.assertFalse(estado["disponibilidade_espaco_consultada"])
         self.assertIn("acima de 25 pessoas", texto)
         self.assertIn("areia", texto)
         self.assertIn("posso seguir", texto)
@@ -1064,7 +1069,64 @@ class AgenteConfiguracaoEstruturadaTest(unittest.TestCase):
         self.assertFalse(resposta["reserva_confirmada"])
         self.assertIn("areia", texto)
         self.assertIn("precisa", texto)
-        self.assertFalse(agente._estados_reserva[telefone]["espaco_confirmado"])
+        estado = agente._estados_reserva[telefone]
+        self.assertNotIn("preferencia_espaco_id", estado)
+        self.assertEqual(estado["espaco_sugerido_id"], "espaco-areia")
+        self.assertTrue(estado["regra_espaco_obrigatoria"])
+        self.assertTrue(estado["aguardando_confirmacao_espaco"])
+        self.assertFalse(estado["espaco_confirmado"])
+        self.assertFalse(estado["disponibilidade_espaco_consultada"])
+
+    def test_regra_obrigatoria_bloqueia_verificacao_do_salao(self) -> None:
+        telefone = "5511993680823"
+        agente._estados_reserva[telefone] = {
+            "data_reserva": "2026-08-01",
+            "horario": "18:00",
+            "pessoas": 26,
+            "nome_cliente": "Rodrigo",
+            "preferencia_espaco_id": "espaco-salao",
+            "preferencia_espaco_nome": "Salao",
+            "espaco_direcionado_id": "espaco-areia",
+            "espaco_direcionado_nome": "Areia",
+            "espaco_sugerido_id": "espaco-areia",
+            "espaco_sugerido_nome": "Areia",
+            "limite_operacional_espaco": 25,
+            "motivo_direcionamento_espaco": "FAQ ativa direciona grupos acima de 25 pessoas em sabado para Areia.",
+            "aguardando_confirmacao_espaco": True,
+            "regra_espaco_obrigatoria": True,
+            "campo_pendente": "espaco",
+            "etapa": "aguardando_espaco",
+        }
+        payload = _payload_custom(
+            "Vou verificar a disponibilidade do salao para voce.",
+            intencao="pergunta_restaurante",
+            campo_sugerido="confirmacao",
+        )
+
+        with (
+            patch.object(config_restaurante.repositorio, "carregar_configuracao_bruta", return_value=_config_bruta_reserva()),
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 25)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste"}, clear=False),
+            patch.object(agente, "_chamar_groq", return_value=payload),
+        ):
+            resposta = agente.processar_mensagem(
+                telefone,
+                "Entao da pra ver se tem como ir pro salao?",
+                nome_cliente="Rodrigo",
+            )
+
+        estado = agente._estados_reserva[telefone]
+        texto = agente._normalizar_busca(resposta["texto"])
+        self.assertFalse(resposta["reserva_confirmada"])
+        self.assertNotIn("verificar", texto)
+        self.assertNotIn("disponibilidade do salao", texto)
+        self.assertIn("areia", texto)
+        self.assertIn("precisa", texto)
+        self.assertNotIn("preferencia_espaco_id", estado)
+        self.assertEqual(estado["espaco_sugerido_id"], "espaco-areia")
+        self.assertTrue(estado["regra_espaco_obrigatoria"])
+        self.assertTrue(estado["aguardando_confirmacao_espaco"])
+        self.assertFalse(estado["disponibilidade_espaco_consultada"])
 
     def test_nome_e_telefone_conhecidos_nao_sao_pedidos_novamente(self) -> None:
         telefone = "5511993680823"
