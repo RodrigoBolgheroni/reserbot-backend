@@ -201,7 +201,10 @@ ETAPA_POR_CAMPO: Final[dict[str, str]] = {
     "analise_comprovante": "aguardando_analise",
 }
 
-CAMPO_POR_ETAPA: Final[dict[str, str]] = {etapa: campo for campo, etapa in ETAPA_POR_CAMPO.items()}
+CAMPO_POR_ETAPA: Final[dict[str, str]] = {
+    **{etapa: campo for campo, etapa in ETAPA_POR_CAMPO.items()},
+    "aguardando_confirmacao_espaco": "espaco",
+}
 INTENCOES_CONVERSACIONAIS_IA: Final[set[str]] = {
     "comentario",
     "brincadeira",
@@ -292,6 +295,7 @@ def processar_mensagem(
     mensagem_cliente: str,
     nome_cliente: str = "",
     perfil_cliente: Mapping[str, Any] | None = None,
+    contexto_mensagem: Mapping[str, Any] | None = None,
 ) -> RespostaAgente:
     telefone_limpo = telefone.strip()
     mensagem_limpa = mensagem_cliente.strip()
@@ -315,6 +319,7 @@ def processar_mensagem(
                 mensagem_cliente=mensagem_limpa,
                 nome_cliente=nome_cliente,
                 perfil_cliente=perfil_cliente,
+                contexto_mensagem=contexto_mensagem,
             )
         finally:
             _telefone_processamento.reset(token_telefone)
@@ -364,6 +369,7 @@ def _processar_mensagem_sem_lock(
     mensagem_cliente: str,
     nome_cliente: str = "",
     perfil_cliente: Mapping[str, Any] | None = None,
+    contexto_mensagem: Mapping[str, Any] | None = None,
 ) -> RespostaAgente:
     telefone_limpo = telefone.strip()
     mensagem_limpa = mensagem_cliente.strip()
@@ -412,6 +418,7 @@ def _processar_mensagem_sem_lock(
                     perfil_cliente=perfil_cliente,
                     telefone=telefone_limpo,
                     mensagem_cliente=mensagem_limpa,
+                    contexto_mensagem=contexto_mensagem,
                 ),
                 _mensagem_contexto_reserva(telefone_limpo),
                 *historico,
@@ -737,12 +744,59 @@ def _marcar_aguardando_comprovante(estado: EstadoReserva) -> None:
     estado["comprovante_status"] = "aguardando_comprovante"
 
 
+def _direcionamento_espaco_aguarda_aceite(estado: Mapping[str, Any]) -> bool:
+    return bool(
+        estado.get("regra_espaco_obrigatoria")
+        and str(estado.get("espaco_direcionado_id") or "").strip()
+        and str(estado.get("espaco_direcionado_nome") or "").strip()
+        and not estado.get("cliente_autorizou_espaco_direcionado")
+    )
+
+
+def _marcar_aguardando_confirmacao_espaco(estado: EstadoReserva) -> None:
+    estado["aguardando_confirmacao_espaco"] = True
+    estado["cliente_autorizou_espaco_direcionado"] = False
+    estado["aguardando_confirmacao"] = False
+    estado["cliente_autorizou_confirmacao"] = False
+    estado["etapa"] = "aguardando_confirmacao_espaco"
+    estado["campo_pendente"] = "espaco"
+
+
+def _resposta_aguardando_confirmacao_espaco(
+    *,
+    estado: EstadoReserva,
+    interpretacao: Mapping[str, Any],
+    funcao: str,
+) -> RespostaAgente:
+    _marcar_aguardando_confirmacao_espaco(estado)
+    texto = _mensagem_direcionamento_espaco(estado)
+    _log_resposta_substituida(
+        texto_ia=str(interpretacao.get("texto") or ""),
+        texto_final=texto,
+        funcao=funcao,
+        motivo="aceite_espaco_direcionado_obrigatorio",
+    )
+    return {
+        "texto": texto,
+        "reserva_confirmada": False,
+        "dados_reserva": _dados_reserva_do_estado(estado),
+        "status_reserva": "em_coleta",
+        "confianca": max(float(interpretacao.get("confianca") or 0.0), 0.9),
+    }
+
+
 def _resposta_aguardando_comprovante(
     *,
     estado: EstadoReserva,
     interpretacao: Mapping[str, Any],
     funcao: str,
 ) -> RespostaAgente:
+    if _direcionamento_espaco_aguarda_aceite(estado):
+        return _resposta_aguardando_confirmacao_espaco(
+            estado=estado,
+            interpretacao=interpretacao,
+            funcao=f"{funcao}.aceite_espaco_pendente",
+        )
     _marcar_aguardando_comprovante(estado)
     texto = _texto_ia_ou_fallback_tecnico(interpretacao)
     if not texto or _texto_tenta_confirmar_reserva(texto):
@@ -843,7 +897,7 @@ def _responder_direcionamento_espaco_se_necessario(
     if not espaco_id or not espaco_nome:
         return None
 
-    if estado.get("aguardando_confirmacao_espaco") and _eh_confirmacao_cliente(mensagem_cliente):
+    if estado.get("aguardando_confirmacao_espaco") and _eh_aceite_espaco_direcionado(mensagem_cliente, estado):
         estado["cliente_autorizou_espaco_direcionado"] = True
         estado["aguardando_confirmacao_espaco"] = False
         return _resposta_aguardando_comprovante(
@@ -852,16 +906,11 @@ def _responder_direcionamento_espaco_se_necessario(
             funcao="_responder_direcionamento_espaco_se_necessario.aceite_espaco",
         )
 
-    texto_ia = _texto_ia_ou_fallback_tecnico(interpretacao)
-    if _texto_respeita_direcionamento_espaco(texto_ia, estado) and not _mensagem_tenta_espaco_proibido(mensagem_cliente, estado):
-        estado["aguardando_confirmacao_espaco"] = True
-        estado["aguardando_confirmacao"] = False
-        estado["cliente_autorizou_confirmacao"] = False
-        _definir_campo_pendente(estado, "espaco")
-        return _resposta_preservando_ia(
+    if _direcionamento_espaco_aguarda_aceite(estado):
+        return _resposta_aguardando_confirmacao_espaco(
             estado=estado,
             interpretacao=interpretacao,
-            status_reserva="em_coleta",
+            funcao="_responder_direcionamento_espaco_se_necessario",
         )
 
     if (
@@ -871,38 +920,10 @@ def _responder_direcionamento_espaco_se_necessario(
     ):
         return None
 
-    estado["aguardando_confirmacao_espaco"] = True
-    estado["aguardando_confirmacao"] = False
-    estado["cliente_autorizou_confirmacao"] = False
-    _definir_campo_pendente(estado, "espaco")
-    texto = _mensagem_direcionamento_espaco(estado)
-    _log_resposta_substituida(
-        texto_ia=str(interpretacao.get("texto") or ""),
-        texto_final=texto,
+    return _resposta_aguardando_confirmacao_espaco(
+        estado=estado,
+        interpretacao=interpretacao,
         funcao="_responder_direcionamento_espaco_se_necessario",
-        motivo="direcionamento_operacional_espaco",
-    )
-    return {
-        "texto": texto,
-        "reserva_confirmada": False,
-        "dados_reserva": _dados_reserva_do_estado(estado),
-        "status_reserva": "em_coleta",
-        "confianca": max(float(interpretacao.get("confianca") or 0.0), 0.9),
-    }
-
-
-def _texto_respeita_direcionamento_espaco(texto: str, estado: Mapping[str, Any]) -> bool:
-    normalizado = _normalizar_busca(texto)
-    espaco_nome = _normalizar_busca(str(estado.get("espaco_direcionado_nome") or ""))
-    if not normalizado or not espaco_nome:
-        return False
-    if _texto_contraria_regra_espaco_obrigatoria(texto, estado):
-        return False
-    if _texto_tenta_confirmar_reserva(texto) and not re.search(r"\b(posso|pode)\s+(?:seguir|continuar)\b", normalizado):
-        return False
-    return bool(
-        re.search(rf"\b{re.escape(espaco_nome)}\b", normalizado)
-        and re.search(r"\b(acima\s+de|regra|precisa|direcionad|seguir|continuar|fica|ser)\b", normalizado)
     )
 
 
@@ -917,12 +938,6 @@ def _mensagem_direcionamento_espaco(estado: Mapping[str, Any]) -> str:
             "Posso seguir assim para o mesmo dia e horario?"
         )
     return f"Pela regra cadastrada, essa reserva precisa seguir em {espaco}. Posso seguir assim para o mesmo dia e horario?"
-
-
-def _texto_contraria_regra_espaco_obrigatoria(texto: str, estado: Mapping[str, Any]) -> bool:
-    if not estado.get("regra_espaco_obrigatoria"):
-        return False
-    return _texto_tenta_espaco_diferente_do_sugerido(texto, estado)
 
 
 def _mensagem_tenta_espaco_proibido(texto: str, estado: Mapping[str, Any]) -> bool:
@@ -1615,6 +1630,13 @@ def aplicar_guardrails_reserva(
             dados_reserva=dados_estado,
         )
 
+    if _direcionamento_espaco_aguarda_aceite(estado):
+        return _resposta_aguardando_confirmacao_espaco(
+            estado=estado,
+            interpretacao=interpretacao,
+            funcao="aplicar_guardrails_reserva.dados_completos",
+        )
+
     _marcar_aguardando_comprovante(estado)
     dados_estado = _dados_reserva_do_estado(estado)
     return _resposta_preservando_ia(
@@ -2304,6 +2326,9 @@ def _definir_pessoas_estado(estado: EstadoReserva, valor: Any, *, invalidos: set
 
 def _definir_campo_pendente(estado: EstadoReserva, campo: str) -> None:
     estado["campo_pendente"] = campo
+    if campo == "espaco" and estado.get("aguardando_confirmacao_espaco"):
+        estado["etapa"] = "aguardando_confirmacao_espaco"
+        return
     etapa = ETAPA_POR_CAMPO.get(campo)
     if etapa:
         estado["etapa"] = etapa
@@ -2856,9 +2881,12 @@ def _aplicar_regras_operacionais_espaco_estado(estado: EstadoReserva) -> None:
         estado["regra_espaco_obrigatoria"] = False
         return
 
+    espaco_anterior = str(estado.get("espaco_direcionado_id") or "").strip()
     espaco = direcionamento["espaco"]
     limite = int(direcionamento["limite"])
     motivo = str(direcionamento["motivo"])
+    if espaco_anterior != espaco.id:
+        estado["cliente_autorizou_espaco_direcionado"] = False
     estado["espaco_direcionado_id"] = espaco.id
     estado["espaco_direcionado_nome"] = espaco.nome
     estado["espaco_sugerido_id"] = espaco.id
@@ -2878,12 +2906,6 @@ def _aplicar_regras_operacionais_espaco_estado(estado: EstadoReserva) -> None:
     estado["espaco_confirmado"] = False
     estado["local_garantido"] = False
     estado["disponibilidade_espaco_consultada"] = False
-    if (
-        estado.get("preferencia_espaco_id")
-        and estado.get("preferencia_espaco_id") != espaco.id
-        and not estado.get("cliente_autorizou_espaco_direcionado")
-    ):
-        estado["cliente_autorizou_espaco_direcionado"] = False
     logger.info(
         "regra_faq_aplicada espaco_direcionado_id=%s nome=%s limite=%s motivo=%r",
         espaco.id,
@@ -3427,7 +3449,7 @@ def _resolver_mensagem_confirmacao_pendente(
     if not _confirmacao_ativa(estado):
         return None
 
-    if estado.get("aguardando_confirmacao_espaco") and _eh_confirmacao_cliente(mensagem_cliente):
+    if estado.get("aguardando_confirmacao_espaco") and _eh_aceite_espaco_direcionado(mensagem_cliente, estado):
         estado["cliente_autorizou_espaco_direcionado"] = True
         estado["aguardando_confirmacao_espaco"] = False
         return _resposta_aguardando_comprovante(
@@ -3710,6 +3732,36 @@ def _eh_confirmacao_cliente(texto: str) -> bool:
         )
         or re.search(
             r"\b(pode confirmar|agora pode confirmar|confirmo|confirma|pode fechar|pode seguir|pode continuar|pode dar andamento|segue com|tudo certo|esta certo|ta certo|fechado)\b",
+            normalizado,
+        )
+    )
+
+
+def _eh_aceite_espaco_direcionado(texto: str, estado: Mapping[str, Any]) -> bool:
+    normalizado = re.sub(r"[^\w\s]", " ", _normalizar_busca(texto))
+    normalizado = re.sub(r"\s+", " ", normalizado).strip()
+    if not normalizado or re.search(r"\b(nao|nunca|prefiro outro|quero outro)\b", normalizado):
+        return False
+    if normalizado in {
+        "sim",
+        "pode",
+        "tudo bem",
+        "aceito",
+        "de acordo",
+        "ok",
+        "certo",
+        "fechado",
+        "pode seguir",
+        "pode continuar",
+        "pode dar andamento",
+    }:
+        return True
+    espaco = _normalizar_busca(str(estado.get("espaco_direcionado_nome") or ""))
+    if not espaco or not re.search(rf"\b{re.escape(espaco)}\b", normalizado):
+        return False
+    return bool(
+        re.search(
+            r"\b(pode|aceito|concordo|de acordo|tudo bem|seguir|continue|continuar|fica|ficar|fechado)\b",
             normalizado,
         )
     )
@@ -4840,6 +4892,7 @@ def _mensagem_sistema(
     perfil_cliente: Mapping[str, Any] | None = None,
     telefone: str = "",
     mensagem_cliente: str = "",
+    contexto_mensagem: Mapping[str, Any] | None = None,
 ) -> Mensagem:
     config = _config_restaurante_atual()
     restaurante = config.nome
@@ -4851,6 +4904,12 @@ def _mensagem_sistema(
     espacos_contexto = _contexto_espacos_restaurante(config)
     regras_espacos_contexto = _contexto_regras_espacos(config)
     contexto_reserva_espacos = _contexto_reserva_espacos(estado, config)
+    contexto_webhook = {
+        "mensagem_contem_midia": bool((contexto_mensagem or {}).get("mensagem_contem_midia")),
+        "tipos_midia": list((contexto_mensagem or {}).get("tipos_midia") or []),
+        "media_ids": list((contexto_mensagem or {}).get("media_ids") or []),
+        "comprovante_persistido": bool((contexto_mensagem or {}).get("comprovante_persistido")),
+    }
     espacos_ativos = _espacos_ativos(config)
     logger.info(
         "espacos_contexto_carregado source=%s estabelecimento_id=%s",
@@ -4911,6 +4970,8 @@ def _mensagem_sistema(
             "\n"
             "Seu objetivo:\n"
             "Coletar dia, horário e número de pessoas. "
+            f"Contexto tecnico da mensagem atual: {_json_contexto(contexto_webhook)}. "
+            "Esse contexto e a unica fonte de verdade sobre anexos: nunca infira midia pelo texto e nunca afirme que um comprovante foi recebido sem comprovante_persistido=true. "
             "Converse primeiro como uma atendente humana inteligente; voce e a orquestradora principal da conversa. "
             "Entenda o significado completo da mensagem antes de extrair qualquer dado. "
             "Antes de tratar a mensagem como preenchimento de campo, classifique a intencao: "

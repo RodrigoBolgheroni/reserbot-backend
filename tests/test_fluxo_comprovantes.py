@@ -107,6 +107,60 @@ class FluxoConclusaoReservaTest(unittest.TestCase):
 
     @patch.object(fluxo_reservas, "registrar_solicitacao_reserva")
     @patch.object(fluxo_reservas.config_restaurante, "obter_config", return_value=_config_praia())
+    def test_a_direcionamento_obrigatorio_exige_aceite_antes_do_comprovante(
+        self,
+        _config,
+        registrar_solicitacao,
+    ) -> None:
+        agente.definir_estado_reserva(
+            TELEFONE,
+            _estado_completo(
+                data_reserva="2026-08-08",
+                horario="14:00",
+                pessoas=26,
+                preferencia_espaco_id="salao-1",
+                preferencia_espaco_nome="Salao",
+                espaco_direcionado_id="areia-1",
+                espaco_direcionado_nome="Areia",
+                regra_espaco_obrigatoria=True,
+                cliente_autorizou_espaco_direcionado=False,
+                etapa="aguardando_comprovante",
+                campo_pendente="comprovante",
+            ),
+        )
+
+        resposta = fluxo_reservas._aplicar_fluxo_comprovante(
+            telefone=TELEFONE,
+            mensagem_cliente="08/08/2026 as 14h para 26 pessoas",
+            cliente={"id": "cli-1", "telefone": TELEFONE, "nome": "Rodrigo"},
+            conversa={"id": "conv-a", "origem": "aniversario"},
+            resposta=_resposta(
+                dados={
+                    "data_reserva": "2026-08-08",
+                    "horario": "14:00",
+                    "pessoas": 26,
+                    "nome_cliente": "Rodrigo",
+                },
+                texto="Perfeito. Envie o comprovante do Pix.",
+            ),
+        )
+
+        estado = agente.obter_estado_reserva(TELEFONE)
+        self.assertEqual(resposta["status_reserva"], "em_coleta")
+        self.assertIn("areia", resposta["texto"].lower())
+        self.assertIn("posso seguir", resposta["texto"].lower())
+        self.assertNotIn("pix", resposta["texto"].lower())
+        self.assertEqual(estado["etapa"], "aguardando_confirmacao_espaco")
+        self.assertEqual(estado["campo_pendente"], "espaco")
+        self.assertFalse(estado["cliente_autorizou_espaco_direcionado"])
+        for aceite in ("pode", "tudo bem", "aceito", "pode continuar com a Areia"):
+            with self.subTest(aceite=aceite):
+                self.assertTrue(agente._eh_aceite_espaco_direcionado(aceite, estado))
+        self.assertFalse(agente._eh_aceite_espaco_direcionado("Enviei", estado))
+        registrar_solicitacao.assert_not_called()
+
+    @patch.object(fluxo_reservas, "registrar_solicitacao_reserva")
+    @patch.object(fluxo_reservas.config_restaurante, "obter_config", return_value=_config_praia())
     @patch.object(fluxo_reservas.agente, "dados_reserva_obrigatorios_ok", return_value=True)
     def test_dados_resolvidos_apresentam_aniversario_pagamento_e_cancelamento_uma_vez(
         self,
@@ -218,6 +272,7 @@ class FluxoConclusaoReservaTest(unittest.TestCase):
         self.assertEqual(estado_apos_aceite["campo_pendente"], "comprovante")
         self.assertFalse(estado_apos_aceite["aguardando_confirmacao"])
         self.assertFalse(estado_apos_aceite["cliente_autorizou_confirmacao"])
+        self.assertTrue(estado_apos_aceite["cliente_autorizou_espaco_direcionado"])
 
         primeira = fluxo_reservas._aplicar_fluxo_comprovante(
             telefone=TELEFONE,
@@ -240,6 +295,10 @@ class FluxoConclusaoReservaTest(unittest.TestCase):
         self.assertIn("imagem ou o pdf", texto_primeira)
         self.assertNotIn("posso confirmar", texto_primeira)
         self.assertNotIn("reserva confirmada", texto_primeira)
+        estado_informacoes = agente.obter_estado_reserva(TELEFONE)
+        self.assertTrue(estado_informacoes["informacoes_aniversario_apresentadas"])
+        self.assertTrue(estado_informacoes["informacoes_pagamento_apresentadas"])
+        self.assertTrue(estado_informacoes["informacoes_cancelamento_apresentadas"])
 
         respostas = [
             ("Estou ciente", "imagem ou o pdf"),
@@ -266,6 +325,70 @@ class FluxoConclusaoReservaTest(unittest.TestCase):
                 estado = agente.obter_estado_reserva(TELEFONE)
                 self.assertEqual(estado["etapa"], "aguardando_comprovante")
                 self.assertEqual(estado["campo_pendente"], "comprovante")
+
+    @patch.object(fluxo_reservas.comprovantes_reserva, "receber_comprovante")
+    @patch.object(fluxo_reservas.supabase, "inserir")
+    @patch.object(fluxo_reservas.config_restaurante, "obter_config", return_value=_config_praia())
+    def test_c_texto_enviei_nao_cria_comprovante_nem_avanca_analise(
+        self,
+        _config,
+        inserir,
+        receber,
+    ) -> None:
+        agente.definir_estado_reserva(
+            TELEFONE,
+            _estado_completo(
+                reserva_id="res-c",
+                etapa="aguardando_comprovante",
+                campo_pendente="comprovante",
+                comprovante_status="aguardando_comprovante",
+                informacoes_pagamento_apresentadas=True,
+                informacoes_cancelamento_apresentadas=True,
+                informacoes_aniversario_apresentadas=True,
+            ),
+        )
+
+        resposta = fluxo_reservas._aplicar_fluxo_comprovante(
+            telefone=TELEFONE,
+            mensagem_cliente="Enviei",
+            cliente={"id": "cli-1", "telefone": TELEFONE, "nome": "Rodrigo"},
+            conversa={"id": "conv-c", "origem": "aniversario"},
+            resposta=_resposta(texto="Comprovante recebido! A equipe vai analisar o comprovante."),
+        )
+
+        estado = agente.obter_estado_reserva(TELEFONE)
+        self.assertIn("nao apareceu nenhum arquivo", resposta["texto"].lower())
+        self.assertNotIn("comprovante recebido", resposta["texto"].lower())
+        self.assertEqual(resposta["status_reserva"], "aguardando_comprovante")
+        self.assertEqual(estado["etapa"], "aguardando_comprovante")
+        self.assertEqual(estado["comprovante_status"], "aguardando_comprovante")
+        receber.assert_not_called()
+        inserir.assert_not_called()
+
+    def test_g_guardrail_final_substitui_afirmacao_sem_comprovante_persistido(self) -> None:
+        agente.definir_estado_reserva(
+            TELEFONE,
+            _estado_completo(
+                etapa="aguardando_comprovante",
+                campo_pendente="comprovante",
+                comprovante_status="aguardando_comprovante",
+            ),
+        )
+        for texto_ia in (
+            "Comprovante recebido! A equipe vai analisar o comprovante.",
+            "A equipe ja recebeu.",
+            "O arquivo foi enviado.",
+        ):
+            with self.subTest(texto_ia=texto_ia):
+                resposta = fluxo_reservas._bloquear_afirmacao_comprovante_backend(
+                    telefone=TELEFONE,
+                    resposta=_resposta(texto=texto_ia),
+                    comprovante_persistido=False,
+                )
+
+                self.assertIn("nao apareceu nenhum arquivo", resposta["texto"].lower())
+                self.assertNotIn("comprovante recebido", resposta["texto"].lower())
+                self.assertEqual(resposta["status_reserva"], "aguardando_comprovante")
 
     @patch.object(fluxo_reservas, "registrar_solicitacao_reserva")
     @patch.object(fluxo_reservas.config_restaurante, "obter_config", return_value=_config_praia())
@@ -443,6 +566,120 @@ class ComprovanteWebhookTest(unittest.TestCase):
         self.assertEqual(receber.call_count, 2)
         self.assertTrue(all(call.kwargs["status"] == "aguardando_humano" for call in atualizar_status.call_args_list))
 
+    @patch.object(fluxo_reservas, "atualizar_status_conversa")
+    @patch.object(fluxo_reservas, "registrar_mensagem", return_value=True)
+    @patch.object(fluxo_reservas.whatsapp, "enviar_com_resultado", return_value={"ok": True, "provider_message_id": "wamid-bot"})
+    @patch.object(fluxo_reservas.supabase, "atualizar", return_value={"ok": True})
+    @patch.object(fluxo_reservas.comprovantes_reserva, "receber_comprovante")
+    @patch.object(fluxo_reservas, "buscar_conversa_ativa_por_telefone")
+    @patch.object(fluxo_reservas, "_provider_message_id_registrado", return_value=False)
+    @patch.object(fluxo_reservas.agente, "processar_mensagem")
+    def test_f_imagem_e_enviei_no_mesmo_lote_registram_e_respondem_uma_vez(
+        self,
+        processar_ia,
+        _duplicado,
+        buscar_conversa,
+        receber,
+        _atualizar_supabase,
+        enviar,
+        _registrar,
+        _atualizar_status,
+    ) -> None:
+        buscar_conversa.return_value = {
+            "id": "conv-f",
+            "cliente_telefone": TELEFONE,
+            "status": "bot_ativo",
+            "origem": "aniversario",
+            "metadata": {
+                "estado_reserva": _estado_completo(
+                    reserva_id="res-f",
+                    etapa="aguardando_comprovante",
+                    campo_pendente="comprovante",
+                    comprovante_status="aguardando_comprovante",
+                )
+            },
+        }
+        receber.return_value = {"ok": True, "comprovante": {"id": "comp-f"}}
+
+        resultados = fluxo_reservas.processar_mensagens_webhook(
+            [
+                {
+                    "telefone": TELEFONE,
+                    "timestamp": "2026-08-08T17:00:00+00:00",
+                    "provider_message_id": "wamid-f-media",
+                    "media": {
+                        "media_id": "media-f",
+                        "tipo": "image",
+                        "mime_type": "image/jpeg",
+                        "nome_arquivo": "",
+                    },
+                    "raw": {},
+                },
+                {
+                    "telefone": TELEFONE,
+                    "texto": "Enviei",
+                    "timestamp": "2026-08-08T17:00:00.500000+00:00",
+                    "provider_message_id": "wamid-f-texto",
+                    "raw": {},
+                },
+            ]
+        )
+
+        self.assertEqual(len(resultados), 1)
+        self.assertEqual(resultados[0]["status"], "aguardando_analise")
+        self.assertFalse(resultados[0]["reserva_confirmada"])
+        receber.assert_called_once()
+        enviar.assert_called_once()
+        processar_ia.assert_not_called()
+
+    @patch.object(fluxo_reservas, "atualizar_status_conversa")
+    @patch.object(fluxo_reservas, "registrar_mensagem", return_value=True)
+    @patch.object(fluxo_reservas.whatsapp, "enviar_com_resultado", return_value={"ok": True, "provider_message_id": "wamid-bot"})
+    @patch.object(fluxo_reservas.comprovantes_reserva, "receber_comprovante", return_value={"ok": False, "erro": "upload falhou"})
+    @patch.object(fluxo_reservas, "buscar_conversa_ativa_por_telefone")
+    @patch.object(fluxo_reservas, "_provider_message_id_registrado", return_value=False)
+    def test_falha_ao_persistir_midia_pede_reenvio_e_mantem_estado_seguro(
+        self,
+        _duplicado,
+        buscar_conversa,
+        _receber,
+        enviar,
+        _registrar,
+        atualizar_status,
+    ) -> None:
+        conversa = {
+            "id": "conv-erro",
+            "cliente_telefone": TELEFONE,
+            "status": "bot_ativo",
+            "metadata": {
+                "estado_reserva": _estado_completo(
+                    reserva_id="res-erro",
+                    etapa="aguardando_comprovante",
+                    campo_pendente="comprovante",
+                    comprovante_status="aguardando_comprovante",
+                )
+            },
+        }
+        buscar_conversa.return_value = conversa
+
+        resultado = fluxo_reservas.processar_mensagem_webhook(
+            {
+                "telefone": TELEFONE,
+                "provider_message_id": "wamid-erro",
+                "media": {
+                    "media_id": "media-erro",
+                    "tipo": "image",
+                    "mime_type": "image/png",
+                },
+                "raw": {},
+            }
+        )
+
+        self.assertEqual(resultado["status"], "aguardando_comprovante")
+        self.assertIn("pode envia-lo novamente", enviar.call_args.args[1].lower())
+        self.assertEqual(agente.obter_estado_reserva(TELEFONE)["etapa"], "aguardando_comprovante")
+        atualizar_status.assert_not_called()
+
     @patch.object(comprovantes_reserva, "_upload_privado", return_value={"ok": True})
     @patch.object(comprovantes_reserva.whatsapp_cloud, "baixar_midia")
     @patch.object(comprovantes_reserva.supabase, "inserir")
@@ -457,7 +694,7 @@ class ComprovanteWebhookTest(unittest.TestCase):
         baixar.return_value = {"ok": True, "conteudo": b"pdf", "mime_type": "application/pdf", "tamanho": 3}
         inserir.return_value = {"ok": True, "data": [{"id": "comp-1"}]}
         resultado = comprovantes_reserva.receber_comprovante(
-            media={"media_id": "media-1", "mime_type": "application/pdf", "nome_arquivo": "pix.pdf"},
+            media={"media_id": "media-1", "tipo": "document", "mime_type": "application/pdf", "nome_arquivo": "pix.pdf"},
             provider_message_id="wamid-1",
             conversa_id="conv-1",
             reserva_id="res-1",

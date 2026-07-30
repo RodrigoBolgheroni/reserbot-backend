@@ -36,14 +36,24 @@ def receber_comprovante(
     conversa_id: str,
     reserva_id: str,
 ) -> dict[str, Any]:
+    provider_id = str(provider_message_id or "").strip()
     media_id = str(media.get("media_id") or "").strip()
+    tipo = str(media.get("tipo") or "").strip().lower()
     mime_webhook = _normalizar_mime(media.get("mime_type"))
+    if not provider_id:
+        return {"ok": False, "erro": "provider_message_id ausente"}
+    if not str(conversa_id or "").strip():
+        return {"ok": False, "erro": "conversa_id ausente"}
+    if not str(reserva_id or "").strip():
+        return {"ok": False, "erro": "reserva_id ausente"}
     if not media_id:
         return {"ok": False, "erro": "media_id ausente"}
-    if mime_webhook and mime_webhook not in MIME_TYPES_ACEITOS:
+    if tipo not in {"image", "document"}:
+        return {"ok": False, "erro": "tipo de midia nao aceito", "tipo": tipo}
+    if mime_webhook not in MIME_TYPES_ACEITOS:
         return {"ok": False, "erro": "tipo de arquivo nao aceito", "mime_type": mime_webhook}
 
-    existente = _buscar_por_provider_message_id(provider_message_id)
+    existente = _buscar_por_provider_message_id(provider_id)
     if existente:
         return {"ok": True, "comprovante": existente, "duplicado": True}
 
@@ -68,7 +78,7 @@ def receber_comprovante(
     payload = {
         "reserva_id": reserva_id or None,
         "conversa_id": conversa_id,
-        "provider_message_id": provider_message_id,
+        "provider_message_id": provider_id,
         "media_id": media_id,
         "tipo_midia": "pdf" if mime_type == "application/pdf" else "imagem",
         "mime_type": mime_type,

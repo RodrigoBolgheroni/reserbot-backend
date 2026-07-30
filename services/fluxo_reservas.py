@@ -254,11 +254,13 @@ def processar_resposta_cliente(
     atualizar_status_conversa(conversa_atual, status="bot_ativo")
     logger.info("Bot respondeu porque conversa esta ativa. telefone=%s", telefone_limpo)
     _carregar_estado_reserva_conversa(conversa_atual, telefone_limpo)
+    contexto_mensagem = _contexto_midia_metadata(metadata_mensagem)
     resposta = agente.processar_mensagem(
         telefone=telefone_limpo,
         mensagem_cliente=mensagem_limpa,
         nome_cliente=str(cliente.get("nome") or nome_cliente or ""),
         perfil_cliente=perfil_cliente,
+        contexto_mensagem=contexto_mensagem,
     )
     resposta = _aplicar_fluxo_comprovante(
         telefone=telefone_limpo,
@@ -266,6 +268,11 @@ def processar_resposta_cliente(
         cliente=cliente,
         conversa=conversa_atual,
         resposta=resposta,
+    )
+    resposta = _bloquear_afirmacao_comprovante_backend(
+        telefone=telefone_limpo,
+        resposta=resposta,
+        comprovante_persistido=bool(contexto_mensagem.get("comprovante_persistido")),
     )
     nome_confirmacao = str(resposta["dados_reserva"].get("nome_cliente") or cliente.get("nome") or nome_cliente or "")
     if resposta["reserva_confirmada"] and not agente.dados_reserva_obrigatorios_ok(
@@ -361,6 +368,66 @@ def _bloquear_confirmacao_automatica_backend(
     }
 
 
+def _bloquear_afirmacao_comprovante_backend(
+    *,
+    telefone: str,
+    resposta: agente.RespostaAgente,
+    comprovante_persistido: bool,
+) -> agente.RespostaAgente:
+    texto = str(resposta.get("texto") or "")
+    if comprovante_persistido or not _texto_afirma_comprovante_recebido(texto):
+        return resposta
+
+    estado = agente.obter_estado_reserva(telefone) or {}
+    if (
+        str(estado.get("etapa") or "") == "aguardando_analise"
+        or str(estado.get("comprovante_status") or "") == "aguardando_analise"
+    ):
+        logger.warning(
+            "Afirmacao de novo recebimento substituida pelo estado persistido de analise. telefone=%s texto_original=%r.",
+            telefone,
+            texto,
+        )
+        return {
+            **resposta,
+            "texto": "A solicitacao esta aguardando a analise da equipe. Assim que for verificada, voce recebera a confirmacao.",
+            "reserva_confirmada": False,
+            "status_reserva": "aguardando_analise",
+        }
+
+    if str(estado.get("etapa") or "") != "aguardando_comprovante":
+        logger.error(
+            "Afirmacao falsa de recebimento bloqueada fora da etapa de comprovante. telefone=%s texto_original=%r.",
+            telefone,
+            texto,
+        )
+        return {
+            **resposta,
+            "texto": "Nao apareceu nenhum arquivo por aqui. Primeiro precisamos concluir os dados da solicitacao.",
+            "reserva_confirmada": False,
+            "status_reserva": str(resposta.get("status_reserva") or "em_coleta"),
+        }
+
+    estado["etapa"] = "aguardando_comprovante"
+    estado["campo_pendente"] = "comprovante"
+    estado["comprovante_status"] = "aguardando_comprovante"
+    estado["aguardando_confirmacao"] = False
+    estado["cliente_autorizou_confirmacao"] = False
+    agente.definir_estado_reserva(telefone, estado)
+    texto_seguro = "Nao apareceu nenhum arquivo por aqui. Envie a imagem ou o PDF do comprovante para a equipe conferir."
+    logger.error(
+        "Afirmacao falsa de recebimento de comprovante bloqueada. telefone=%s texto_original=%r.",
+        telefone,
+        texto,
+    )
+    return {
+        **resposta,
+        "texto": texto_seguro,
+        "reserva_confirmada": False,
+        "status_reserva": "aguardando_comprovante",
+    }
+
+
 def _aplicar_fluxo_comprovante(
     *,
     telefone: str,
@@ -381,6 +448,26 @@ def _aplicar_fluxo_comprovante(
     if not estado:
         return resposta
 
+    if estado.get("regra_espaco_obrigatoria") and not estado.get("cliente_autorizou_espaco_direcionado"):
+        estado["aguardando_confirmacao_espaco"] = True
+        estado["aguardando_confirmacao"] = False
+        estado["cliente_autorizou_confirmacao"] = False
+        estado["etapa"] = "aguardando_confirmacao_espaco"
+        estado["campo_pendente"] = "espaco"
+        agente.definir_estado_reserva(telefone, estado)
+        texto = agente._mensagem_direcionamento_espaco(estado)
+        logger.warning(
+            "Entrada em aguardando_comprovante bloqueada por aceite de espaco pendente. telefone=%s espaco=%s.",
+            telefone,
+            estado.get("espaco_direcionado_nome", ""),
+        )
+        return {
+            **resposta,
+            "texto": texto,
+            "reserva_confirmada": False,
+            "status_reserva": "em_coleta",
+        }
+
     etapa = str(estado.get("etapa") or "")
     if etapa == "aguardando_analise":
         return {
@@ -389,7 +476,35 @@ def _aplicar_fluxo_comprovante(
             "status_reserva": "aguardando_analise",
         }
 
+    dados = dict(resposta.get("dados_reserva") or {})
+    nome = str(dados.get("nome_cliente") or cliente.get("nome") or "").strip()
+    if not agente.dados_reserva_obrigatorios_ok(dados, nome_cliente=nome, telefone=telefone):
+        return {**resposta, "reserva_confirmada": False}
+    if estado.get("quantidade_abaixo_minima"):
+        return {**resposta, "reserva_confirmada": False}
+
+    config = config_restaurante.obter_config()
+    horario = str(estado.get("horario") or dados.get("horario") or "")[:5]
+    horario_sem_preferencia = horario in {"18:00", "19:00"}
+    regra_obrigatoria = bool(estado.get("regra_espaco_obrigatoria"))
+
     if etapa == "aguardando_comprovante" and estado.get("informacoes_pagamento_apresentadas"):
+        if not _espaco_valido_para_comprovante(
+            estado,
+            config=config,
+            horario_sem_preferencia=horario_sem_preferencia,
+        ):
+            logger.error(
+                "Estado aguardando_comprovante bloqueado por espaco invalido. telefone=%s espaco_id=%s.",
+                telefone,
+                estado.get("espaco_direcionado_id") or estado.get("preferencia_espaco_id") or "",
+            )
+            return {
+                **resposta,
+                "texto": "A equipe precisa revisar o espaco da solicitacao antes de continuar o pagamento.",
+                "reserva_confirmada": False,
+                "status_reserva": "aguardando_humano",
+            }
         texto = str(resposta.get("texto") or "").strip()
         resposta_comprovante = _resposta_texto_aguardando_comprovante(mensagem_cliente)
         if resposta_comprovante:
@@ -405,17 +520,6 @@ def _aplicar_fluxo_comprovante(
             "status_reserva": "aguardando_comprovante",
         }
 
-    dados = dict(resposta.get("dados_reserva") or {})
-    nome = str(dados.get("nome_cliente") or cliente.get("nome") or "").strip()
-    if not agente.dados_reserva_obrigatorios_ok(dados, nome_cliente=nome, telefone=telefone):
-        return {**resposta, "reserva_confirmada": False}
-    if estado.get("quantidade_abaixo_minima"):
-        return {**resposta, "reserva_confirmada": False}
-
-    config = config_restaurante.obter_config()
-    horario = str(estado.get("horario") or dados.get("horario") or "")[:5]
-    horario_sem_preferencia = horario in {"18:00", "19:00"}
-    regra_obrigatoria = bool(estado.get("regra_espaco_obrigatoria"))
     if regra_obrigatoria and not estado.get("cliente_autorizou_espaco_direcionado"):
         return {**resposta, "reserva_confirmada": False, "status_reserva": "em_coleta"}
 
@@ -453,6 +557,24 @@ def _aplicar_fluxo_comprovante(
                 "reserva_confirmada": False,
                 "status_reserva": "em_coleta",
             }
+
+    if not _espaco_valido_para_comprovante(
+        estado,
+        config=config,
+        horario_sem_preferencia=horario_sem_preferencia,
+    ):
+        logger.error(
+            "Entrada em aguardando_comprovante bloqueada por espaco invalido. telefone=%s regra_obrigatoria=%s espaco_id=%s.",
+            telefone,
+            regra_obrigatoria,
+            estado.get("espaco_direcionado_id") or estado.get("preferencia_espaco_id") or "",
+        )
+        return {
+            **resposta,
+            "texto": "Os dados estao completos, mas a equipe precisa orientar o espaco antes do pagamento.",
+            "reserva_confirmada": False,
+            "status_reserva": "aguardando_humano",
+        }
 
     solicitacao = registrar_solicitacao_reserva(
         cliente=cliente,
@@ -543,6 +665,29 @@ def _aplicar_fluxo_comprovante(
     }
 
 
+def _espaco_valido_para_comprovante(
+    estado: Mapping[str, Any],
+    *,
+    config: config_restaurante.ConfigRestaurante,
+    horario_sem_preferencia: bool,
+) -> bool:
+    regra_obrigatoria = bool(estado.get("regra_espaco_obrigatoria"))
+    if horario_sem_preferencia and not regra_obrigatoria:
+        return True
+    if regra_obrigatoria:
+        espaco_id = str(estado.get("espaco_direcionado_id") or "").strip()
+        espaco_nome = str(estado.get("espaco_direcionado_nome") or "").strip()
+        if not estado.get("cliente_autorizou_espaco_direcionado"):
+            return False
+    else:
+        espaco_id = str(estado.get("preferencia_espaco_id") or "").strip()
+        espaco_nome = str(estado.get("preferencia_espaco_nome") or "").strip()
+    return any(
+        espaco.ativo and espaco.id == espaco_id and espaco.nome == espaco_nome
+        for espaco in config.espacos
+    )
+
+
 def _texto_pagamento_config(config: config_restaurante.ConfigRestaurante) -> str:
     if (
         config.taxa_valor is None
@@ -600,6 +745,8 @@ def _mensagem_informa_pagamento_sem_midia(texto: str) -> bool:
 def _resposta_texto_aguardando_comprovante(texto: str) -> str:
     normalizado = re.sub(r"[^\w\s]", " ", _normalizar_texto(texto))
     normalizado = re.sub(r"\s+", " ", normalizado).strip()
+    if _mensagem_afirma_envio_comprovante_sem_midia(normalizado):
+        return "Nao apareceu nenhum arquivo por aqui. Envie a imagem ou o PDF do comprovante para a equipe conferir."
     if re.search(r"\b(nao preciso|preciso enviar|precisa enviar|enviar nada)\b", normalizado):
         return (
             "Precisa sim. Envie a imagem ou o PDF do comprovante do Pix por aqui. "
@@ -610,6 +757,30 @@ def _resposta_texto_aguardando_comprovante(texto: str) -> str:
     if re.fullmatch(r"(certo|obrigad[ao]|certo obrigad[ao]|valeu|beleza)", normalizado):
         return "Por nada! Fico aguardando o comprovante para a equipe analisar a solicitacao."
     return ""
+
+
+def _mensagem_afirma_envio_comprovante_sem_midia(texto: str) -> bool:
+    normalizado = re.sub(r"[^\w\s]", " ", _normalizar_texto(texto))
+    normalizado = re.sub(r"\s+", " ", normalizado).strip()
+    return bool(
+        re.fullmatch(
+            r"(enviei|ja enviei|mandei|ja mandei|ja paguei|paguei|foi|pronto|segue|segue o comprovante)",
+            normalizado,
+        )
+        or re.search(r"\b(enviei|ja enviei|mandei|ja mandei|segue o comprovante)\b", normalizado)
+    )
+
+
+def _texto_afirma_comprovante_recebido(texto: str) -> bool:
+    normalizado = _normalizar_texto(texto)
+    return bool(
+        re.search(r"\bcomprovante\s+(?:foi\s+)?recebid", normalizado)
+        or re.search(r"\ba\s+equipe\s+(?:ja\s+)?recebeu\b", normalizado)
+        or re.search(r"\bo\s+arquivo\s+foi\s+enviado\b", normalizado)
+        or re.search(r"\b(?:recebi|recebemos|equipe\s+(?:ja\s+)?recebeu)\b.{0,40}\b(comprovante|arquivo)\b", normalizado)
+        or re.search(r"\b(?:comprovante|arquivo)\b.{0,40}\b(?:recebid|registrad|enviado\s+com\s+sucesso)\b", normalizado)
+        or re.search(r"\bequipe\s+vai\s+analisar\s+(?:o\s+)?comprovante\b", normalizado)
+    )
 
 
 def _texto_afirma_reserva_confirmada(texto: str) -> bool:
@@ -682,6 +853,16 @@ def _mensagens_agrupadas_metadata(metadata: Mapping[str, Any] | None) -> list[Ma
     if not isinstance(agrupadas, list):
         return []
     return [item for item in agrupadas if isinstance(item, Mapping)]
+
+
+def _contexto_midia_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    contexto = metadata if isinstance(metadata, Mapping) else {}
+    return {
+        "mensagem_contem_midia": bool(contexto.get("mensagem_contem_midia")),
+        "tipos_midia": [str(item) for item in (contexto.get("tipos_midia") or []) if str(item)],
+        "media_ids": [str(item) for item in (contexto.get("media_ids") or []) if str(item)],
+        "comprovante_persistido": bool(contexto.get("comprovante_persistido")),
+    }
 
 
 def _mensagens_debounce_persistidas_metadata(mensagens_agrupadas: Sequence[Any]) -> list[dict[str, Any]]:
@@ -1324,12 +1505,61 @@ def _conversa_id_debounce_chave(chave: str) -> str:
     return chave.split(":", 1)[0].strip()
 
 
+def _mensagens_originais_lote(mensagem: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    raw = mensagem.get("raw") if isinstance(mensagem.get("raw"), Mapping) else {}
+    originais = raw.get("messages") if isinstance(raw.get("messages"), list) else []
+    itens = [item for item in originais if isinstance(item, Mapping)]
+    return itens or [mensagem]
+
+
+def _midias_lote(mensagem: Mapping[str, Any]) -> list[tuple[Mapping[str, Any], Mapping[str, Any]]]:
+    midias: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
+    for item in _mensagens_originais_lote(mensagem):
+        media = item.get("media") if isinstance(item.get("media"), Mapping) else {}
+        if media:
+            midias.append((item, media))
+    return midias
+
+
+def _contexto_midia_lote(mensagem: Mapping[str, Any], *, comprovante_persistido: bool = False) -> dict[str, Any]:
+    midias = _midias_lote(mensagem)
+    return {
+        "mensagem_contem_midia": bool(midias),
+        "tipos_midia": [str(media.get("tipo") or "") for _, media in midias if str(media.get("tipo") or "")],
+        "media_ids": [str(media.get("media_id") or "") for _, media in midias if str(media.get("media_id") or "")],
+        "comprovante_persistido": comprovante_persistido,
+    }
+
+
 def processar_mensagem_webhook(mensagem: MensagemRecebida) -> ResultadoWebhook:
     telefone = str(mensagem.get("telefone") or "").strip()
     texto = str(mensagem.get("texto") or "").strip()
-    media = mensagem.get("media") if isinstance(mensagem.get("media"), Mapping) else {}
-    if telefone and media:
-        return _processar_comprovante_webhook(mensagem, media=media)
+    midias_lote = _midias_lote(mensagem)
+    if telefone and midias_lote:
+        item_midia, media = next(
+            (
+                item
+                for item in midias_lote
+                if str(item[1].get("mime_type") or "").lower() in comprovantes_reserva.MIME_TYPES_ACEITOS
+            ),
+            midias_lote[0],
+        )
+        mensagem_midia: MensagemRecebida = {
+            **dict(item_midia),
+            "telefone": telefone,
+            "raw": {
+                **dict(item_midia.get("raw") if isinstance(item_midia.get("raw"), Mapping) else {}),
+                "lote_original": [dict(item) for item in _mensagens_originais_lote(mensagem)],
+                "contexto_midia": _contexto_midia_lote(mensagem),
+            },
+        }
+        if len(midias_lote) > 1:
+            logger.warning(
+                "Lote contem mais de uma midia; apenas o primeiro comprovante valido sera processado. telefone=%s total=%s.",
+                telefone,
+                len(midias_lote),
+            )
+        return _processar_comprovante_webhook(mensagem_midia, media=media)
     if not telefone or not texto:
         return {
             "ok": False,
@@ -1375,6 +1605,7 @@ def processar_mensagem_webhook(mensagem: MensagemRecebida) -> ResultadoWebhook:
         "timestamp_provider": mensagem.get("timestamp", ""),
         "remetente_whatsapp": mensagem.get("remetente", ""),
         "raw": raw,
+        **_contexto_midia_lote(mensagem),
     }
     mensagens_agrupadas = raw.get("messages") if isinstance(raw, Mapping) and raw.get("coalesced") else None
     if isinstance(mensagens_agrupadas, list):
@@ -1418,6 +1649,10 @@ def _processar_comprovante_webhook(
 ) -> ResultadoWebhook:
     telefone = str(mensagem.get("telefone") or "").strip()
     provider_message_id = str(mensagem.get("provider_message_id") or "").strip()
+    raw = mensagem.get("raw") if isinstance(mensagem.get("raw"), Mapping) else {}
+    contexto_midia = raw.get("contexto_midia") if isinstance(raw.get("contexto_midia"), Mapping) else {}
+    if not contexto_midia:
+        contexto_midia = _contexto_midia_lote(mensagem)
     mensagem_pre_registrada = bool(provider_message_id and _provider_message_id_registrado(provider_message_id))
     if mensagem_pre_registrada and comprovantes_reserva.obter_por_provider_message_id(provider_message_id):
         logger.info("Comprovante inbound duplicado ignorado: provider_message_id=%s.", provider_message_id)
@@ -1454,6 +1689,10 @@ def _processar_comprovante_webhook(
                 "media_id": str(media.get("media_id") or ""),
                 "mime_type": str(media.get("mime_type") or ""),
                 "comprovante_processado": False,
+                "mensagem_contem_midia": True,
+                "tipos_midia": list(contexto_midia.get("tipos_midia") or [tipo]),
+                "media_ids": list(contexto_midia.get("media_ids") or [str(media.get("media_id") or "")]),
+                "comprovante_persistido": False,
             },
         )
         if not registrado:
@@ -1502,7 +1741,19 @@ def _processar_comprovante_webhook(
             reserva_id,
             resultado.get("erro", ""),
         )
-        texto_erro = "Nao consegui guardar esse arquivo com seguranca. Vou deixar a equipe continuar o atendimento por aqui."
+        estado["etapa"] = "aguardando_comprovante"
+        estado["campo_pendente"] = "comprovante"
+        estado["comprovante_status"] = "aguardando_comprovante"
+        agente.definir_estado_reserva(telefone, estado)
+        resposta_estado: agente.RespostaAgente = {
+            "texto": "",
+            "reserva_confirmada": False,
+            "dados_reserva": dict((conversa.get("metadata") or {}).get("dados_reserva") or {}),
+            "status_reserva": "aguardando_comprovante",
+            "confianca": 1.0,
+        }
+        _salvar_estado_reserva_conversa(conversa, telefone, resposta=resposta_estado)
+        texto_erro = "Recebi o arquivo, mas nao consegui registra-lo corretamente. Pode envia-lo novamente?"
         envio = whatsapp.enviar_com_resultado(telefone, texto_erro)
         registrar_mensagem(
             conversa,
@@ -1511,12 +1762,11 @@ def _processar_comprovante_webhook(
             provider_message_id=str(envio.get("provider_message_id") or ""),
             metadata={"envio_ok": bool(envio.get("ok")), "falha_comprovante": True},
         )
-        atualizar_status_conversa(conversa, status="aguardando_humano")
         return {
             "ok": False,
             "telefone": telefone,
             "conversa_id": str(conversa.get("id") or ""),
-            "status": "aguardando_humano",
+            "status": "aguardando_comprovante",
             "resposta_enviada": bool(envio.get("ok")),
             "erro": str(resultado.get("erro") or "falha ao receber comprovante"),
         }
@@ -1536,6 +1786,9 @@ def _processar_comprovante_webhook(
         provider_message_id=provider_message_id,
         comprovante_id=str(comprovante.get("id") or ""),
         reserva_id=reserva_id,
+        tipo=tipo,
+        media_id=str(media.get("media_id") or ""),
+        mime_type=str(media.get("mime_type") or ""),
     )
 
     estado["etapa"] = "aguardando_analise"
@@ -1604,6 +1857,9 @@ def _marcar_mensagem_comprovante_processada(
     provider_message_id: str,
     comprovante_id: str,
     reserva_id: str,
+    tipo: str,
+    media_id: str,
+    mime_type: str,
 ) -> None:
     if not provider_message_id:
         return
@@ -1613,6 +1869,11 @@ def _marcar_mensagem_comprovante_processada(
             "metadata": {
                 "provider": "cloud",
                 "comprovante_processado": True,
+                "mensagem_contem_midia": True,
+                "tipos_midia": [tipo],
+                "media_ids": [media_id],
+                "mime_type": mime_type,
+                "comprovante_persistido": True,
                 "comprovante_id": comprovante_id,
                 "reserva_id": reserva_id,
             }
