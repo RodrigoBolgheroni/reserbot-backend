@@ -280,6 +280,10 @@ def processar_resposta_cliente(
             "reserva_confirmada": False,
             "status_reserva": "em_coleta",
         }
+    resposta = _bloquear_confirmacao_automatica_backend(
+        telefone=telefone_limpo,
+        resposta=resposta,
+    )
     _salvar_estado_reserva_conversa(conversa_atual, telefone_limpo, resposta=resposta)
 
     if resposta["texto"]:
@@ -311,16 +315,50 @@ def processar_resposta_cliente(
         logger.info("Conversa finalizada por recusa ao convite de reserva. telefone=%s", telefone_limpo)
         return resposta
 
-    if resposta["reserva_confirmada"]:
-        logger.error(
-            "Confirmacao automatica bloqueada antes da persistencia. telefone=%s conversa_id=%s.",
-            telefone_limpo,
-            conversa_atual.get("id", ""),
-        )
-        resposta["reserva_confirmada"] = False
-        resposta["status_reserva"] = "aguardando_comprovante"
-
     return resposta
+
+
+def _bloquear_confirmacao_automatica_backend(
+    *,
+    telefone: str,
+    resposta: agente.RespostaAgente,
+) -> agente.RespostaAgente:
+    texto = str(resposta.get("texto") or "")
+    status = str(resposta.get("status_reserva") or "")
+    if not resposta.get("reserva_confirmada") and status != "confirmada" and not _texto_afirma_reserva_confirmada(texto):
+        return resposta
+
+    estado = agente.obter_estado_reserva(telefone) or {}
+    etapa = str(estado.get("etapa") or "")
+    if etapa == "aguardando_analise" or str(estado.get("comprovante_status") or "") == "aguardando_analise":
+        texto_seguro = "A solicitacao esta aguardando a analise da equipe. Assim que for verificada, voce recebera a confirmacao."
+        status_seguro = "aguardando_analise"
+    elif estado:
+        estado["aguardando_confirmacao"] = False
+        estado["cliente_autorizou_confirmacao"] = False
+        estado["etapa"] = "aguardando_comprovante"
+        estado["campo_pendente"] = "comprovante"
+        estado["comprovante_status"] = "aguardando_comprovante"
+        agente.definir_estado_reserva(telefone, estado)
+        texto_seguro = "A solicitacao ainda aguarda o comprovante. Envie a imagem ou o PDF por aqui para a equipe conferir."
+        status_seguro = "aguardando_comprovante"
+    else:
+        texto_seguro = "Perfeito, sigo com os dados anotados por aqui."
+        status_seguro = "em_coleta"
+
+    logger.error(
+        "Confirmacao automatica bloqueada antes de salvar ou enviar resposta. telefone=%s status_ia=%s texto_ia=%r status_final=%s.",
+        telefone,
+        status,
+        texto,
+        status_seguro,
+    )
+    return {
+        **resposta,
+        "texto": texto_seguro,
+        "reserva_confirmada": False,
+        "status_reserva": status_seguro,
+    }
 
 
 def _aplicar_fluxo_comprovante(
@@ -353,7 +391,10 @@ def _aplicar_fluxo_comprovante(
 
     if etapa == "aguardando_comprovante" and estado.get("informacoes_pagamento_apresentadas"):
         texto = str(resposta.get("texto") or "").strip()
-        if _mensagem_informa_pagamento_sem_midia(mensagem_cliente):
+        resposta_comprovante = _resposta_texto_aguardando_comprovante(mensagem_cliente)
+        if resposta_comprovante:
+            texto = resposta_comprovante
+        elif _mensagem_informa_pagamento_sem_midia(mensagem_cliente):
             texto = "Perfeito. Agora envie a imagem ou o PDF do comprovante por aqui para a equipe conferir."
         elif _texto_afirma_reserva_confirmada(texto):
             texto = "A solicitacao ainda aguarda o comprovante. Envie a imagem ou o PDF por aqui para a equipe conferir."
@@ -554,6 +595,21 @@ def _conversa_de_aniversario(conversa: Mapping[str, Any], estado: Mapping[str, A
 def _mensagem_informa_pagamento_sem_midia(texto: str) -> bool:
     normalizado = _normalizar_texto(texto)
     return bool(re.search(r"\b(ja paguei|paguei|pagamento feito|pix feito|fiz o pix|transferi)\b", normalizado))
+
+
+def _resposta_texto_aguardando_comprovante(texto: str) -> str:
+    normalizado = re.sub(r"[^\w\s]", " ", _normalizar_texto(texto))
+    normalizado = re.sub(r"\s+", " ", normalizado).strip()
+    if re.search(r"\b(nao preciso|preciso enviar|precisa enviar|enviar nada)\b", normalizado):
+        return (
+            "Precisa sim. Envie a imagem ou o PDF do comprovante do Pix por aqui. "
+            "A equipe so conclui a solicitacao depois da conferencia."
+        )
+    if re.fullmatch(r"(estou ciente|ciente|sim|ok|pode seguir|pode continuar|confirmo os dados)", normalizado):
+        return "Perfeito. Agora e so enviar a imagem ou o PDF do comprovante por aqui para a equipe conferir."
+    if re.fullmatch(r"(certo|obrigad[ao]|certo obrigad[ao]|valeu|beleza)", normalizado):
+        return "Por nada! Fico aguardando o comprovante para a equipe analisar a solicitacao."
+    return ""
 
 
 def _texto_afirma_reserva_confirmada(texto: str) -> bool:
@@ -1805,7 +1861,6 @@ def registrar_reserva_confirmada(
     autorizacao_humana: bool = False,
 ) -> bool:
     telefone = str(cliente.get("telefone") or "").strip()
-    nome = str(dados_reserva.get("nome_cliente") or cliente.get("nome") or "").strip()
     conversa_id = str((conversa or {}).get("id") or "")
     if not autorizacao_humana:
         logger.warning(
@@ -1814,54 +1869,12 @@ def registrar_reserva_confirmada(
             conversa_id,
         )
         return False
-    if not agente.dados_reserva_obrigatorios_ok(dados_reserva, nome_cliente=nome, telefone=telefone):
-        logger.warning(
-            "Reserva nao registrada por campos obrigatorios ausentes. telefone=%s conversa=%s dados=%s",
-            telefone,
-            conversa_id,
-            {
-                "data_reserva": bool(dados_reserva.get("data_reserva")),
-                "horario": bool(dados_reserva.get("horario")),
-                "pessoas": bool(dados_reserva.get("pessoas")),
-                "nome": bool(nome),
-                "telefone": bool(telefone),
-            },
-        )
-        return False
-    if _reserva_confirmada_existente(conversa_id):
-        logger.info("Reserva ja registrada para conversa %s; ignorando duplicidade.", conversa_id)
-        return True
-
-    perfil_cliente = _resolver_perfil_seguro(cliente)
-    payload = {
-        "cliente_id": cliente.get("id"),
-        "cliente_telefone": telefone,
-        "conversa_id": conversa_id,
-        "data_reserva": dados_reserva.get("data_reserva"),
-        "horario": dados_reserva.get("horario"),
-        "pessoas": dados_reserva.get("pessoas"),
-        "observacoes": dados_reserva.get("observacoes"),
-        "status": "confirmada",
-        "metadata": {
-            "nome": nome,
-            "perfil_id": (perfil_cliente or {}).get("id"),
-            "perfil_nome": (perfil_cliente or {}).get("nome"),
-        },
-    }
-    resultado = supabase.inserir(_tabela_reservas(), _sem_vazios(payload))
-    if resultado.get("ok"):
-        logger.info("Reserva registrada no Supabase para %s.", telefone)
-        return True
-
-    logger.warning("Reserva nao registrada no Supabase para %s: %s", telefone, resultado.get("erro"))
-    return dados.adicionar_reserva(
-        {
-            "telefone": telefone,
-            "nome": nome,
-            "confirmado_em": _agora(),
-            **dados_reserva,
-        }
+    logger.warning(
+        "Registro direto de reserva confirmada bloqueado. Use confirmar_reserva_por_humano com comprovante em analise. telefone=%s conversa=%s.",
+        telefone,
+        conversa_id,
     )
+    return False
 
 
 def listar_reservas(*, limite: int = 500) -> list[dict[str, Any]]:

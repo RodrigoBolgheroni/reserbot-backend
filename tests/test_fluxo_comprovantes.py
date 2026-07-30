@@ -156,6 +156,119 @@ class FluxoConclusaoReservaTest(unittest.TestCase):
 
     @patch.object(fluxo_reservas, "registrar_solicitacao_reserva")
     @patch.object(fluxo_reservas.config_restaurante, "obter_config", return_value=_config_praia())
+    @patch.object(agente.config_restaurante, "obter_config", return_value=_config_praia())
+    def test_fluxo_real_salao_areia_ciente_obrigado_e_sem_envio_nao_confirma(
+        self,
+        _config_agente,
+        _config_fluxo,
+        registrar_solicitacao,
+    ) -> None:
+        registrar_solicitacao.return_value = {"ok": True, "reserva": {"id": "res-real"}}
+        agente.definir_estado_reserva(
+            TELEFONE,
+            {
+                "data_reserva": "2026-08-08",
+                "horario": "14:00",
+                "pessoas": 26,
+                "nome_cliente": "Rodrigo",
+                "preferencia_espaco_id": "salao-1",
+                "preferencia_espaco_nome": "Salao",
+                "espaco_direcionado_id": "areia-1",
+                "espaco_direcionado_nome": "Areia",
+                "espaco_sugerido_id": "areia-1",
+                "espaco_sugerido_nome": "Areia",
+                "regra_espaco_obrigatoria": True,
+                "aguardando_confirmacao_espaco": True,
+                "cliente_autorizou_espaco_direcionado": False,
+                "origem_conversa": "aniversario",
+                "campo_pendente": "espaco",
+                "etapa": "aguardando_espaco",
+            },
+        )
+        interpretacao_legada = {
+            "texto": "Para confirmar, preciso que voce confirme que esta ciente da taxa de reserva de R$50,00.",
+            "reserva_confirmada": False,
+            "dados_reserva": {},
+            "dados_confirmados": {},
+            "dados_mencionados": {},
+            "dados_incertos": {},
+            "status_reserva": "aguardando_confirmacao",
+            "confianca": 0.92,
+            "intencao": "pedir_confirmacao",
+            "acao": "pedir_confirmacao",
+            "proximo_campo": "confirmacao",
+            "deve_avancar_estado": False,
+            "correcoes": {},
+            "assunto_atual": "",
+            "pergunta_aberta": "",
+            "tom_cliente": "",
+            "resumo_conversa": "",
+            "contrato_novo": True,
+        }
+
+        aceite_areia = agente.aplicar_guardrails_reserva(
+            telefone=TELEFONE,
+            mensagem_cliente="pode seguir com a Areia",
+            interpretacao=interpretacao_legada,
+            nome_cliente="Rodrigo",
+        )
+        self.assertFalse(aceite_areia["reserva_confirmada"])
+        self.assertEqual(aceite_areia["status_reserva"], "aguardando_comprovante")
+        estado_apos_aceite = agente.obter_estado_reserva(TELEFONE)
+        self.assertEqual(estado_apos_aceite["campo_pendente"], "comprovante")
+        self.assertFalse(estado_apos_aceite["aguardando_confirmacao"])
+        self.assertFalse(estado_apos_aceite["cliente_autorizou_confirmacao"])
+
+        primeira = fluxo_reservas._aplicar_fluxo_comprovante(
+            telefone=TELEFONE,
+            mensagem_cliente="pode seguir com a Areia",
+            cliente={"id": "cli-1", "telefone": TELEFONE, "nome": "Rodrigo"},
+            conversa={"id": "conv-real", "origem": "aniversario"},
+            resposta=aceite_areia,
+        )
+        texto_primeira = primeira["texto"].lower()
+        self.assertEqual(primeira["status_reserva"], "aguardando_comprovante")
+        self.assertFalse(primeira["reserva_confirmada"])
+        self.assertIn("nao trabalhamos com lista", texto_primeira)
+        self.assertIn("bolo", texto_primeira)
+        self.assertIn("geladeira", texto_primeira)
+        self.assertIn("pratos e garfos", texto_primeira)
+        self.assertIn("r$ 50,00", texto_primeira)
+        self.assertIn("42.538.063/0001-46", texto_primeira)
+        self.assertIn("praia da radial", texto_primeira)
+        self.assertIn("24 horas", texto_primeira)
+        self.assertIn("imagem ou o pdf", texto_primeira)
+        self.assertNotIn("posso confirmar", texto_primeira)
+        self.assertNotIn("reserva confirmada", texto_primeira)
+
+        respostas = [
+            ("Estou ciente", "imagem ou o pdf"),
+            ("Certo, obrigado", "aguardando o comprovante"),
+            ("Nao preciso enviar nada nao?", "precisa sim"),
+            ("sim", "imagem ou o pdf"),
+            ("ja paguei", "imagem ou o pdf"),
+        ]
+        for mensagem, trecho in respostas:
+            with self.subTest(mensagem=mensagem):
+                resposta = fluxo_reservas._aplicar_fluxo_comprovante(
+                    telefone=TELEFONE,
+                    mensagem_cliente=mensagem,
+                    cliente={"id": "cli-1", "telefone": TELEFONE, "nome": "Rodrigo"},
+                    conversa={"id": "conv-real", "origem": "aniversario"},
+                    resposta=_resposta(texto="Tudo confirmado entao."),
+                )
+                texto = resposta["texto"].lower()
+                self.assertEqual(resposta["status_reserva"], "aguardando_comprovante")
+                self.assertFalse(resposta["reserva_confirmada"])
+                self.assertIn(trecho, texto)
+                self.assertNotIn("tudo confirmado", texto)
+                self.assertNotIn("reserva confirmada", texto)
+                estado = agente.obter_estado_reserva(TELEFONE)
+                self.assertEqual(estado["etapa"], "aguardando_comprovante")
+                self.assertEqual(estado["campo_pendente"], "comprovante")
+
+    @patch.object(fluxo_reservas, "registrar_solicitacao_reserva")
+    @patch.object(fluxo_reservas.config_restaurante, "obter_config", return_value=_config_praia())
     @patch.object(fluxo_reservas.agente, "dados_reserva_obrigatorios_ok", return_value=True)
     def test_18h_nao_garante_espaco_e_nao_pede_preferencia(
         self,
@@ -218,6 +331,24 @@ class FluxoConclusaoReservaTest(unittest.TestCase):
                 dados_reserva={"data_reserva": "2030-08-03", "horario": "13:00", "pessoas": 14},
             )
         )
+
+    @patch.object(fluxo_reservas.supabase, "inserir")
+    @patch.object(fluxo_reservas.dados, "adicionar_reserva")
+    def test_registrar_confirmada_direta_mesmo_com_autorizacao_humana_e_bloqueada(
+        self,
+        adicionar_local,
+        inserir_supabase,
+    ) -> None:
+        resultado = fluxo_reservas.registrar_reserva_confirmada(
+            cliente={"telefone": TELEFONE, "nome": "Rodrigo"},
+            conversa={"id": "conv-1"},
+            dados_reserva={"data_reserva": "2030-08-03", "horario": "13:00", "pessoas": 14},
+            autorizacao_humana=True,
+        )
+
+        self.assertFalse(resultado)
+        inserir_supabase.assert_not_called()
+        adicionar_local.assert_not_called()
 
 
 class ComprovanteWebhookTest(unittest.TestCase):

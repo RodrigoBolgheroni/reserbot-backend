@@ -728,6 +728,40 @@ def _resposta_preservando_ia(
     }
 
 
+def _marcar_aguardando_comprovante(estado: EstadoReserva) -> None:
+    estado["aguardando_confirmacao"] = False
+    estado["cliente_autorizou_confirmacao"] = False
+    estado["confirmacao_pausada"] = False
+    estado["etapa"] = "aguardando_comprovante"
+    estado["campo_pendente"] = "comprovante"
+    estado["comprovante_status"] = "aguardando_comprovante"
+
+
+def _resposta_aguardando_comprovante(
+    *,
+    estado: EstadoReserva,
+    interpretacao: Mapping[str, Any],
+    funcao: str,
+) -> RespostaAgente:
+    _marcar_aguardando_comprovante(estado)
+    texto = _texto_ia_ou_fallback_tecnico(interpretacao)
+    if not texto or _texto_tenta_confirmar_reserva(texto):
+        texto = "Os dados estao completos. Vou te passar as orientacoes para enviar o comprovante."
+    _log_resposta_substituida(
+        texto_ia=str(interpretacao.get("texto") or ""),
+        texto_final=texto,
+        funcao=funcao,
+        motivo="confirmacao_automatica_bloqueada_aguardando_comprovante",
+    )
+    return {
+        "texto": texto,
+        "reserva_confirmada": False,
+        "dados_reserva": _dados_reserva_do_estado(estado),
+        "status_reserva": "aguardando_comprovante",
+        "confianca": max(float(interpretacao.get("confianca") or 0.0), 0.9),
+    }
+
+
 def _responder_quantidade_abaixo_minima_se_necessario(
     *,
     telefone: str,
@@ -812,12 +846,10 @@ def _responder_direcionamento_espaco_se_necessario(
     if estado.get("aguardando_confirmacao_espaco") and _eh_confirmacao_cliente(mensagem_cliente):
         estado["cliente_autorizou_espaco_direcionado"] = True
         estado["aguardando_confirmacao_espaco"] = False
-        estado["aguardando_confirmacao"] = True
-        _definir_campo_pendente(estado, "confirmacao")
-        return _resposta_preservando_ia(
+        return _resposta_aguardando_comprovante(
             estado=estado,
             interpretacao=interpretacao,
-            status_reserva="aguardando_confirmacao",
+            funcao="_responder_direcionamento_espaco_se_necessario.aceite_espaco",
         )
 
     texto_ia = _texto_ia_ou_fallback_tecnico(interpretacao)
@@ -1583,11 +1615,7 @@ def aplicar_guardrails_reserva(
             dados_reserva=dados_estado,
         )
 
-    estado["aguardando_confirmacao"] = False
-    estado["confirmacao_pausada"] = False
-    estado["cliente_autorizou_confirmacao"] = False
-    estado["comprovante_status"] = "aguardando_comprovante"
-    _definir_campo_pendente(estado, "comprovante")
+    _marcar_aguardando_comprovante(estado)
     dados_estado = _dados_reserva_do_estado(estado)
     return _resposta_preservando_ia(
         estado=estado,
@@ -1727,13 +1755,13 @@ def interpretar_resposta_modelo(
         texto_cliente = remover_flag_reserva(texto_modelo)
         return {
             "texto": texto_cliente,
-            "reserva_confirmada": contem_flag_reserva(texto_modelo),
+            "reserva_confirmada": False,
             "dados_reserva": extrair_dados_reserva(mensagem_cliente, texto_cliente),
             "dados_confirmados": {},
             "dados_mencionados": {},
             "dados_incertos": {},
-            "status_reserva": "confirmada" if contem_flag_reserva(texto_modelo) else "em_coleta",
-            "confianca": 0.5 if contem_flag_reserva(texto_modelo) else 0.0,
+            "status_reserva": "em_coleta",
+            "confianca": 0.0,
             "intencao": "",
             "acao": "",
             "proximo_campo": "",
@@ -1751,7 +1779,7 @@ def interpretar_resposta_modelo(
     acao = str(payload.get("acao") or "").strip().lower()
     status = str(reserva_dict.get("status") or payload.get("status_reserva") or "em_coleta").strip().lower()
     if acao == "confirmar_reserva":
-        status = "confirmada"
+        status = "em_coleta"
     elif acao == "cancelar":
         status = "cancelada"
     elif acao == "encaminhar_humano":
@@ -1781,9 +1809,9 @@ def interpretar_resposta_modelo(
     if not texto_cliente:
         texto_cliente = _resposta_contingencia()
 
-    reserva_confirmada = status == "confirmada" and _dados_reserva_minimos(dados_reserva)
-    if not reserva_confirmada and bool(reserva_dict.get("confirmada")):
-        reserva_confirmada = _dados_reserva_minimos(dados_reserva)
+    if status == "confirmada":
+        status = "em_coleta"
+    reserva_confirmada = False
     correcoes_payload = payload.get("correcoes")
     correcoes = dict(correcoes_payload) if isinstance(correcoes_payload, Mapping) else {}
 
@@ -3381,7 +3409,11 @@ def _texto_modelo_confirmacao_previa(texto: str, dados: Mapping[str, Any]) -> st
 
 
 def _confirmacao_ativa(estado: Mapping[str, Any]) -> bool:
-    return bool(estado.get("aguardando_confirmacao")) or _campo_aguardado(estado) == "confirmacao"
+    return (
+        bool(estado.get("aguardando_confirmacao"))
+        or bool(estado.get("aguardando_confirmacao_espaco"))
+        or _campo_aguardado(estado) == "confirmacao"
+    )
 
 
 def _resolver_mensagem_confirmacao_pendente(
@@ -3395,19 +3427,17 @@ def _resolver_mensagem_confirmacao_pendente(
     if not _confirmacao_ativa(estado):
         return None
 
-    _atualizar_preferencia_espaco_estado(estado, mensagem_cliente=mensagem_cliente)
-    _aplicar_regras_operacionais_espaco_estado(estado)
-
     if estado.get("aguardando_confirmacao_espaco") and _eh_confirmacao_cliente(mensagem_cliente):
         estado["cliente_autorizou_espaco_direcionado"] = True
         estado["aguardando_confirmacao_espaco"] = False
-        estado["aguardando_confirmacao"] = True
-        _definir_campo_pendente(estado, "confirmacao")
-        return _resposta_preservando_ia(
+        return _resposta_aguardando_comprovante(
             estado=estado,
             interpretacao=interpretacao,
-            status_reserva="aguardando_confirmacao",
+            funcao="_resolver_mensagem_confirmacao_pendente.aceite_espaco",
         )
+
+    _atualizar_preferencia_espaco_estado(estado, mensagem_cliente=mensagem_cliente)
+    _aplicar_regras_operacionais_espaco_estado(estado)
 
     resposta_espaco = _responder_direcionamento_espaco_se_necessario(
         telefone=telefone,
@@ -3498,8 +3528,6 @@ def _confirmar_reserva_pendente(
         }
 
     estado["confirmacao_pausada"] = False
-    estado["cliente_autorizou_confirmacao"] = False
-    estado["aguardando_confirmacao"] = False
     logger.info(
         "Dados validados antes do comprovante: data=%s horario=%s pessoas=%s telefone=%s.",
         dados_estado.get("data_reserva", ""),
@@ -3507,24 +3535,7 @@ def _confirmar_reserva_pendente(
         dados_estado.get("pessoas", ""),
         telefone,
     )
-    estado["comprovante_status"] = "aguardando_comprovante"
-    _definir_campo_pendente(estado, "comprovante")
-    texto = remover_flag_reserva(str(interpretacao.get("texto") or "")).strip()
-    if not texto or _texto_tenta_confirmar_reserva(texto):
-        texto = "Os dados estao completos. Vou te passar as orientacoes para enviar o comprovante."
-    _log_resposta_substituida(
-        texto_ia=str(interpretacao.get("texto") or ""),
-        texto_final=texto,
-        funcao=funcao,
-        motivo="confirmacao_automatica_bloqueada_aguardando_comprovante",
-    )
-    return {
-        "texto": texto,
-        "reserva_confirmada": False,
-        "dados_reserva": dados_estado,
-        "status_reserva": "aguardando_comprovante",
-        "confianca": max(float(interpretacao.get("confianca") or 0.0), 0.9),
-    }
+    return _resposta_aguardando_comprovante(estado=estado, interpretacao=interpretacao, funcao=funcao)
 
 
 def _responder_pausa_confirmacao(
