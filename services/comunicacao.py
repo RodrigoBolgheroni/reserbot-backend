@@ -9,6 +9,8 @@ class MensagemRecebida(TypedDict, total=False):
     remetente: str
     timestamp: str
     provider_message_id: str
+    tipo: str
+    media: dict[str, Any]
     raw: dict[str, Any]
 
 

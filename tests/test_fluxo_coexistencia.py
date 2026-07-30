@@ -532,6 +532,11 @@ class FluxoCoexistenciaTest(unittest.TestCase):
             patch.object(fluxo_reservas.agente, "_hoje", return_value=date(2026, 7, 22)),
             patch.dict(os.environ, {"GROQ_API_KEY": "teste"}),
             patch.object(fluxo_reservas.agente, "_chamar_groq", return_value=json_payload(payload)),
+            patch.object(
+                fluxo_reservas,
+                "_aplicar_fluxo_comprovante",
+                side_effect=lambda **kwargs: kwargs["resposta"],
+            ),
         ):
             resposta = fluxo_reservas.processar_resposta_cliente(
                 telefone="5511999999999",
@@ -539,13 +544,13 @@ class FluxoCoexistenciaTest(unittest.TestCase):
                 provider_message_id="wamid.estado",
             )
 
-        self.assertEqual(resposta["status_reserva"], "aguardando_confirmacao")
+        self.assertEqual(resposta["status_reserva"], "aguardando_comprovante")
         payload_metadata = atualizar_supabase.call_args_list[-1].args[1]
         estado_salvo = payload_metadata["metadata"]["estado_reserva"]
         self.assertEqual(estado_salvo["data_reserva"], "2026-07-29")
         self.assertEqual(estado_salvo["horario"], "20:00")
         self.assertEqual(estado_salvo["pessoas"], 4)
-        self.assertEqual(estado_salvo["campo_pendente"], "confirmacao")
+        self.assertEqual(estado_salvo["campo_pendente"], "comprovante")
         enviar.assert_called_once()
         self.assertEqual(registrar.call_count, 2)
 

@@ -1,0 +1,387 @@
+from __future__ import annotations
+
+import unittest
+from dataclasses import replace
+from unittest.mock import patch
+
+from scripts import config_server
+from services import agente, comprovantes_reserva, config_restaurante, fluxo_reservas, whatsapp_cloud
+
+
+TELEFONE = "5511999999999"
+
+
+def _config_praia() -> config_restaurante.ConfigRestaurante:
+    base = config_restaurante._obter_config_env()
+    return replace(
+        base,
+        nome="Praia da Radial",
+        estabelecimento_id="est-1",
+        fonte="supabase",
+        quantidade_minima_reserva=11,
+        taxa_valor=50.0,
+        taxa_convertida_consumacao=True,
+        prazo_cancelamento_horas=24,
+        pix_chave="42.538.063/0001-46",
+        pix_titular="Praia da Radial",
+        exige_comprovante=True,
+        espacos=(
+            config_restaurante.EspacoRestaurante(
+                id="salao-1",
+                nome="Salao",
+                descricao="Area interna",
+                capacidade_maxima=25,
+                permite_preferencia=True,
+                regras="",
+            ),
+            config_restaurante.EspacoRestaurante(
+                id="areia-1",
+                nome="Areia",
+                descricao="Area externa",
+                capacidade_maxima=None,
+                permite_preferencia=True,
+                regras="",
+            ),
+        ),
+        faq_conteudos=(
+            config_restaurante.FaqConteudo(
+                id="faq-bolo",
+                categoria="aniversario",
+                titulo="Bolo e aniversario",
+                conteudo=(
+                    "Como e aniversario, nao trabalhamos com lista. Pode trazer bolo, e conseguimos guarda-lo "
+                    "na geladeira ate o parabens. Recomendamos trazer pratos e garfos para servir."
+                ),
+                tags=("bolo", "aniversario"),
+            ),
+        ),
+    )
+
+
+def _estado_completo(**extras):
+    estado = {
+        "data_reserva": "2030-08-03",
+        "horario": "13:00",
+        "pessoas": 14,
+        "nome_cliente": "Rodrigo",
+        "preferencia_espaco_id": "salao-1",
+        "preferencia_espaco_nome": "Salao",
+        "origem_conversa": "aniversario",
+        "campo_pendente": "comprovante",
+        "etapa": "dados_completos",
+    }
+    estado.update(extras)
+    return estado
+
+
+def _resposta(dados=None, *, texto="Dados completos. Posso confirmar?"):
+    return {
+        "texto": texto,
+        "reserva_confirmada": True,
+        "dados_reserva": dados
+        or {
+            "data_reserva": "2030-08-03",
+            "horario": "13:00",
+            "pessoas": 14,
+            "nome_cliente": "Rodrigo",
+        },
+        "status_reserva": "confirmada",
+        "confianca": 0.9,
+    }
+
+
+class FluxoConclusaoReservaTest(unittest.TestCase):
+    def setUp(self) -> None:
+        agente._estados_reserva.clear()
+
+    def tearDown(self) -> None:
+        agente._estados_reserva.clear()
+
+    def test_quantidade_minima_e_capacidades_vem_da_configuracao(self) -> None:
+        config = _config_praia()
+        self.assertFalse(agente._pessoas_atende_quantidade_minima(10, config))
+        self.assertTrue(agente._pessoas_atende_quantidade_minima(11, config))
+        espacos = {espaco.nome: espaco for espaco in config.espacos}
+        self.assertEqual(espacos["Salao"].capacidade_maxima, 25)
+        self.assertIsNone(espacos["Areia"].capacidade_maxima)
+
+    @patch.object(fluxo_reservas, "registrar_solicitacao_reserva")
+    @patch.object(fluxo_reservas.config_restaurante, "obter_config", return_value=_config_praia())
+    @patch.object(fluxo_reservas.agente, "dados_reserva_obrigatorios_ok", return_value=True)
+    def test_dados_resolvidos_apresentam_aniversario_pagamento_e_cancelamento_uma_vez(
+        self,
+        _validar,
+        _config,
+        registrar_solicitacao,
+    ) -> None:
+        registrar_solicitacao.return_value = {"ok": True, "reserva": {"id": "res-1"}}
+        agente.definir_estado_reserva(TELEFONE, _estado_completo(etapa="dados_completos", campo_pendente="comprovante"))
+
+        resposta = fluxo_reservas._aplicar_fluxo_comprovante(
+            telefone=TELEFONE,
+            mensagem_cliente="prefiro o salao",
+            cliente={"id": "cli-1", "telefone": TELEFONE, "nome": "Rodrigo"},
+            conversa={"id": "conv-1", "origem": "aniversario"},
+            resposta=_resposta(),
+        )
+
+        texto = resposta["texto"].lower()
+        self.assertEqual(resposta["status_reserva"], "aguardando_comprovante")
+        self.assertFalse(resposta["reserva_confirmada"])
+        self.assertIn("nao trabalhamos com lista", texto)
+        self.assertIn("bolo", texto)
+        self.assertIn("geladeira", texto)
+        self.assertIn("pratos e garfos", texto)
+        self.assertIn("r$ 50,00", texto)
+        self.assertIn("42.538.063/0001-46", texto)
+        self.assertIn("24 horas", texto)
+        self.assertNotIn("posso confirmar", texto)
+        estado = agente.obter_estado_reserva(TELEFONE)
+        self.assertTrue(estado["informacoes_aniversario_apresentadas"])
+        self.assertTrue(estado["informacoes_pagamento_apresentadas"])
+        self.assertTrue(estado["informacoes_cancelamento_apresentadas"])
+        self.assertEqual(estado["reserva_id"], "res-1")
+
+        segunda = fluxo_reservas._aplicar_fluxo_comprovante(
+            telefone=TELEFONE,
+            mensagem_cliente="ja paguei",
+            cliente={"id": "cli-1", "telefone": TELEFONE, "nome": "Rodrigo"},
+            conversa={"id": "conv-1", "origem": "aniversario"},
+            resposta=_resposta(texto="Sua reserva esta confirmada."),
+        )
+        self.assertEqual(segunda["status_reserva"], "aguardando_comprovante")
+        self.assertFalse(segunda["reserva_confirmada"])
+        self.assertIn("imagem ou o pdf", segunda["texto"].lower())
+        self.assertNotIn("r$ 50,00", segunda["texto"].lower())
+
+    @patch.object(fluxo_reservas, "registrar_solicitacao_reserva")
+    @patch.object(fluxo_reservas.config_restaurante, "obter_config", return_value=_config_praia())
+    @patch.object(fluxo_reservas.agente, "dados_reserva_obrigatorios_ok", return_value=True)
+    def test_18h_nao_garante_espaco_e_nao_pede_preferencia(
+        self,
+        _validar,
+        _config,
+        registrar_solicitacao,
+    ) -> None:
+        registrar_solicitacao.return_value = {"ok": True, "reserva": {"id": "res-18"}}
+        estado = _estado_completo(
+            horario="18:00",
+            etapa="dados_completos",
+            campo_pendente="comprovante",
+            origem_conversa="webhook",
+        )
+        agente.definir_estado_reserva(TELEFONE, estado)
+        dados = dict(_resposta()["dados_reserva"])
+        dados["horario"] = "18:00"
+
+        resposta = fluxo_reservas._aplicar_fluxo_comprovante(
+            telefone=TELEFONE,
+            mensagem_cliente="18h",
+            cliente={"id": "cli-1", "telefone": TELEFONE, "nome": "Rodrigo"},
+            conversa={"id": "conv-18", "origem": "webhook"},
+            resposta=_resposta(dados=dados),
+        )
+
+        self.assertIn("nao conseguimos garantir", resposta["texto"].lower())
+        self.assertNotIn("voces preferem", resposta["texto"].lower())
+        self.assertNotIn("preferencia_espaco_id", agente.obter_estado_reserva(TELEFONE))
+
+    @patch.object(fluxo_reservas, "registrar_solicitacao_reserva")
+    @patch.object(fluxo_reservas.config_restaurante, "obter_config", return_value=_config_praia())
+    @patch.object(fluxo_reservas.agente, "dados_reserva_obrigatorios_ok", return_value=True)
+    def test_sem_espaco_em_horario_com_preferencia_permitida_pergunta_uma_vez(
+        self,
+        _validar,
+        _config,
+        registrar_solicitacao,
+    ) -> None:
+        estado = _estado_completo(etapa="dados_completos")
+        estado.pop("preferencia_espaco_id")
+        estado.pop("preferencia_espaco_nome")
+        agente.definir_estado_reserva(TELEFONE, estado)
+        resposta = fluxo_reservas._aplicar_fluxo_comprovante(
+            telefone=TELEFONE,
+            mensagem_cliente="14 pessoas",
+            cliente={"telefone": TELEFONE, "nome": "Rodrigo"},
+            conversa={"id": "conv-1", "origem": "webhook"},
+            resposta=_resposta(texto="Certo."),
+        )
+        self.assertEqual(resposta["status_reserva"], "em_coleta")
+        self.assertIn("salao ou areia", resposta["texto"].lower())
+        registrar_solicitacao.assert_not_called()
+
+    def test_registrar_confirmada_sem_acao_humana_e_bloqueado(self) -> None:
+        self.assertFalse(
+            fluxo_reservas.registrar_reserva_confirmada(
+                cliente={"telefone": TELEFONE, "nome": "Rodrigo"},
+                conversa={"id": "conv-1"},
+                dados_reserva={"data_reserva": "2030-08-03", "horario": "13:00", "pessoas": 14},
+            )
+        )
+
+
+class ComprovanteWebhookTest(unittest.TestCase):
+    def setUp(self) -> None:
+        agente._estados_reserva.clear()
+
+    def tearDown(self) -> None:
+        agente._estados_reserva.clear()
+
+    def test_parser_whatsapp_aceita_imagem_e_pdf_sem_texto(self) -> None:
+        for tipo, corpo, mime in (
+            ("image", {"id": "media-img", "mime_type": "image/jpeg"}, "image/jpeg"),
+            ("document", {"id": "media-pdf", "mime_type": "application/pdf", "filename": "pix.pdf"}, "application/pdf"),
+        ):
+            with self.subTest(tipo=tipo):
+                payload = {
+                    "entry": [
+                        {
+                            "changes": [
+                                {
+                                    "value": {
+                                        "messages": [{"id": f"wamid-{tipo}", "from": TELEFONE, "type": tipo, tipo: corpo}],
+                                        "contacts": [{"wa_id": TELEFONE, "profile": {"name": "Rodrigo"}}],
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                }
+                mensagens = whatsapp_cloud.extrair_mensagens_webhook(payload)
+                self.assertEqual(len(mensagens), 1)
+                self.assertEqual(mensagens[0]["media"]["mime_type"], mime)
+                self.assertEqual(mensagens[0].get("texto", ""), "")
+
+    @patch.object(fluxo_reservas, "atualizar_status_conversa")
+    @patch.object(fluxo_reservas, "registrar_mensagem", return_value=True)
+    @patch.object(fluxo_reservas.whatsapp, "enviar_com_resultado", return_value={"ok": True, "provider_message_id": "wamid-bot"})
+    @patch.object(fluxo_reservas.supabase, "atualizar", return_value={"ok": True})
+    @patch.object(fluxo_reservas.comprovantes_reserva, "receber_comprovante")
+    @patch.object(fluxo_reservas, "buscar_conversa_ativa_por_telefone")
+    @patch.object(fluxo_reservas, "_provider_message_id_registrado", return_value=False)
+    def test_imagem_e_pdf_mudam_para_aguardando_analise_sem_confirmar(
+        self,
+        _duplicado,
+        buscar_conversa,
+        receber,
+        _atualizar_supabase,
+        _enviar,
+        _registrar,
+        atualizar_status,
+    ) -> None:
+        conversa = {
+            "id": "conv-1",
+            "cliente_telefone": TELEFONE,
+            "status": "bot_ativo",
+            "origem": "aniversario",
+            "metadata": {
+                "estado_reserva": _estado_completo(
+                    reserva_id="res-1",
+                    etapa="aguardando_comprovante",
+                    campo_pendente="comprovante",
+                    comprovante_status="aguardando_comprovante",
+                )
+            },
+        }
+        buscar_conversa.return_value = conversa
+        receber.return_value = {"ok": True, "comprovante": {"id": "comp-1"}}
+
+        for indice, mime in enumerate(("image/jpeg", "application/pdf"), start=1):
+            with self.subTest(mime=mime):
+                conversa["metadata"]["estado_reserva"] = _estado_completo(
+                    reserva_id="res-1",
+                    etapa="aguardando_comprovante",
+                    campo_pendente="comprovante",
+                    comprovante_status="aguardando_comprovante",
+                )
+                resultado = fluxo_reservas.processar_mensagem_webhook(
+                    {
+                        "telefone": TELEFONE,
+                        "provider_message_id": f"wamid-media-{indice}",
+                        "media": {
+                            "media_id": f"media-{indice}",
+                            "tipo": "document" if mime == "application/pdf" else "image",
+                            "mime_type": mime,
+                            "nome_arquivo": "pix.pdf" if mime == "application/pdf" else "",
+                        },
+                        "raw": {},
+                    }
+                )
+                self.assertEqual(resultado["status"], "aguardando_analise")
+                self.assertFalse(resultado["reserva_confirmada"])
+        self.assertEqual(receber.call_count, 2)
+        self.assertTrue(all(call.kwargs["status"] == "aguardando_humano" for call in atualizar_status.call_args_list))
+
+    @patch.object(comprovantes_reserva, "_upload_privado", return_value={"ok": True})
+    @patch.object(comprovantes_reserva.whatsapp_cloud, "baixar_midia")
+    @patch.object(comprovantes_reserva.supabase, "inserir")
+    @patch.object(comprovantes_reserva.supabase, "selecionar", return_value={"ok": True, "data": []})
+    def test_servico_armazena_comprovante_privado_sem_url_publica(
+        self,
+        _selecionar,
+        inserir,
+        baixar,
+        _upload,
+    ) -> None:
+        baixar.return_value = {"ok": True, "conteudo": b"pdf", "mime_type": "application/pdf", "tamanho": 3}
+        inserir.return_value = {"ok": True, "data": [{"id": "comp-1"}]}
+        resultado = comprovantes_reserva.receber_comprovante(
+            media={"media_id": "media-1", "mime_type": "application/pdf", "nome_arquivo": "pix.pdf"},
+            provider_message_id="wamid-1",
+            conversa_id="conv-1",
+            reserva_id="res-1",
+        )
+        self.assertTrue(resultado["ok"])
+        payload = inserir.call_args.args[1]
+        self.assertEqual(payload["status_analise"], "aguardando_analise")
+        self.assertNotIn("url", payload)
+        self.assertEqual(payload["bucket"], "reserva-comprovantes")
+
+
+class ConfirmacaoHumanaTest(unittest.TestCase):
+    @patch.object(fluxo_reservas, "registrar_mensagem")
+    @patch.object(fluxo_reservas, "finalizar_conversa")
+    @patch.object(fluxo_reservas, "_buscar_conversa_por_id", return_value={"id": "conv-1", "status": "aguardando_humano"})
+    @patch.object(fluxo_reservas.whatsapp, "enviar_com_resultado", return_value={"ok": True, "provider_message_id": "wamid-ok"})
+    @patch.object(fluxo_reservas.comprovantes_reserva, "listar_por_reserva", return_value=[{"id": "comp-1"}])
+    @patch.object(fluxo_reservas.supabase, "chamar_rpc")
+    @patch.object(fluxo_reservas.supabase, "selecionar")
+    def test_acao_humana_autenticada_confirma_e_notifica(
+        self,
+        selecionar,
+        chamar_rpc,
+        _listar,
+        _enviar,
+        _buscar_conversa,
+        finalizar,
+        _registrar,
+    ) -> None:
+        reserva = {
+            "id": "res-1",
+            "conversa_id": "conv-1",
+            "cliente_telefone": TELEFONE,
+            "data_reserva": "2030-08-03",
+            "horario": "13:00:00",
+            "pessoas": 14,
+            "status": "aguardando_analise",
+            "metadata": {},
+        }
+        selecionar.return_value = {"ok": True, "data": [reserva]}
+        chamar_rpc.return_value = {"ok": True, "data": {**reserva, "status": "confirmada", "status_pagamento": "aprovado"}}
+        resultado = fluxo_reservas.confirmar_reserva_por_humano("res-1")
+        self.assertTrue(resultado["ok"])
+        self.assertEqual(resultado["reserva"]["status"], "confirmada")
+        chamar_rpc.assert_called_once_with(
+            "confirmar_reserva_comprovante",
+            {"p_reserva_id": "res-1", "p_analisado_por": "painel"},
+        )
+        finalizar.assert_called_once()
+
+    def test_rotas_seguras_de_comprovante_sao_reconhecidas(self) -> None:
+        self.assertEqual(config_server._id_rota_reserva_recurso("/api/reservas/res-1/comprovantes", "comprovantes"), "res-1")
+        self.assertEqual(config_server._id_rota_reserva_recurso("/api/reservas/res-1/confirmar", "confirmar"), "res-1")
+        self.assertEqual(config_server._id_rota_comprovante_arquivo("/api/comprovantes/comp-1/arquivo"), "comp-1")
+
+
+if __name__ == "__main__":
+    unittest.main()

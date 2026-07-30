@@ -231,7 +231,7 @@ class AgenteGuardrailsReservaTest(unittest.TestCase):
             resposta = agente.processar_mensagem(telefone, "29", nome_cliente="Rodrigo Teste")
 
         self.assertFalse(resposta["reserva_confirmada"])
-        self.assertEqual(resposta["status_reserva"], "aguardando_confirmacao")
+        self.assertEqual(resposta["status_reserva"], "aguardando_comprovante")
         self.assertEqual(resposta["dados_reserva"]["pessoas"], 29)
         self.assertEqual(resposta["dados_reserva"]["data_reserva"], "2026-07-26")
         self.assertEqual(resposta["dados_reserva"]["horario"], "20:00")
@@ -635,7 +635,7 @@ class AgenteGuardrailsReservaTest(unittest.TestCase):
         ):
             resposta = agente.processar_mensagem(telefone, "20 sem contar comigo", nome_cliente="Rodrigo Teste")
 
-        self.assertEqual(resposta["status_reserva"], "aguardando_confirmacao")
+        self.assertEqual(resposta["status_reserva"], "aguardando_comprovante")
         self.assertEqual(resposta["dados_reserva"]["pessoas"], 21)
         self.assertEqual(resposta["texto"], payload["resposta_natural"])
 
@@ -767,7 +767,7 @@ class AgenteGuardrailsReservaTest(unittest.TestCase):
             resposta = agente.processar_mensagem(telefone, "Na verdade, quero Ã s 20h", nome_cliente="Rodrigo Teste")
 
         self.assertFalse(resposta["reserva_confirmada"])
-        self.assertEqual(resposta["status_reserva"], "aguardando_confirmacao")
+        self.assertEqual(resposta["status_reserva"], "aguardando_comprovante")
         self.assertEqual(resposta["dados_reserva"]["data_reserva"], "2026-07-26")
         self.assertEqual(resposta["dados_reserva"]["horario"], "20:00")
         self.assertEqual(resposta["dados_reserva"]["pessoas"], 5)
@@ -920,9 +920,10 @@ class AgenteGuardrailsReservaTest(unittest.TestCase):
             final = agente.processar_mensagem(telefone, "Sim", nome_cliente="Rodrigo Teste")
 
         self.assertFalse(previa["reserva_confirmada"])
-        self.assertEqual(previa["status_reserva"], "aguardando_confirmacao")
+        self.assertEqual(previa["status_reserva"], "aguardando_comprovante")
         self.assertEqual(previa["texto"], coleta_payload["resposta_cliente"])
-        self.assertTrue(final["reserva_confirmada"])
+        self.assertFalse(final["reserva_confirmada"])
+        self.assertEqual(final["status_reserva"], "aguardando_comprovante")
         self.assertEqual(final["dados_reserva"]["horario"], "20:00")
         self.assertEqual(final["dados_reserva"]["pessoas"], 10)
 

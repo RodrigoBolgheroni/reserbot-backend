@@ -38,6 +38,16 @@ def configurado() -> bool:
     return _carregar_config() is not None
 
 
+def config_service_role() -> SupabaseConfig | None:
+    """Retorna somente credenciais de backend aptas a ignorar RLS."""
+    env_local = _ler_env_local()
+    url = _env("SUPABASE_URL", env_local).rstrip("/")
+    chave = _env("SUPABASE_SERVICE_ROLE_KEY", env_local)
+    if not url or not chave:
+        return None
+    return {"url": url, "chave": chave}
+
+
 def inserir(
     tabela: str,
     payload: Mapping[str, Any] | Sequence[Mapping[str, Any]],
@@ -104,6 +114,55 @@ def deletar(
     parametros = urlencode(dict(filtros))
     prefer = "return=representation" if retornar else "return=minimal"
     return requisitar("DELETE", tabela, query=f"?{parametros}", prefer=prefer)
+
+
+def chamar_rpc(funcao: str, payload: Mapping[str, Any]) -> SupabaseResultado:
+    config = config_service_role()
+    if config is None:
+        return {
+            "ok": False,
+            "tabela": f"rpc/{funcao}",
+            "erro": "Supabase service role nao configurado",
+        }
+    url = f"{config['url']}/rest/v1/rpc/{quote(funcao)}"
+    dados = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = Request(
+        url,
+        data=dados,
+        method="POST",
+        headers={
+            "apikey": config["chave"],
+            "Authorization": f"Bearer {config['chave']}",
+            "Accept": "application/json",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+    )
+    try:
+        with urlopen(request, timeout=TIMEOUT_SEGUNDOS) as response:
+            return {
+                "ok": True,
+                "status": getattr(response, "status", 200),
+                "tabela": f"rpc/{funcao}",
+                "data": _parse_json(response.read().decode("utf-8")),
+            }
+    except HTTPError as erro:
+        detalhe = _ler_erro_http(erro)
+        logger.warning("Supabase RPC %s retornou HTTP %s: %s", funcao, erro.code, detalhe)
+        return {
+            "ok": False,
+            "status": erro.code,
+            "tabela": f"rpc/{funcao}",
+            "erro": f"Supabase retornou HTTP {erro.code}",
+            "detalhe": detalhe,
+        }
+    except (OSError, URLError) as erro:
+        logger.warning("Falha ao chamar Supabase RPC %s: %s", funcao, erro)
+        return {
+            "ok": False,
+            "tabela": f"rpc/{funcao}",
+            "erro": "Falha ao chamar Supabase",
+            "detalhe": str(erro),
+        }
 
 
 def requisitar(

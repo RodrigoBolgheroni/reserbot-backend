@@ -149,8 +149,10 @@ def _parse_mensagem(item: Any, contatos: dict[str, str]) -> MensagemRecebida | N
     telefone = normalizar_telefone(str(item.get("from", "")))
     if not telefone:
         return None
+    tipo = str(item.get("type") or "").strip().lower()
     texto = _texto_mensagem(item)
-    if not texto:
+    media = _midia_mensagem(item)
+    if not texto and not media:
         return None
     timestamp = _timestamp(item.get("timestamp"))
     return {
@@ -159,6 +161,8 @@ def _parse_mensagem(item: Any, contatos: dict[str, str]) -> MensagemRecebida | N
         "remetente": contatos.get(telefone, telefone),
         "timestamp": timestamp,
         "provider_message_id": str(item.get("id") or ""),
+        "tipo": tipo,
+        "media": media,
         "raw": item,
     }
 
@@ -211,6 +215,87 @@ def _texto_mensagem(item: dict[str, Any]) -> str:
                 if isinstance(reply, dict):
                     return str(reply.get("title") or reply.get("id") or "").strip()
     return ""
+
+
+def _midia_mensagem(item: dict[str, Any]) -> dict[str, Any]:
+    tipo = str(item.get("type") or "").strip().lower()
+    if tipo not in {"image", "document"}:
+        return {}
+    dados = item.get(tipo)
+    if not isinstance(dados, dict):
+        return {}
+    media_id = str(dados.get("id") or "").strip()
+    if not media_id:
+        return {}
+    return {
+        "media_id": media_id,
+        "tipo": tipo,
+        "mime_type": str(dados.get("mime_type") or "").strip().lower(),
+        "nome_arquivo": str(dados.get("filename") or "").strip(),
+        "sha256": str(dados.get("sha256") or "").strip(),
+        "caption": str(dados.get("caption") or "").strip(),
+    }
+
+
+def baixar_midia(media_id: str, *, limite_bytes: int = 15 * 1024 * 1024) -> dict[str, Any]:
+    media_id_limpo = str(media_id or "").strip()
+    token = _access_token()
+    if not media_id_limpo or not token:
+        return {"ok": False, "erro": "midia ou credencial do WhatsApp ausente"}
+
+    metadados = _requisitar_json_meta(f"https://graph.facebook.com/{_api_version()}/{media_id_limpo}", token)
+    if not metadados.get("ok"):
+        return metadados
+    dados = metadados.get("data") if isinstance(metadados.get("data"), dict) else {}
+    url_midia = str(dados.get("url") or "").strip()
+    tamanho_informado = _inteiro_seguro(dados.get("file_size"))
+    if not url_midia:
+        return {"ok": False, "erro": "Meta nao retornou URL da midia"}
+    if tamanho_informado and tamanho_informado > limite_bytes:
+        return {"ok": False, "erro": "arquivo excede o limite permitido", "tamanho": tamanho_informado}
+
+    request = Request(url_midia, method="GET", headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urlopen(request, timeout=_timeout()) as response:
+            conteudo = response.read(limite_bytes + 1)
+            if len(conteudo) > limite_bytes:
+                return {"ok": False, "erro": "arquivo excede o limite permitido", "tamanho": len(conteudo)}
+            mime_type = str(dados.get("mime_type") or response.headers.get("Content-Type", "")).split(";", 1)[0].strip().lower()
+            return {
+                "ok": True,
+                "conteudo": conteudo,
+                "mime_type": mime_type,
+                "tamanho": len(conteudo),
+                "sha256": str(dados.get("sha256") or ""),
+            }
+    except HTTPError as erro:
+        detalhe = _ler_erro_http(erro)
+        logger.warning("Download de midia da Meta retornou HTTP %s: %s", erro.code, detalhe)
+        return {"ok": False, "erro": f"Meta retornou HTTP {erro.code}", "detalhe": detalhe}
+    except (OSError, URLError) as erro:
+        logger.warning("Falha ao baixar midia da Meta: %s", erro)
+        return {"ok": False, "erro": "falha ao baixar midia da Meta", "detalhe": str(erro)}
+
+
+def _requisitar_json_meta(url: str, token: str) -> dict[str, Any]:
+    request = Request(url, method="GET", headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+    try:
+        with urlopen(request, timeout=_timeout()) as response:
+            return {"ok": True, "data": _ler_json(response.read().decode("utf-8"))}
+    except HTTPError as erro:
+        detalhe = _ler_erro_http(erro)
+        logger.warning("Consulta de midia da Meta retornou HTTP %s: %s", erro.code, detalhe)
+        return {"ok": False, "erro": f"Meta retornou HTTP {erro.code}", "detalhe": detalhe}
+    except (OSError, URLError) as erro:
+        logger.warning("Falha ao consultar midia da Meta: %s", erro)
+        return {"ok": False, "erro": "falha ao consultar midia da Meta", "detalhe": str(erro)}
+
+
+def _inteiro_seguro(valor: Any) -> int:
+    try:
+        return int(valor)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _contatos_por_wa_id(value: dict[str, Any]) -> dict[str, str]:

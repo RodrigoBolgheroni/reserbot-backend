@@ -155,6 +155,13 @@ class EstadoReserva(TypedDict, total=False):
     confirmacao_pausada: bool
     cliente_autorizou_confirmacao: bool
     ultima_confirmacao_oferecida_em: str
+    informacoes_aniversario_apresentadas: bool
+    informacoes_pagamento_apresentadas: bool
+    informacoes_cancelamento_apresentadas: bool
+    regra_horario_sem_preferencia_apresentada: bool
+    comprovante_status: str
+    reserva_id: str
+    origem_conversa: str
     conversa_id: str
     ultimo_texto_bot: str
     ultimo_campo_perguntado: str
@@ -190,6 +197,8 @@ ETAPA_POR_CAMPO: Final[dict[str, str]] = {
     "telefone": "aguardando_telefone",
     "espaco": "aguardando_espaco",
     "confirmacao": "aguardando_confirmacao",
+    "comprovante": "aguardando_comprovante",
+    "analise_comprovante": "aguardando_analise",
 }
 
 CAMPO_POR_ETAPA: Final[dict[str, str]] = {etapa: campo for campo, etapa in ETAPA_POR_CAMPO.items()}
@@ -253,6 +262,13 @@ CHAVES_ESTADO_PERSISTIDO: Final[set[str]] = {
     "confirmacao_pausada",
     "cliente_autorizou_confirmacao",
     "ultima_confirmacao_oferecida_em",
+    "informacoes_aniversario_apresentadas",
+    "informacoes_pagamento_apresentadas",
+    "informacoes_cancelamento_apresentadas",
+    "regra_horario_sem_preferencia_apresentada",
+    "comprovante_status",
+    "reserva_id",
+    "origem_conversa",
     "conversa_id",
     "ultimo_texto_bot",
     "ultimo_campo_perguntado",
@@ -573,6 +589,10 @@ def _normalizar_estado_reserva_persistido(estado: Mapping[str, Any] | None) -> E
             "espaco_confirmado",
             "local_garantido",
             "disponibilidade_espaco_consultada",
+            "informacoes_aniversario_apresentadas",
+            "informacoes_pagamento_apresentadas",
+            "informacoes_cancelamento_apresentadas",
+            "regra_horario_sem_preferencia_apresentada",
         }:
             normalizado[chave] = bool(valor)  # type: ignore[literal-required]
             continue
@@ -627,6 +647,11 @@ def _mensagem_contexto_reserva(telefone: str) -> Mensagem:
         "etapa_interna_orientativa": estado.get("etapa", ""),
         "confirmacao_pausada": bool(estado.get("confirmacao_pausada")),
         "cliente_autorizou_confirmacao": bool(estado.get("cliente_autorizou_confirmacao")),
+        "informacoes_aniversario_apresentadas": bool(estado.get("informacoes_aniversario_apresentadas")),
+        "informacoes_pagamento_apresentadas": bool(estado.get("informacoes_pagamento_apresentadas")),
+        "informacoes_cancelamento_apresentadas": bool(estado.get("informacoes_cancelamento_apresentadas")),
+        "comprovante_status": estado.get("comprovante_status", ""),
+        "reserva_id": estado.get("reserva_id", ""),
         "ultima_confirmacao_oferecida_em": estado.get("ultima_confirmacao_oferecida_em", ""),
         "ultima_intencao": estado.get("ultima_intencao", ""),
         "assunto_atual": estado.get("assunto_atual", ""),
@@ -1558,28 +1583,16 @@ def aplicar_guardrails_reserva(
             dados_reserva=dados_estado,
         )
 
-    if estado.get("confirmacao_pausada") and not confirmacao_cliente:
-        estado["aguardando_confirmacao"] = True
-        estado["cliente_autorizou_confirmacao"] = False
-        _definir_campo_pendente(estado, "confirmacao")
-        dados_estado = _dados_reserva_do_estado(estado)
-        return _resposta_preservando_ia(
-            estado=estado,
-            interpretacao=interpretacao,
-            status_reserva="aguardando_confirmacao",
-            dados_reserva=dados_estado,
-        )
-
-    estado["aguardando_confirmacao"] = True
+    estado["aguardando_confirmacao"] = False
     estado["confirmacao_pausada"] = False
     estado["cliente_autorizou_confirmacao"] = False
-    estado["ultima_confirmacao_oferecida_em"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    _definir_campo_pendente(estado, "confirmacao")
+    estado["comprovante_status"] = "aguardando_comprovante"
+    _definir_campo_pendente(estado, "comprovante")
     dados_estado = _dados_reserva_do_estado(estado)
     return _resposta_preservando_ia(
         estado=estado,
         interpretacao=interpretacao,
-        status_reserva="aguardando_confirmacao",
+        status_reserva="aguardando_comprovante",
         dados_reserva=dados_estado,
     )
 
@@ -1616,8 +1629,8 @@ def _recalcular_campo_pendente(estado: EstadoReserva, telefone: str) -> None:
         estado["aguardando_confirmacao"] = False
         estado["cliente_autorizou_confirmacao"] = False
         return
-    _definir_campo_pendente(estado, "confirmacao")
-    estado["aguardando_confirmacao"] = True
+    _definir_campo_pendente(estado, "comprovante")
+    estado["aguardando_confirmacao"] = False
 
 
 def dados_reserva_obrigatorios_ok(
@@ -3485,27 +3498,31 @@ def _confirmar_reserva_pendente(
         }
 
     estado["confirmacao_pausada"] = False
-    estado["cliente_autorizou_confirmacao"] = True
+    estado["cliente_autorizou_confirmacao"] = False
     estado["aguardando_confirmacao"] = False
     logger.info(
-        "Confirmacao final validada: data=%s horario=%s pessoas=%s telefone=%s.",
+        "Dados validados antes do comprovante: data=%s horario=%s pessoas=%s telefone=%s.",
         dados_estado.get("data_reserva", ""),
         dados_estado.get("horario", ""),
         dados_estado.get("pessoas", ""),
         telefone,
     )
-    texto = _mensagem_reserva_confirmada(dados_estado)
+    estado["comprovante_status"] = "aguardando_comprovante"
+    _definir_campo_pendente(estado, "comprovante")
+    texto = remover_flag_reserva(str(interpretacao.get("texto") or "")).strip()
+    if not texto or _texto_tenta_confirmar_reserva(texto):
+        texto = "Os dados estao completos. Vou te passar as orientacoes para enviar o comprovante."
     _log_resposta_substituida(
         texto_ia=str(interpretacao.get("texto") or ""),
         texto_final=texto,
         funcao=funcao,
-        motivo="confirmacao_final_operacional",
+        motivo="confirmacao_automatica_bloqueada_aguardando_comprovante",
     )
     return {
         "texto": texto,
-        "reserva_confirmada": True,
+        "reserva_confirmada": False,
         "dados_reserva": dados_estado,
-        "status_reserva": "confirmada",
+        "status_reserva": "aguardando_comprovante",
         "confianca": max(float(interpretacao.get("confianca") or 0.0), 0.9),
     }
 
@@ -4878,8 +4895,8 @@ def _mensagem_sistema(
             "Cliente: 'Sábado às 20h'\n"
             "Você: 'Perfeito! Quantas pessoas no total?'\n"
             "\n"
-            "Cliente: '8 pessoas'\n"
-            "Você: 'Anotado! Sábado, 20h, 8 pessoas — confirma?'\n"
+            "Cliente: '12 pessoas'\n"
+            "Você: 'Perfeito. Voces preferem Salao ou Areia?'\n"
             "\n"
             "Seu objetivo:\n"
             "Coletar dia, horário e número de pessoas. "
@@ -4907,8 +4924,10 @@ def _mensagem_sistema(
             "Se o nome do cliente ja veio do cadastro ou webhook, nao peca o nome novamente. "
             "Se o cliente disser sim mas faltar algum campo, pergunte o campo faltante. "
             "Se o horario ou a quantidade forem invalidos, nao use esse valor. "
-            "Antes da confirmacao final, envie um resumo com data, horario e pessoas e pergunte se pode confirmar. "
-            "So use status confirmada depois que o cliente confirmar esse resumo. "
+            "A conversa nunca confirma a reserva automaticamente. Depois de coletar e validar os dados e o espaco, "
+            "oriente o pagamento e o envio do comprovante. Nao pergunte 'Posso confirmar?'. "
+            "Quando o comprovante chegar, informe que a solicitacao aguardara analise humana. "
+            "Somente uma acao administrativa autenticada pode mudar a reserva para confirmada. "
             "\n\n"
             "Informacoes reais do restaurante para responder perguntas durante a reserva:\n"
             f"- Endereco: {config.endereco}\n"
@@ -4942,7 +4961,7 @@ def _mensagem_sistema(
             '"dados_mencionados":{"data":"YYYY-MM-DD ou null","horario":"HH:MM ou null","quantidade":numero ou null},'
             '"dados_incertos":{"campo":"valor incerto"} ou {},'
             '"correcoes":{"campo":"valor corrigido"} ou {},'
-            '"acao":"responder|continuar_conversa|pedir_confirmacao|confirmar_reserva|cancelar|encaminhar_humano",'
+            '"acao":"responder|continuar_conversa|solicitar_comprovante|cancelar|encaminhar_humano",'
             '"deve_avancar_estado":true ou false,'
             '"campo_sugerido":"data|horario|quantidade|nome|confirmacao|null",'
             '"assunto_atual":"texto curto","pergunta_aberta":"texto curto","tom_cliente":"texto curto","resumo_conversa":"texto curto",'
@@ -4953,7 +4972,7 @@ def _mensagem_sistema(
             '"data_reserva":"YYYY-MM-DD ou null","horario":"HH:MM ou null",'
             '"pessoas":numero ou null,"observacoes":"texto curto ou null"},'
             '"confianca":0.0}. '
-            "Use status confirmada apenas quando data, horário, pessoas e confirmação do cliente estiverem claros. "
+            "Nunca use status confirmada nem afirme que a reserva esta confirmada; a equipe confirma depois de analisar o comprovante. "
             f"Data de hoje: {hoje}."
     )
     logger.info(

@@ -19,7 +19,7 @@ ROOT_DIR: Final[Path] = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from services import clientes_supabase, configuracoes_admin, conversas_supabase, disparador, fluxo_reservas, pdf_clientes, perfis, whatsapp_cloud
+from services import clientes_supabase, comprovantes_reserva, configuracoes_admin, conversas_supabase, disparador, fluxo_reservas, pdf_clientes, perfis, whatsapp_cloud
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,13 @@ class ConfigHandler(BaseHTTPRequestHandler):
             self._responder_json({"ok": True, "servico": "ReservaBot API", "health": "/api/health"})
             return
         if rota == "/api/health":
-            self._responder_json({"ok": True, "servico": "ReservaBot API"})
+            self._responder_json(
+                {
+                    "ok": True,
+                    "servico": "ReservaBot API",
+                    "commit": os.getenv("RENDER_GIT_COMMIT", "").strip()[:12] or None,
+                }
+            )
             return
         if rota == "/api/config":
             self._responder_json(_ler_env())
@@ -78,6 +84,14 @@ class ConfigHandler(BaseHTTPRequestHandler):
             return
         if rota == "/api/reservas":
             self._listar_reservas()
+            return
+        reserva_comprovantes_id = _id_rota_reserva_recurso(rota, "comprovantes")
+        if reserva_comprovantes_id:
+            self._listar_comprovantes_reserva(reserva_comprovantes_id)
+            return
+        comprovante_id = _id_rota_comprovante_arquivo(rota)
+        if comprovante_id:
+            self._baixar_comprovante(comprovante_id)
             return
         if rota == "/api/perfis":
             self._listar_perfis()
@@ -119,6 +133,10 @@ class ConfigHandler(BaseHTTPRequestHandler):
             return
         if rota == "/api/conversas/status":
             self._atualizar_status_conversa()
+            return
+        reserva_confirmar_id = _id_rota_reserva_recurso(rota, "confirmar")
+        if reserva_confirmar_id:
+            self._confirmar_reserva_humana(reserva_confirmar_id)
             return
         if rota == "/api/whatsapp/webhook":
             self._receber_webhook_whatsapp()
@@ -426,6 +444,49 @@ class ConfigHandler(BaseHTTPRequestHandler):
         limite = _query_int(self.path, "limit", 500)
         reservas = fluxo_reservas.listar_reservas(limite=limite)
         self._responder_json({"ok": True, "reservas": reservas, "total": len(reservas)})
+
+    def _listar_comprovantes_reserva(self, reserva_id: str) -> None:
+        if not self._exigir_config_admin():
+            return
+        comprovantes = fluxo_reservas.listar_comprovantes_reserva(reserva_id)
+        self._responder_json(
+            {
+                "ok": True,
+                "reserva_id": reserva_id,
+                "comprovantes": comprovantes,
+                "total": len(comprovantes),
+            }
+        )
+
+    def _baixar_comprovante(self, comprovante_id: str) -> None:
+        if not self._exigir_config_admin():
+            return
+        resultado = comprovantes_reserva.baixar_arquivo(comprovante_id)
+        if not resultado.get("ok"):
+            self._responder_json(
+                {"ok": False, "erro": resultado.get("erro", "comprovante nao encontrado")},
+                status=HTTPStatus(int(resultado.get("status") or HTTPStatus.BAD_GATEWAY)),
+            )
+            return
+        conteudo = resultado.get("conteudo")
+        if not isinstance(conteudo, bytes):
+            self._responder_erro(HTTPStatus.BAD_GATEWAY, "arquivo do comprovante indisponivel")
+            return
+        nome = re.sub(r"[^A-Za-z0-9._-]+", "-", str(resultado.get("nome_arquivo") or "comprovante"))
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", str(resultado.get("mime_type") or "application/octet-stream"))
+        self.send_header("Content-Length", str(len(conteudo)))
+        self.send_header("Content-Disposition", f'inline; filename="{nome}"')
+        self.send_header("Cache-Control", "private, no-store")
+        self.end_headers()
+        self.wfile.write(conteudo)
+
+    def _confirmar_reserva_humana(self, reserva_id: str) -> None:
+        if not self._exigir_config_admin():
+            return
+        resultado = fluxo_reservas.confirmar_reserva_por_humano(reserva_id, analisado_por="painel_autenticado")
+        status = HTTPStatus(int(resultado.pop("status", HTTPStatus.OK if resultado.get("ok") else HTTPStatus.BAD_REQUEST)))
+        self._responder_json(resultado, status=status)
 
     def _salvar_perfil(self) -> None:
         try:
@@ -912,6 +973,20 @@ def _id_rota_configuracao(rota: str, recurso: str) -> str:
     partes = [parte for parte in rota.split("/") if parte]
     if len(partes) == 4 and partes[:3] == ["api", "configuracoes", recurso]:
         return partes[3]
+    return ""
+
+
+def _id_rota_reserva_recurso(rota: str, recurso: str) -> str:
+    partes = [parte for parte in rota.split("/") if parte]
+    if len(partes) == 4 and partes[0] == "api" and partes[1] == "reservas" and partes[3] == recurso:
+        return partes[2]
+    return ""
+
+
+def _id_rota_comprovante_arquivo(rota: str) -> str:
+    partes = [parte for parte in rota.split("/") if parte]
+    if len(partes) == 4 and partes[:2] == ["api", "comprovantes"] and partes[3] == "arquivo":
+        return partes[2]
     return ""
 
 

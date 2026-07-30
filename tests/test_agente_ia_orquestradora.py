@@ -444,7 +444,7 @@ class AgenteIAOrquestradoraTest(unittest.TestCase):
         resposta = self._processar(telefone, "resume pra mim", payload)
 
         self.assertEqual(resposta["texto"], payload["resposta"])
-        self.assertEqual(resposta["status_reserva"], "aguardando_confirmacao")
+        self.assertEqual(resposta["status_reserva"], "aguardando_comprovante")
 
     def test_mudanca_de_assunto_e_retorno_mantem_estado(self) -> None:
         telefone = "5511990000009"
@@ -493,7 +493,7 @@ class AgenteIAOrquestradoraTest(unittest.TestCase):
         resposta = self._processar(telefone, "ficou como?", payload)
 
         self.assertFalse(resposta["reserva_confirmada"])
-        self.assertEqual(resposta["status_reserva"], "aguardando_confirmacao")
+        self.assertEqual(resposta["status_reserva"], "aguardando_comprovante")
 
     def test_resposta_natural_apos_validacao_invalida(self) -> None:
         telefone = "5511990010001"
@@ -664,7 +664,7 @@ class AgenteIAOrquestradoraTest(unittest.TestCase):
         self.assertEqual(estado["data_reserva"], "2030-02-28")
         self.assertEqual(estado["horario"], "18:00")
         self.assertEqual(estado["pessoas"], 12)
-        self.assertEqual(estado["campo_pendente"], "confirmacao")
+        self.assertEqual(estado["campo_pendente"], "comprovante")
 
     def test_data_valida_nao_chama_ia_pos_validacao(self) -> None:
         telefone = "5511990010033"
@@ -851,7 +851,7 @@ class AgenteIAOrquestradoraTest(unittest.TestCase):
         self.assertEqual(resposta_correcao["texto"], correcao["resposta"])
         self.assertEqual(agente._estados_reserva[telefone]["data_reserva"], "2026-07-30")
         self.assertEqual(agente._estados_reserva[telefone]["horario"], "21:00")
-        self.assertTrue(agente._estados_reserva[telefone]["confirmacao_pausada"])
+        self.assertFalse(agente._estados_reserva[telefone]["confirmacao_pausada"])
         self.assertNotIn("posso confirmar", agente._normalizar_busca(resposta_correcao["texto"]))
 
         resposta_comentario = self._processar(telefone, "Se nao estiver chovendo eu vou kkkkk", comentario)
@@ -860,8 +860,8 @@ class AgenteIAOrquestradoraTest(unittest.TestCase):
         self.assertNotIn("posso confirmar", agente._normalizar_busca(resposta_comentario["texto"]))
 
         resposta_confirmar = self._processar(telefone, "Agora pode confirmar", confirmar)
-        self.assertTrue(resposta_confirmar["reserva_confirmada"])
-        self.assertEqual(resposta_confirmar["status_reserva"], "confirmada")
+        self.assertFalse(resposta_confirmar["reserva_confirmada"])
+        self.assertEqual(resposta_confirmar["status_reserva"], "aguardando_comprovante")
         self.assertEqual(resposta_confirmar["dados_reserva"]["data_reserva"], "2026-07-30")
         self.assertEqual(resposta_confirmar["dados_reserva"]["horario"], "21:00")
         self.assertEqual(resposta_confirmar["dados_reserva"]["pessoas"], 4)
@@ -899,8 +899,8 @@ class AgenteIAOrquestradoraTest(unittest.TestCase):
 
         resposta = self._processar(telefone, "pode seguir", payload)
 
-        self.assertTrue(resposta["reserva_confirmada"])
-        self.assertEqual(resposta["status_reserva"], "confirmada")
+        self.assertFalse(resposta["reserva_confirmada"])
+        self.assertEqual(resposta["status_reserva"], "aguardando_comprovante")
         self.assertEqual(resposta["dados_reserva"]["data_reserva"], "2030-02-28")
         self.assertEqual(resposta["dados_reserva"]["horario"], "18:00")
         self.assertEqual(resposta["dados_reserva"]["pessoas"], 14)

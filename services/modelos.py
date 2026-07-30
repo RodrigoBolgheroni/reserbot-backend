@@ -15,7 +15,15 @@ StatusConversa = Literal[
 ]
 OrigemConversa = Literal["aniversario", "pdf", "whatsapp", "manual", "webhook"]
 RemetenteMensagem = Literal["cliente", "bot", "agente", "sistema"]
-StatusReserva = Literal["pendente", "identificada", "confirmada", "cancelada", "erro"]
+StatusReserva = Literal[
+    "pendente",
+    "identificada",
+    "aguardando_comprovante",
+    "aguardando_analise",
+    "confirmada",
+    "cancelada",
+    "erro",
+]
 
 
 class Cliente(TypedDict, total=False):
@@ -69,6 +77,9 @@ class ReservaBanco(TypedDict, total=False):
     pessoas: int
     observacoes: str
     status: StatusReserva
+    status_pagamento: str
+    estabelecimento_id: str
+    espaco_id: str
     metadata: dict[str, Any]
 
 
