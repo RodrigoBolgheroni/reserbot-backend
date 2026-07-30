@@ -142,6 +142,91 @@ class ConversasSupabaseTest(unittest.TestCase):
         self.assertEqual([item["texto"] for item in resultado["mensagens"]], ["Quero reservar", "Qual dia?"])
         self.assertEqual(resultado["mensagens"][1]["status"], "lido")
 
+    def test_listar_mensagens_expoe_imagem_e_pdf_sem_dados_privados(self) -> None:
+        def selecionar(tabela: str, **kwargs: Any) -> dict[str, Any]:
+            if tabela == "conversas":
+                return {
+                    "ok": True,
+                    "data": [{"id": "conv-1", "cliente_id": "cli-1", "status": "aguardando_humano"}],
+                }
+            if tabela == "clientes":
+                return {"ok": True, "data": [{"id": "cli-1", "nome": "Rodrigo", "telefone": "5511991111111"}]}
+            if tabela == "mensagens":
+                return {
+                    "ok": True,
+                    "data": [
+                        {
+                            "id": "msg-img",
+                            "conversa_id": "conv-1",
+                            "remetente": "cliente",
+                            "conteudo": "Imagem recebida",
+                            "provider_message_id": "wamid.img",
+                            "metadata": {
+                                "tipo": "image",
+                                "comprovante_id": "comp-img",
+                                "bucket": "nao-expor",
+                                "storage_path": "privado/imagem.jpg",
+                            },
+                        },
+                        {
+                            "id": "msg-pdf",
+                            "conversa_id": "conv-1",
+                            "remetente": "cliente",
+                            "conteudo": "Documento recebido",
+                            "provider_message_id": "wamid.pdf",
+                            "metadata": {"tipo": "document", "comprovante_id": "comp-pdf"},
+                        },
+                    ],
+                }
+            raise AssertionError(tabela)
+
+        comprovantes = [
+            {
+                "id": "comp-img",
+                "provider_message_id": "wamid.img",
+                "mime_type": "image/jpeg",
+                "nome_original": "pix.jpg",
+                "tamanho_bytes": 1234,
+                "status_analise": "aguardando_analise",
+                "disponivel": True,
+            },
+            {
+                "id": "comp-pdf",
+                "provider_message_id": "wamid.pdf",
+                "mime_type": "application/pdf",
+                "nome_original": "pix.pdf",
+                "tamanho_bytes": 4321,
+                "status_analise": "aprovado",
+                "disponivel": True,
+            },
+        ]
+        with (
+            patch.object(conversas_supabase.supabase, "selecionar", side_effect=selecionar),
+            patch.object(conversas_supabase.comprovantes_reserva, "listar_por_conversa", return_value=comprovantes),
+        ):
+            resultado = conversas_supabase.listar_mensagens_conversa("conv-1")
+
+        assert resultado is not None
+        imagem, pdf = resultado["mensagens"]
+        self.assertEqual(imagem["tipo"], "image")
+        self.assertEqual(imagem["media"]["mime_type"], "image/jpeg")
+        self.assertEqual(imagem["media"]["filename"], "pix.jpg")
+        self.assertEqual(imagem["media"]["tamanho"], 1234)
+        self.assertEqual(imagem["media"]["comprovante_status"], "aguardando_analise")
+        self.assertEqual(imagem["media"]["url_endpoint"], "/api/mensagens/msg-img/midia?conversa_id=conv-1")
+        self.assertEqual(pdf["tipo"], "document")
+        self.assertEqual(pdf["media"]["mime_type"], "application/pdf")
+        self.assertEqual(pdf["media"]["comprovante_status"], "aprovado")
+        serializado = str(resultado)
+        self.assertNotIn("nao-expor", serializado)
+        self.assertNotIn("privado/imagem.jpg", serializado)
+
+    def test_mensagem_comum_nao_dispara_consulta_de_comprovantes(self) -> None:
+        mensagem = {"id": "msg-1", "conversa_id": "conv-1", "conteudo": "Ola", "metadata": {}}
+        resumo = conversas_supabase._resumir_mensagem(mensagem)
+        self.assertNotIn("media", resumo)
+        self.assertNotIn("tipo", resumo)
+
 
 if __name__ == "__main__":
     unittest.main()

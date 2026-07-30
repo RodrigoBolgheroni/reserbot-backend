@@ -718,19 +718,10 @@ def _texto_cancelamento_config(config: config_restaurante.ConfigRestaurante) -> 
 
 
 def _texto_aniversario_config(config: config_restaurante.ConfigRestaurante) -> str:
-    candidatos = [
-        faq.conteudo.strip()
-        for faq in config.faq_conteudos
-        if faq.ativo
-        and (
-            "anivers" in f"{faq.categoria} {faq.titulo}".lower()
-            or any(tag.lower() in {"bolo", "aniversario", "decoracao"} for tag in faq.tags)
-        )
-        and faq.conteudo.strip()
-    ]
-    if candidatos:
-        return candidatos[0]
-    return str(config.aniversario or "").strip()
+    return (
+        "Como é aniversário, não trabalhamos com lista. Pode trazer bolo, e conseguimos guardá-lo "
+        "na geladeira até a hora do parabéns. Recomendamos trazer pratos e garfos para servir."
+    )
 
 
 def _conversa_de_aniversario(conversa: Mapping[str, Any], estado: Mapping[str, Any]) -> bool:

@@ -182,13 +182,20 @@ class FluxoConclusaoReservaTest(unittest.TestCase):
         texto = resposta["texto"].lower()
         self.assertEqual(resposta["status_reserva"], "aguardando_comprovante")
         self.assertFalse(resposta["reserva_confirmada"])
-        self.assertIn("nao trabalhamos com lista", texto)
+        self.assertIn("não trabalhamos com lista", texto)
         self.assertIn("bolo", texto)
         self.assertIn("geladeira", texto)
         self.assertIn("pratos e garfos", texto)
         self.assertIn("r$ 50,00", texto)
         self.assertIn("42.538.063/0001-46", texto)
         self.assertIn("24 horas", texto)
+        self.assertEqual(
+            resposta["texto"].count(
+                "Como é aniversário, não trabalhamos com lista. Pode trazer bolo, e conseguimos guardá-lo "
+                "na geladeira até a hora do parabéns. Recomendamos trazer pratos e garfos para servir."
+            ),
+            1,
+        )
         self.assertNotIn("posso confirmar", texto)
         estado = agente.obter_estado_reserva(TELEFONE)
         self.assertTrue(estado["informacoes_aniversario_apresentadas"])
@@ -207,6 +214,7 @@ class FluxoConclusaoReservaTest(unittest.TestCase):
         self.assertFalse(segunda["reserva_confirmada"])
         self.assertIn("imagem ou o pdf", segunda["texto"].lower())
         self.assertNotIn("r$ 50,00", segunda["texto"].lower())
+        self.assertNotIn("Como é aniversário", segunda["texto"])
 
     @patch.object(fluxo_reservas, "registrar_solicitacao_reserva")
     @patch.object(fluxo_reservas.config_restaurante, "obter_config", return_value=_config_praia())
@@ -284,7 +292,7 @@ class FluxoConclusaoReservaTest(unittest.TestCase):
         texto_primeira = primeira["texto"].lower()
         self.assertEqual(primeira["status_reserva"], "aguardando_comprovante")
         self.assertFalse(primeira["reserva_confirmada"])
-        self.assertIn("nao trabalhamos com lista", texto_primeira)
+        self.assertIn("não trabalhamos com lista", texto_primeira)
         self.assertIn("bolo", texto_primeira)
         self.assertIn("geladeira", texto_primeira)
         self.assertIn("pratos e garfos", texto_primeira)
@@ -705,6 +713,70 @@ class ComprovanteWebhookTest(unittest.TestCase):
         self.assertNotIn("url", payload)
         self.assertEqual(payload["bucket"], "reserva-comprovantes")
 
+    @patch.object(comprovantes_reserva, "_download_privado", return_value={"ok": True, "conteudo": b"imagem"})
+    @patch.object(comprovantes_reserva.supabase, "selecionar")
+    def test_stream_por_mensagem_confere_conversa_e_preserva_mime(self, selecionar, download) -> None:
+        selecionar.side_effect = [
+            {
+                "ok": True,
+                "data": [
+                    {
+                        "id": "msg-1",
+                        "conversa_id": "conv-1",
+                        "provider_message_id": "wamid-1",
+                        "metadata": {"comprovante_id": "comp-1"},
+                    }
+                ],
+            },
+            {
+                "ok": True,
+                "data": [
+                    {
+                        "id": "comp-1",
+                        "conversa_id": "conv-1",
+                        "mime_type": "image/png",
+                        "nome_original": "pix.png",
+                        "bucket": "privado",
+                        "storage_path": "conv-1/pix.png",
+                    }
+                ],
+            },
+        ]
+        resultado = comprovantes_reserva.baixar_arquivo_mensagem(mensagem_id="msg-1", conversa_id="conv-1")
+        self.assertTrue(resultado["ok"])
+        self.assertEqual(resultado["mime_type"], "image/png")
+        self.assertEqual(resultado["nome_arquivo"], "pix.png")
+        download.assert_called_once_with(bucket="privado", caminho="conv-1/pix.png")
+        self.assertEqual(selecionar.call_args_list[0].kwargs["filtros"]["conversa_id"], "eq.conv-1")
+        self.assertEqual(selecionar.call_args_list[1].kwargs["filtros"]["conversa_id"], "eq.conv-1")
+
+    @patch.object(comprovantes_reserva, "_download_privado")
+    @patch.object(comprovantes_reserva.supabase, "selecionar", return_value={"ok": True, "data": []})
+    def test_stream_por_mensagem_recusa_conversa_incorreta(self, _selecionar, download) -> None:
+        resultado = comprovantes_reserva.baixar_arquivo_mensagem(mensagem_id="msg-1", conversa_id="outra-conversa")
+        self.assertFalse(resultado["ok"])
+        self.assertEqual(resultado["status"], 404)
+        download.assert_not_called()
+
+    def test_texto_operacional_de_aniversario_nao_usa_faq_generica(self) -> None:
+        config = replace(
+            _config_praia(),
+            faq_conteudos=(
+                config_restaurante.FaqConteudo(
+                    id="faq-generica",
+                    categoria="aniversario",
+                    titulo="Bolo e decoracao",
+                    conteudo="Informacoes sobre bolo e decoracao devem ser confirmadas com a equipe.",
+                    tags=("bolo", "decoracao"),
+                ),
+            ),
+        )
+        self.assertEqual(
+            fluxo_reservas._texto_aniversario_config(config),
+            "Como é aniversário, não trabalhamos com lista. Pode trazer bolo, e conseguimos guardá-lo "
+            "na geladeira até a hora do parabéns. Recomendamos trazer pratos e garfos para servir.",
+        )
+
 
 class ConfirmacaoHumanaTest(unittest.TestCase):
     @patch.object(fluxo_reservas, "registrar_mensagem")
@@ -749,6 +821,25 @@ class ConfirmacaoHumanaTest(unittest.TestCase):
         self.assertEqual(config_server._id_rota_reserva_recurso("/api/reservas/res-1/comprovantes", "comprovantes"), "res-1")
         self.assertEqual(config_server._id_rota_reserva_recurso("/api/reservas/res-1/confirmar", "confirmar"), "res-1")
         self.assertEqual(config_server._id_rota_comprovante_arquivo("/api/comprovantes/comp-1/arquivo"), "comp-1")
+        self.assertEqual(config_server._id_rota_mensagem_midia("/api/mensagens/msg-1/midia"), "msg-1")
+
+    @patch.object(config_server.comprovantes_reserva, "baixar_arquivo_mensagem")
+    def test_rota_de_midia_exige_auth_e_repassa_conversa(self, baixar) -> None:
+        handler = object.__new__(config_server.ConfigHandler)
+        handler.path = "/api/mensagens/msg-1/midia?conversa_id=conv-1"
+        with patch.object(config_server.ConfigHandler, "_exigir_config_admin", return_value=False):
+            config_server.ConfigHandler._baixar_midia_mensagem(handler, "msg-1")
+        baixar.assert_not_called()
+
+        resultado = {"ok": True, "conteudo": b"pdf", "mime_type": "application/pdf", "nome_arquivo": "pix.pdf"}
+        with (
+            patch.object(config_server.ConfigHandler, "_exigir_config_admin", return_value=True),
+            patch.object(config_server.ConfigHandler, "_responder_arquivo_privado") as responder,
+        ):
+            baixar.return_value = resultado
+            config_server.ConfigHandler._baixar_midia_mensagem(handler, "msg-1")
+        baixar.assert_called_once_with(mensagem_id="msg-1", conversa_id="conv-1")
+        responder.assert_called_once_with(resultado)
 
 
 if __name__ == "__main__":

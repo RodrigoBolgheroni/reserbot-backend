@@ -127,6 +127,44 @@ def listar_por_reserva(reserva_id: str) -> list[dict[str, Any]]:
     return [dict(item) for item in (resultado.get("data") or []) if isinstance(item, Mapping)]
 
 
+def listar_por_conversa(conversa_id: str) -> list[dict[str, Any]]:
+    conversa_id_limpo = str(conversa_id or "").strip()
+    if not conversa_id_limpo:
+        return []
+    resultado = supabase.selecionar(
+        TABELA_COMPROVANTES,
+        filtros={"conversa_id": f"eq.{conversa_id_limpo}"},
+        colunas=(
+            "id,reserva_id,conversa_id,provider_message_id,tipo_midia,mime_type,nome_original,"
+            "tamanho_bytes,recebido_em,status_analise,bucket,storage_path"
+        ),
+        order="recebido_em.asc",
+    )
+    if not resultado.get("ok"):
+        logger.warning("Comprovantes nao listados para conversa=%s: %s", conversa_id_limpo, resultado.get("erro"))
+        return []
+    comprovantes: list[dict[str, Any]] = []
+    for item in resultado.get("data") or []:
+        if not isinstance(item, Mapping):
+            continue
+        comprovantes.append(
+            {
+                "id": str(item.get("id") or ""),
+                "reserva_id": str(item.get("reserva_id") or ""),
+                "conversa_id": str(item.get("conversa_id") or ""),
+                "provider_message_id": str(item.get("provider_message_id") or ""),
+                "tipo_midia": str(item.get("tipo_midia") or ""),
+                "mime_type": str(item.get("mime_type") or ""),
+                "nome_original": str(item.get("nome_original") or ""),
+                "tamanho_bytes": _inteiro_seguro(item.get("tamanho_bytes")),
+                "recebido_em": str(item.get("recebido_em") or ""),
+                "status_analise": str(item.get("status_analise") or ""),
+                "disponivel": bool(item.get("bucket") and item.get("storage_path")),
+            }
+        )
+    return comprovantes
+
+
 def obter_por_provider_message_id(provider_message_id: str) -> dict[str, Any] | None:
     return _buscar_por_provider_message_id(provider_message_id)
 
@@ -145,6 +183,59 @@ def baixar_arquivo(comprovante_id: str) -> dict[str, Any]:
         bucket=str(comprovante.get("bucket") or ""),
         caminho=str(comprovante.get("storage_path") or ""),
     )
+    if not download.get("ok"):
+        return download
+    return {
+        "ok": True,
+        "conteudo": download["conteudo"],
+        "mime_type": str(comprovante.get("mime_type") or "application/octet-stream"),
+        "nome_arquivo": str(comprovante.get("nome_original") or "comprovante"),
+        "tamanho": len(download["conteudo"]),
+    }
+
+
+def baixar_arquivo_mensagem(*, mensagem_id: str, conversa_id: str) -> dict[str, Any]:
+    mensagem_id_limpo = str(mensagem_id or "").strip()
+    conversa_id_limpo = str(conversa_id or "").strip()
+    if not mensagem_id_limpo or not conversa_id_limpo:
+        return {"ok": False, "status": 400, "erro": "mensagem_id e conversa_id sao obrigatorios"}
+
+    resultado_mensagem = supabase.selecionar(
+        os.getenv("SUPABASE_MENSAGENS_TABLE", "mensagens").strip() or "mensagens",
+        filtros={"id": f"eq.{mensagem_id_limpo}", "conversa_id": f"eq.{conversa_id_limpo}"},
+        colunas="id,conversa_id,provider_message_id,metadata",
+        limite=1,
+    )
+    mensagem = _primeiro(resultado_mensagem.get("data")) if resultado_mensagem.get("ok") else None
+    if not mensagem:
+        return {"ok": False, "status": 404, "erro": "midia da mensagem nao encontrada"}
+
+    metadata = mensagem.get("metadata") if isinstance(mensagem.get("metadata"), Mapping) else {}
+    comprovante_id = str(metadata.get("comprovante_id") or "").strip()
+    filtros = {"conversa_id": f"eq.{conversa_id_limpo}"}
+    if comprovante_id:
+        filtros["id"] = f"eq.{comprovante_id}"
+    else:
+        provider_message_id = str(mensagem.get("provider_message_id") or "").strip()
+        if not provider_message_id:
+            return {"ok": False, "status": 404, "erro": "comprovante da mensagem nao encontrado"}
+        filtros["provider_message_id"] = f"eq.{provider_message_id}"
+
+    resultado_comprovante = supabase.selecionar(
+        TABELA_COMPROVANTES,
+        filtros=filtros,
+        colunas="id,conversa_id,mime_type,nome_original,tamanho_bytes,bucket,storage_path",
+        limite=1,
+    )
+    comprovante = _primeiro(resultado_comprovante.get("data")) if resultado_comprovante.get("ok") else None
+    if not comprovante:
+        return {"ok": False, "status": 404, "erro": "comprovante da mensagem nao encontrado"}
+
+    bucket = str(comprovante.get("bucket") or "").strip()
+    storage_path = str(comprovante.get("storage_path") or "").strip()
+    if not bucket or not storage_path:
+        return {"ok": False, "status": 409, "erro": "arquivo do comprovante ainda nao esta disponivel"}
+    download = _download_privado(bucket=bucket, caminho=storage_path)
     if not download.get("ok"):
         return download
     return {
@@ -179,6 +270,13 @@ def _buscar_por_provider_message_id(provider_message_id: str) -> dict[str, Any] 
     if not resultado.get("ok"):
         return None
     return _primeiro(resultado.get("data"))
+
+
+def _inteiro_seguro(valor: Any) -> int:
+    try:
+        return int(valor or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _upload_privado(*, bucket: str, caminho: str, conteudo: bytes, mime_type: str) -> dict[str, Any]:

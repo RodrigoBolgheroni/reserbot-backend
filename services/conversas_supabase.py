@@ -4,8 +4,9 @@ import logging
 import re
 from collections.abc import Iterable, Mapping
 from typing import Any, Final, TypedDict
+from urllib.parse import quote
 
-from services import supabase
+from services import comprovantes_reserva, supabase
 
 
 logger = logging.getLogger(__name__)
@@ -17,6 +18,14 @@ PAGE_SIZE_PADRAO: Final[int] = 30
 PAGE_SIZE_MAX: Final[int] = 100
 BUSCA_LIMITE: Final[int] = 500
 RECENTES_LIMITE: Final[int] = 1000
+CAMPOS_METADATA_PRIVADOS: Final[set[str]] = {
+    "bucket",
+    "storage_path",
+    "signed_url",
+    "url_assinada",
+    "url_publica",
+    "service_role_key",
+}
 STATUS_FILTROS: Final[dict[str, tuple[str, ...]]] = {
     "bot_ativo": ("bot_ativo", "aberta", "aguardando_cliente"),
     "aguardando_humano": ("aguardando_humano",),
@@ -136,7 +145,24 @@ def listar_mensagens_conversa(conversa_id: str) -> dict[str, Any] | None:
         }
 
     dados = resultado.get("data")
-    mensagens = [_resumir_mensagem(item) for item in dados if isinstance(item, dict)] if isinstance(dados, list) else []
+    itens_mensagem = [item for item in dados if isinstance(item, dict)] if isinstance(dados, list) else []
+    comprovantes = comprovantes_reserva.listar_por_conversa(conversa_id) if any(
+        _mensagem_tem_indicio_midia(item) for item in itens_mensagem
+    ) else []
+    comprovantes_por_id = {str(item.get("id") or ""): item for item in comprovantes if item.get("id")}
+    comprovantes_por_provider = {
+        str(item.get("provider_message_id") or ""): item
+        for item in comprovantes
+        if item.get("provider_message_id")
+    }
+    mensagens = [
+        _resumir_mensagem(
+            item,
+            comprovantes_por_id=comprovantes_por_id,
+            comprovantes_por_provider=comprovantes_por_provider,
+        )
+        for item in itens_mensagem
+    ]
     return {
         "conversa": conversa["conversa"],
         "cliente": conversa["cliente"],
@@ -296,9 +322,14 @@ def _resumir_conversa(
     }
 
 
-def _resumir_mensagem(mensagem: Mapping[str, Any]) -> dict[str, Any]:
+def _resumir_mensagem(
+    mensagem: Mapping[str, Any],
+    *,
+    comprovantes_por_id: Mapping[str, Mapping[str, Any]] | None = None,
+    comprovantes_por_provider: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
     metadata = _metadata(mensagem)
-    return {
+    resumo = {
         "id": str(mensagem.get("id") or ""),
         "conversa_id": str(mensagem.get("conversa_id") or ""),
         "texto": str(mensagem.get("conteudo") or ""),
@@ -307,8 +338,71 @@ def _resumir_mensagem(mensagem: Mapping[str, Any]) -> dict[str, Any]:
         "erro": str(metadata.get("erro_entrega") or metadata.get("erro") or "") or None,
         "provider_message_id": str(mensagem.get("provider_message_id") or "") or None,
         "created_at": str(mensagem.get("timestamp") or mensagem.get("created_at") or ""),
-        "metadata": metadata,
+        "metadata": _sanitizar_metadata(metadata),
     }
+    tipo = _tipo_midia_mensagem(mensagem)
+    if not tipo:
+        return resumo
+
+    comprovante_id = str(metadata.get("comprovante_id") or "")
+    provider_message_id = str(mensagem.get("provider_message_id") or "")
+    comprovante = (comprovantes_por_id or {}).get(comprovante_id) or (comprovantes_por_provider or {}).get(provider_message_id)
+    comprovante = comprovante or {}
+    mime_type = str(comprovante.get("mime_type") or metadata.get("mime_type") or "")
+    if mime_type == "application/pdf":
+        tipo = "document"
+    elif mime_type.startswith("image/"):
+        tipo = "image"
+    filename = str(comprovante.get("nome_original") or "").strip()
+    if not filename:
+        filename = "comprovante.pdf" if tipo == "document" else "comprovante.jpg"
+    mensagem_id = str(mensagem.get("id") or "")
+    conversa_id = str(mensagem.get("conversa_id") or "")
+    resumo["tipo"] = tipo
+    resumo["media"] = {
+        "disponivel": bool(comprovante.get("disponivel")),
+        "mime_type": mime_type or ("application/pdf" if tipo == "document" else "image/jpeg"),
+        "filename": filename,
+        "tamanho": _inteiro_seguro(comprovante.get("tamanho_bytes")),
+        "comprovante_status": str(comprovante.get("status_analise") or metadata.get("comprovante_status") or ""),
+        "url_endpoint": (
+            f"/api/mensagens/{quote(mensagem_id, safe='')}/midia?conversa_id={quote(conversa_id, safe='')}"
+            if mensagem_id and conversa_id and comprovante
+            else ""
+        ),
+    }
+    return resumo
+
+
+def _mensagem_tem_indicio_midia(mensagem: Mapping[str, Any]) -> bool:
+    return bool(_tipo_midia_mensagem(mensagem))
+
+
+def _inteiro_seguro(valor: Any) -> int:
+    try:
+        return int(valor or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _tipo_midia_mensagem(mensagem: Mapping[str, Any]) -> str:
+    metadata = _metadata(mensagem)
+    tipo = str(metadata.get("tipo") or "").strip().lower()
+    if not tipo:
+        tipos = metadata.get("tipos_midia")
+        if isinstance(tipos, list) and tipos:
+            tipo = str(tipos[0] or "").strip().lower()
+    mime_type = str(metadata.get("mime_type") or "").strip().lower()
+    if mime_type == "application/pdf" or tipo in {"document", "pdf"}:
+        return "document"
+    if mime_type.startswith("image/") or tipo in {"image", "imagem"}:
+        return "image"
+    conteudo = str(mensagem.get("conteudo") or "").strip().lower()
+    if conteudo == "imagem recebida":
+        return "image"
+    if conteudo == "documento recebido" or conteudo.endswith(".pdf"):
+        return "document"
+    return ""
 
 
 def _cliente_da_conversa(conversa: Mapping[str, Any], clientes: Mapping[str, dict[str, Any]]) -> dict[str, Any] | None:
@@ -395,6 +489,18 @@ def _nao_lidas(conversa: Mapping[str, Any]) -> int:
 def _metadata(registro: Mapping[str, Any]) -> dict[str, Any]:
     valor = registro.get("metadata")
     return dict(valor) if isinstance(valor, Mapping) else {}
+
+
+def _sanitizar_metadata(valor: Any) -> Any:
+    if isinstance(valor, Mapping):
+        return {
+            str(chave): _sanitizar_metadata(item)
+            for chave, item in valor.items()
+            if str(chave).lower() not in CAMPOS_METADATA_PRIVADOS
+        }
+    if isinstance(valor, list):
+        return [_sanitizar_metadata(item) for item in valor]
+    return valor
 
 
 def _filtro_in(valores: Iterable[str]) -> str:

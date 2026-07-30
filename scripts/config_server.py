@@ -93,6 +93,10 @@ class ConfigHandler(BaseHTTPRequestHandler):
         if comprovante_id:
             self._baixar_comprovante(comprovante_id)
             return
+        mensagem_midia_id = _id_rota_mensagem_midia(rota)
+        if mensagem_midia_id:
+            self._baixar_midia_mensagem(mensagem_midia_id)
+            return
         if rota == "/api/perfis":
             self._listar_perfis()
             return
@@ -462,6 +466,22 @@ class ConfigHandler(BaseHTTPRequestHandler):
         if not self._exigir_config_admin():
             return
         resultado = comprovantes_reserva.baixar_arquivo(comprovante_id)
+        self._responder_arquivo_privado(resultado)
+
+    def _baixar_midia_mensagem(self, mensagem_id: str) -> None:
+        if not self._exigir_config_admin():
+            return
+        conversa_id = parse_qs(urlparse(self.path).query).get("conversa_id", [""])[0].strip()
+        if not conversa_id:
+            self._responder_erro(HTTPStatus.BAD_REQUEST, "conversa_id e obrigatorio")
+            return
+        resultado = comprovantes_reserva.baixar_arquivo_mensagem(
+            mensagem_id=mensagem_id,
+            conversa_id=conversa_id,
+        )
+        self._responder_arquivo_privado(resultado)
+
+    def _responder_arquivo_privado(self, resultado: dict[str, Any]) -> None:
         if not resultado.get("ok"):
             self._responder_json(
                 {"ok": False, "erro": resultado.get("erro", "comprovante nao encontrado")},
@@ -986,6 +1006,13 @@ def _id_rota_reserva_recurso(rota: str, recurso: str) -> str:
 def _id_rota_comprovante_arquivo(rota: str) -> str:
     partes = [parte for parte in rota.split("/") if parte]
     if len(partes) == 4 and partes[:2] == ["api", "comprovantes"] and partes[3] == "arquivo":
+        return partes[2]
+    return ""
+
+
+def _id_rota_mensagem_midia(rota: str) -> str:
+    partes = [parte for parte in rota.split("/") if parte]
+    if len(partes) == 4 and partes[:2] == ["api", "mensagens"] and partes[3] == "midia":
         return partes[2]
     return ""
 
