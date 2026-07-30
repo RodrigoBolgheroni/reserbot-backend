@@ -24,6 +24,9 @@ STATUS_BOT_ATIVO = {"bot_ativo", "aberta", "aguardando_cliente", "em_atendimento
 STATUS_HUMANO = {"humano", "aguardando_humano", "finalizada"}
 STATUS_CONVERSA_PERMITIDOS = STATUS_BOT_ATIVO | STATUS_HUMANO | {"erro"}
 DEBOUNCE_SECONDS_ENV = "WHATSAPP_DEBOUNCE_SECONDS"
+DEBOUNCE_SECONDS_DEFAULT = 2.5
+DEBOUNCE_RETRY_SECONDS = 1.0
+DEBOUNCE_LEASE_SECONDS = 30.0
 PADROES_PEDIDO_HUMANO = (
     r"\batendente\b",
     r"\bhumano\b",
@@ -602,9 +605,6 @@ def _deve_enfileirar_debounce(mensagem: Mapping[str, Any], raw: Mapping[str, Any
         return False
     if _janela_debounce_segundos() <= 0:
         return False
-    provider_message_id = str(mensagem.get("provider_message_id") or "").strip()
-    if provider_message_id and _mensagem_ja_processada(provider_message_id):
-        return False
     return True
 
 
@@ -612,21 +612,13 @@ def _enfileirar_mensagem_debounce(mensagem: MensagemRecebida) -> ResultadoWebhoo
     telefone = str(mensagem.get("telefone") or "").strip()
     provider_message_id = str(mensagem.get("provider_message_id") or "").strip()
     janela = _janela_debounce_segundos()
-    if provider_message_id:
-        with _debounce_lock:
-            if provider_message_id in _provider_ids_pendentes:
-                logger.info("Mensagem de webhook ja esta pendente no debounce: %s", provider_message_id)
-                return {
-                    "ok": True,
-                    "telefone": telefone,
-                    "status": "duplicada_pendente",
-                    "resposta_enviada": False,
-                }
 
     conversa = buscar_conversa_ativa_por_telefone(telefone) or buscar_conversa_por_telefone(telefone)
+    conversa_id = str((conversa or {}).get("id") or "")
+    chave = _debounce_key(telefone, conversa_id)
+    recebido_em = _agora_preciso()
     pendente_persistido = False
     if conversa is not None:
-        conversa_id = str(conversa.get("id") or "")
         pendente_persistido = registrar_mensagem(
             conversa,
             remetente="cliente",
@@ -635,60 +627,85 @@ def _enfileirar_mensagem_debounce(mensagem: MensagemRecebida) -> ResultadoWebhoo
             metadata={
                 "provider": "cloud",
                 "debounce_pending": True,
-                "debounce_key": _debounce_key(telefone, conversa_id),
+                "debounce_processing": False,
+                "debounce_processed": False,
+                "debounce_key": chave,
+                "debounce_received_at": recebido_em,
+                "debounce_ready_at": _iso_em_segundos(_timestamp_atual() + janela),
                 "telefone": telefone,
                 "provider_message_id_original": provider_message_id,
                 "timestamp_provider": mensagem.get("timestamp", ""),
                 "remetente_whatsapp": mensagem.get("remetente", ""),
             },
         ) is True
+        if pendente_persistido:
+            logger.info(
+                "debounce_mensagem_registrada conversa_id=%s provider_message_id=%s chave=%s.",
+                conversa_id,
+                provider_message_id,
+                chave,
+            )
 
     with _debounce_lock:
-        lote = _debounce_lotes.get(telefone)
+        lote = _debounce_lotes.get(chave)
         if lote is None:
-            lote = {"mensagens": [], "timer": None, "processando": False, "persistente": False}
-            _debounce_lotes[telefone] = lote
+            lote = {"mensagens": [], "timer": None, "processando": False, "persistente": False, "telefone": telefone}
+            _debounce_lotes[chave] = lote
         lote["persistente"] = bool(lote.get("persistente")) or pendente_persistido
+        lote["telefone"] = telefone
         timer_antigo = lote.get("timer")
         if isinstance(timer_antigo, threading.Timer):
             timer_antigo.cancel()
         lote["mensagens"].append(dict(mensagem))
         if provider_message_id:
             _provider_ids_pendentes.add(provider_message_id)
-        timer = threading.Timer(janela, _processar_lote_debounce, args=(telefone,))
+        timer = threading.Timer(janela, _processar_lote_debounce, args=(chave,))
         timer.daemon = True
         lote["timer"] = timer
         timer.start()
 
     logger.info(
-        "Mensagem enfileirada para debounce: telefone=%s provider_message_id=%s janela=%s.",
+        "debounce_janela_renovada conversa_id=%s telefone=%s provider_message_id=%s chave=%s janela=%s.",
+        conversa_id,
         telefone,
         provider_message_id,
+        chave,
         janela,
     )
     return {
         "ok": True,
         "telefone": telefone,
+        "conversa_id": conversa_id,
         "status": "debounce_pendente",
         "resposta_enviada": False,
     }
 
 
-def _processar_lote_debounce(telefone: str) -> None:
+def _processar_lote_debounce(chave: str) -> None:
     with _debounce_lock:
-        lote = _debounce_lotes.get(telefone)
+        chave_lote, lote = _obter_lote_debounce(chave)
         if not lote or lote.get("processando"):
             return
         lote["processando"] = True
+        telefone = str(lote.get("telefone") or chave).strip()
         mensagens = [dict(item) for item in lote.get("mensagens", []) if isinstance(item, Mapping)]
         usar_persistente = bool(lote.get("persistente"))
-        _debounce_lotes.pop(telefone, None)
+        _debounce_lotes.pop(chave_lote, None)
 
-    if not mensagens:
+    if not mensagens and not usar_persistente:
         return
 
-    mensagens_persistidas = _carregar_lote_debounce_persistente(telefone) if usar_persistente else []
-    mensagens_processamento = mensagens_persistidas or mensagens
+    status_persistente = "memoria"
+    mensagens_persistidas: list[MensagemRecebida] = []
+    if usar_persistente:
+        mensagens_persistidas, status_persistente, retry_em = _carregar_lote_debounce_persistente(chave_lote, telefone)
+        if status_persistente in {"aguardando", "erro", "lock_ignorado"}:
+            _agendar_processamento_debounce(chave_lote, telefone=telefone, atraso=max(retry_em, DEBOUNCE_RETRY_SECONDS), persistente=True)
+            return
+        if status_persistente != "ok":
+            return
+
+    mensagens_processamento = mensagens_persistidas if usar_persistente else mensagens
 
     for mensagem in mensagens_processamento:
         provider_message_id = str(mensagem.get("provider_message_id") or "").strip()
@@ -702,6 +719,21 @@ def _processar_lote_debounce(telefone: str) -> None:
         "debounce_processado": True,
         "debounce_persistente": bool(mensagens_persistidas),
     }
+    raw_final = mensagem_agrupada.get("raw") if isinstance(mensagem_agrupada.get("raw"), Mapping) else {}
+    mensagens_raw = raw_final.get("messages") if isinstance(raw_final.get("messages"), list) else [mensagem_agrupada]
+    provider_ids = [
+        str(item.get("provider_message_id") or "").strip()
+        for item in mensagens_raw
+        if isinstance(item, Mapping) and str(item.get("provider_message_id") or "").strip()
+    ]
+    conversa_id = _conversa_id_debounce(mensagens_processamento, chave_lote)
+    logger.info(
+        "debounce_grupo_formado conversa_id=%s quantidade=%s provider_message_ids=%s texto=%s.",
+        conversa_id,
+        len(mensagens_processamento),
+        provider_ids,
+        _texto_seguro_log(str(mensagem_agrupada.get("texto") or "")),
+    )
     logger.info(
         "Processando lote debounce: telefone=%s mensagens=%s fonte=%s.",
         telefone,
@@ -709,16 +741,31 @@ def _processar_lote_debounce(telefone: str) -> None:
         "supabase" if mensagens_persistidas else "memoria",
     )
     try:
-        processar_mensagem_webhook(mensagem_agrupada)
+        resultado = processar_mensagem_webhook(mensagem_agrupada)
+        logger.info(
+            "debounce_agente_executado conversa_id=%s provider_message_ids=%s status=%s resposta_enviada=%s.",
+            conversa_id,
+            provider_ids,
+            resultado.get("status", ""),
+            bool(resultado.get("resposta_enviada")),
+        )
+        logger.info(
+            "debounce_grupo_concluido conversa_id=%s quantidade=%s provider_message_ids=%s.",
+            conversa_id,
+            len(mensagens_processamento),
+            provider_ids,
+        )
     except Exception:
         logger.exception("Falha ao processar lote debounce telefone=%s.", telefone)
 
 
-def _carregar_lote_debounce_persistente(telefone: str) -> list[MensagemRecebida]:
-    conversa = buscar_conversa_ativa_por_telefone(telefone) or buscar_conversa_por_telefone(telefone)
-    conversa_id = str((conversa or {}).get("id") or "")
+def _carregar_lote_debounce_persistente(chave: str, telefone: str) -> tuple[list[MensagemRecebida], str, float]:
+    conversa_id = _conversa_id_debounce_chave(chave)
+    if not conversa_id:
+        conversa = buscar_conversa_ativa_por_telefone(telefone) or buscar_conversa_por_telefone(telefone)
+        conversa_id = str((conversa or {}).get("id") or "")
     if not conversa_id or conversa_id.startswith("local:"):
-        return []
+        return [], "vazio", 0.0
 
     resultado = supabase.selecionar(
         _tabela_mensagens(),
@@ -726,35 +773,63 @@ def _carregar_lote_debounce_persistente(telefone: str) -> list[MensagemRecebida]
             "conversa_id": f"eq.{conversa_id}",
             "remetente": "eq.cliente",
             "metadata->>debounce_pending": "eq.true",
+            "metadata->>debounce_key": f"eq.{chave}",
         },
         colunas="id,conversa_id,remetente,conteudo,timestamp,provider_message_id,metadata,created_at",
         limite=20,
         order="timestamp.asc,created_at.asc",
     )
     if not resultado.get("ok"):
-        logger.warning("Debounce persistente nao consultado para telefone=%s: %s", telefone, resultado.get("erro"))
-        return []
+        logger.warning("debounce_lock_ignorado conversa_id=%s chave=%s motivo=consulta_falhou erro=%s", conversa_id, chave, resultado.get("erro"))
+        return [], "erro", DEBOUNCE_RETRY_SECONDS
 
     dados = resultado.get("data")
     pendentes = [item for item in dados if isinstance(item, dict)] if isinstance(dados, list) else []
     if not pendentes:
-        return []
+        return [], "vazio", 0.0
+
+    janela = _janela_debounce_segundos()
+    ultimo_recebimento = max(_timestamp_debounce_mensagem(item) for item in pendentes)
+    restante = (ultimo_recebimento + janela) - _timestamp_atual()
+    if restante > 0.05:
+        logger.info(
+            "debounce_aguardando_nova_janela conversa_id=%s chave=%s mensagens=%s restante=%.3f.",
+            conversa_id,
+            chave,
+            len(pendentes),
+            restante,
+        )
+        return [], "aguardando", min(max(restante, 0.1), janela)
 
     lock_id = f"{_agora()}:{uuid4()}"
-    travadas = [_travar_mensagem_debounce_pendente(item, lock_id=lock_id) for item in pendentes]
+    travadas: list[dict[str, Any]] = []
+    for item in pendentes:
+        travada = _travar_mensagem_debounce_pendente(item, lock_id=lock_id, chave=chave)
+        if travada is None:
+            logger.info(
+                "debounce_lock_ignorado conversa_id=%s chave=%s lock_id=%s motivo=mensagem_ja_travada.",
+                conversa_id,
+                chave,
+                lock_id,
+            )
+            _liberar_mensagens_debounce_travadas(travadas)
+            return [], "lock_ignorado", DEBOUNCE_RETRY_SECONDS
+        travadas.append(travada)
     mensagens = [_mensagem_debounce_persistida_para_recebida(item) for item in travadas if item]
     if mensagens:
         logger.info(
-            "Debounce persistente travado: telefone=%s conversa_id=%s mensagens=%s lock_id=%s.",
+            "debounce_lock_adquirido telefone=%s conversa_id=%s chave=%s mensagens=%s lock_id=%s.",
             telefone,
             conversa_id,
+            chave,
             len(mensagens),
             lock_id,
         )
-    return mensagens
+        return mensagens, "ok", 0.0
+    return [], "vazio", 0.0
 
 
-def _travar_mensagem_debounce_pendente(mensagem: Mapping[str, Any], *, lock_id: str) -> dict[str, Any] | None:
+def _travar_mensagem_debounce_pendente(mensagem: Mapping[str, Any], *, lock_id: str, chave: str) -> dict[str, Any] | None:
     mensagem_id = str(mensagem.get("id") or "").strip()
     if not mensagem_id:
         return None
@@ -765,6 +840,7 @@ def _travar_mensagem_debounce_pendente(mensagem: Mapping[str, Any], *, lock_id: 
             "debounce_processing": True,
             "debounce_lock": lock_id,
             "debounce_processing_started_at": _agora(),
+            "debounce_lock_expires_at": _iso_em_segundos(_timestamp_atual() + DEBOUNCE_LEASE_SECONDS),
         }
     )
     resultado = supabase.atualizar(
@@ -773,13 +849,39 @@ def _travar_mensagem_debounce_pendente(mensagem: Mapping[str, Any], *, lock_id: 
         filtros={
             "id": f"eq.{mensagem_id}",
             "metadata->>debounce_pending": "eq.true",
+            "metadata->>debounce_key": f"eq.{chave}",
         },
     )
     if not resultado.get("ok"):
         logger.warning("Mensagem pendente de debounce nao travada id=%s: %s", mensagem_id, resultado.get("erro"))
         return None
     atualizada = _primeiro(resultado.get("data"))
-    return dict(atualizada or {**dict(mensagem), "metadata": metadata})
+    if not atualizada:
+        return None
+    return dict(atualizada)
+
+
+def _liberar_mensagens_debounce_travadas(mensagens: Sequence[Mapping[str, Any]]) -> None:
+    for mensagem in mensagens:
+        mensagem_id = str(mensagem.get("id") or "").strip()
+        if not mensagem_id:
+            continue
+        metadata = _metadata_mensagem(mensagem)
+        metadata.update(
+            {
+                "debounce_pending": True,
+                "debounce_processing": False,
+                "debounce_lock": "",
+                "debounce_processing_started_at": "",
+                "debounce_lock_expires_at": "",
+            }
+        )
+        supabase.atualizar(
+            _tabela_mensagens(),
+            {"metadata": metadata},
+            filtros={"id": f"eq.{mensagem_id}"},
+            retornar=False,
+        )
 
 
 def _mensagem_debounce_persistida_para_recebida(mensagem: Mapping[str, Any]) -> MensagemRecebida:
@@ -793,6 +895,7 @@ def _mensagem_debounce_persistida_para_recebida(mensagem: Mapping[str, Any]) -> 
         "raw": {
             "debounce_mensagem_id": str(mensagem.get("id") or ""),
             "debounce_metadata": metadata,
+            "debounce_conversa_id": str(mensagem.get("conversa_id") or ""),
         },
     }
 
@@ -808,10 +911,92 @@ def _debounce_key(telefone: str, conversa_id: str) -> str:
 
 def _janela_debounce_segundos() -> float:
     try:
-        valor = float(os.getenv(DEBOUNCE_SECONDS_ENV, "0"))
+        valor = float(os.getenv(DEBOUNCE_SECONDS_ENV, str(DEBOUNCE_SECONDS_DEFAULT)))
     except ValueError:
-        return 0.0
+        return DEBOUNCE_SECONDS_DEFAULT
     return max(0.0, min(valor, 15.0))
+
+
+def _obter_lote_debounce(chave: str) -> tuple[str, dict[str, Any] | None]:
+    lote = _debounce_lotes.get(chave)
+    if lote is not None:
+        return chave, lote
+    for chave_lote, lote_atual in _debounce_lotes.items():
+        if str(lote_atual.get("telefone") or "") == chave:
+            return chave_lote, lote_atual
+    return chave, None
+
+
+def _agendar_processamento_debounce(chave: str, *, telefone: str, atraso: float, persistente: bool) -> None:
+    atraso_final = max(0.1, min(float(atraso or DEBOUNCE_RETRY_SECONDS), 15.0))
+    with _debounce_lock:
+        lote = _debounce_lotes.get(chave)
+        if lote is None:
+            lote = {"mensagens": [], "timer": None, "processando": False, "persistente": persistente, "telefone": telefone}
+            _debounce_lotes[chave] = lote
+        lote["persistente"] = bool(lote.get("persistente")) or persistente
+        lote["telefone"] = telefone
+        lote["processando"] = False
+        timer_antigo = lote.get("timer")
+        if isinstance(timer_antigo, threading.Timer):
+            timer_antigo.cancel()
+        timer = threading.Timer(atraso_final, _processar_lote_debounce, args=(chave,))
+        timer.daemon = True
+        lote["timer"] = timer
+        timer.start()
+    logger.info("debounce_janela_renovada telefone=%s chave=%s janela=%.3f.", telefone, chave, atraso_final)
+
+
+def _timestamp_atual() -> float:
+    return datetime.now(timezone.utc).timestamp()
+
+
+def _agora_preciso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _iso_em_segundos(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _timestamp_debounce_mensagem(mensagem: Mapping[str, Any]) -> float:
+    metadata = _metadata_mensagem(mensagem)
+    for valor in (
+        metadata.get("debounce_received_at"),
+        metadata.get("timestamp_provider"),
+        mensagem.get("timestamp"),
+        mensagem.get("created_at"),
+    ):
+        timestamp = _timestamp_segundos(valor)
+        if timestamp is not None:
+            return timestamp
+    return _timestamp_atual()
+
+
+def _texto_seguro_log(texto: str, *, limite: int = 500) -> str:
+    normalizado = re.sub(r"\s+", " ", str(texto or "")).strip()
+    if len(normalizado) <= limite:
+        return normalizado
+    return normalizado[:limite] + "..."
+
+
+def _conversa_id_debounce(mensagens: Sequence[Mapping[str, Any]], chave: str) -> str:
+    for mensagem in mensagens:
+        raw = mensagem.get("raw") if isinstance(mensagem.get("raw"), Mapping) else {}
+        conversa_id = str(raw.get("debounce_conversa_id") or "").strip()
+        if conversa_id:
+            return conversa_id
+        metadata = raw.get("debounce_metadata") if isinstance(raw.get("debounce_metadata"), Mapping) else {}
+        chave_metadata = str(metadata.get("debounce_key") or "").strip()
+        if ":" in chave_metadata:
+            return chave_metadata.split(":", 1)[0]
+    return chave.split(":", 1)[0] if ":" in chave else chave
+
+
+def _conversa_id_debounce_chave(chave: str) -> str:
+    if ":" not in chave:
+        return ""
+    return chave.split(":", 1)[0].strip()
 
 
 def processar_mensagem_webhook(mensagem: MensagemRecebida) -> ResultadoWebhook:
@@ -826,10 +1011,30 @@ def processar_mensagem_webhook(mensagem: MensagemRecebida) -> ResultadoWebhook:
         }
 
     raw = mensagem.get("raw") if isinstance(mensagem.get("raw"), Mapping) else {}
+    provider_message_id = str(mensagem.get("provider_message_id") or "").strip()
+    if (
+        provider_message_id
+        and not raw.get("coalesced")
+        and not raw.get("debounce_processado")
+    ):
+        with _debounce_lock:
+            pendente_memoria = provider_message_id in _provider_ids_pendentes
+        if pendente_memoria or _provider_message_id_registrado(provider_message_id):
+            logger.info(
+                "debounce_lock_ignorado telefone=%s provider_message_id=%s motivo=provider_message_id_ja_registrado.",
+                telefone,
+                provider_message_id,
+            )
+            return {
+                "ok": True,
+                "telefone": telefone,
+                "status": "duplicada",
+                "resposta_enviada": False,
+            }
     if _deve_enfileirar_debounce(mensagem, raw):
         return _enfileirar_mensagem_debounce(mensagem)
 
-    conversa = buscar_conversa_ativa_por_telefone(telefone)
+    conversa = _buscar_conversa_debounce_raw(raw, telefone) or buscar_conversa_ativa_por_telefone(telefone)
     logger.info(
         "DIAG_RESERVA webhook_mensagem_vinculo telefone=%s provider_message_id=%s conversa_ativa_id=%s conversa_status=%s",
         telefone,
@@ -917,6 +1122,44 @@ def processar_status_whatsapp(status: Mapping[str, Any]) -> dict[str, Any]:
         "status_interno": status_interno,
         "atualizacoes": atualizacoes,
     }
+
+
+def _buscar_conversa_debounce_raw(raw: Mapping[str, Any], telefone: str) -> Conversa | None:
+    if not raw.get("debounce_processado"):
+        return None
+    conversa_id = str(raw.get("debounce_conversa_id") or "").strip()
+    mensagens = raw.get("messages")
+    if not conversa_id and isinstance(mensagens, list):
+        for item in mensagens:
+            if not isinstance(item, Mapping):
+                continue
+            item_raw = item.get("raw") if isinstance(item.get("raw"), Mapping) else {}
+            conversa_id = str(item_raw.get("debounce_conversa_id") or "").strip()
+            if conversa_id:
+                break
+    if not conversa_id:
+        return None
+    conversa = _buscar_conversa_por_id(conversa_id)
+    if conversa is not None:
+        return conversa
+    logger.warning("Conversa do debounce nao recuperada por id=%s; usando referencia minima.", conversa_id)
+    return {"id": conversa_id, "cliente_telefone": telefone, "status": "bot_ativo", "metadata": {}}
+
+
+def _buscar_conversa_por_id(conversa_id: str) -> Conversa | None:
+    conversa_id = str(conversa_id or "").strip()
+    if not conversa_id or conversa_id.startswith("local:"):
+        return None
+    resultado = supabase.selecionar(
+        _tabela_conversas(),
+        filtros={"id": f"eq.{conversa_id}"},
+        limite=1,
+    )
+    if not resultado.get("ok"):
+        logger.warning("Conversa nao recuperada por id=%s: %s", conversa_id, resultado.get("erro"))
+        return None
+    conversa = _primeiro(resultado.get("data"))
+    return dict(conversa) if conversa else None
 
 
 def registrar_reserva_confirmada(
@@ -1201,6 +1444,23 @@ def _mensagem_ja_processada(provider_message_id: str) -> bool:
     if not resultado.get("ok"):
         return False
 
+    dados = resultado.get("data")
+    return isinstance(dados, list) and bool(dados)
+
+
+def _provider_message_id_registrado(provider_message_id: str) -> bool:
+    message_id = str(provider_message_id or "").strip()
+    if not message_id:
+        return False
+    if _mensagem_ja_processada(message_id):
+        return True
+    resultado = supabase.selecionar(
+        _tabela_mensagens(),
+        filtros={"metadata->>provider_message_id_original": f"eq.{message_id}"},
+        limite=1,
+    )
+    if not resultado.get("ok"):
+        return False
     dados = resultado.get("data")
     return isinstance(dados, list) and bool(dados)
 

@@ -2420,6 +2420,12 @@ def _pode_aplicar_dado_confirmado(
     if tem_dado and campo == "horario" and campo_aguardado == "horario" and _mensagem_tem_sinal_horario(mensagem_cliente):
         return True
     if not contrato_novo:
+        if not _mensagem_suporta_campo_reserva(campo, mensagem_cliente, interpretacao):
+            logger.info(
+                "DIAG_RESERVA dado_confirmado_ignorado campo=%s motivo=contrato_antigo_sem_sinal_do_campo",
+                campo,
+            )
+            return False
         if _mensagem_indica_correcao(mensagem_cliente, interpretacao):
             return campo == campo_aguardado or (
                 campo == "horario" and _mensagem_tem_sinal_horario(mensagem_cliente)

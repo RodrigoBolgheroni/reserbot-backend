@@ -290,6 +290,7 @@ class AgenteGuardrailsReservaTest(unittest.TestCase):
         }
 
         with (
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 22)),
             patch.dict(
                 os.environ,
                 {
@@ -329,6 +330,7 @@ class AgenteGuardrailsReservaTest(unittest.TestCase):
         }
 
         with (
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 22)),
             patch.dict(
                 os.environ,
                 {
@@ -363,6 +365,7 @@ class AgenteGuardrailsReservaTest(unittest.TestCase):
         }
 
         with (
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 22)),
             patch.dict(
                 os.environ,
                 {
@@ -400,6 +403,7 @@ class AgenteGuardrailsReservaTest(unittest.TestCase):
         }
 
         with (
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 22)),
             patch.dict(
                 os.environ,
                 {
@@ -440,6 +444,7 @@ class AgenteGuardrailsReservaTest(unittest.TestCase):
         }
 
         with (
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 22)),
             patch.dict(
                 os.environ,
                 {
@@ -623,7 +628,11 @@ class AgenteGuardrailsReservaTest(unittest.TestCase):
             "confianca": 0.8,
         }
 
-        with patch.dict(os.environ, {"GROQ_API_KEY": "teste"}), patch.object(agente, "_chamar_groq", return_value=self._mock_groq(payload)):
+        with (
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 22)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste"}),
+            patch.object(agente, "_chamar_groq", return_value=self._mock_groq(payload)),
+        ):
             resposta = agente.processar_mensagem(telefone, "20 sem contar comigo", nome_cliente="Rodrigo Teste")
 
         self.assertEqual(resposta["status_reserva"], "aguardando_confirmacao")
@@ -683,10 +692,14 @@ class AgenteGuardrailsReservaTest(unittest.TestCase):
             "confianca": 0.9,
         }
 
-        with patch.dict(os.environ, {"GROQ_API_KEY": "teste", "RESERVA_HORARIO_INICIO": "10:00", "RESERVA_HORARIO_FIM": "23:00"}), patch.object(
-            agente,
-            "_chamar_groq",
-            return_value=self._mock_groq(payload),
+        with (
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 22)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste", "RESERVA_HORARIO_INICIO": "10:00", "RESERVA_HORARIO_FIM": "23:00"}),
+            patch.object(
+                agente,
+                "_chamar_groq",
+                return_value=self._mock_groq(payload),
+            ),
         ):
             resposta = agente.processar_mensagem(telefone, "4 da manhÃ£", nome_cliente="Rodrigo Teste")
 
@@ -710,7 +723,11 @@ class AgenteGuardrailsReservaTest(unittest.TestCase):
             "confianca": 0.5,
         }
 
-        with patch.dict(os.environ, {"GROQ_API_KEY": "teste"}), patch.object(agente, "_chamar_groq", return_value=self._mock_groq(payload)):
+        with (
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 22)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste"}),
+            patch.object(agente, "_chamar_groq", return_value=self._mock_groq(payload)),
+        ):
             primeira = agente.processar_mensagem(telefone, "qualquer coisa", nome_cliente="Rodrigo Teste")
             segunda = agente.processar_mensagem(telefone, "asdfgh", nome_cliente="Rodrigo Teste")
 
@@ -890,10 +907,14 @@ class AgenteGuardrailsReservaTest(unittest.TestCase):
             "confianca": 1,
         }
 
-        with patch.dict(os.environ, {"GROQ_API_KEY": "teste"}), patch.object(
-            agente,
-            "_chamar_groq",
-            side_effect=[self._mock_groq(coleta_payload), self._mock_groq(confirma_payload)],
+        with (
+            patch.object(agente, "_hoje", return_value=date(2026, 7, 22)),
+            patch.dict(os.environ, {"GROQ_API_KEY": "teste"}),
+            patch.object(
+                agente,
+                "_chamar_groq",
+                side_effect=[self._mock_groq(coleta_payload), self._mock_groq(confirma_payload)],
+            ),
         ):
             previa = agente.processar_mensagem(telefone, "Dia 28/07 as 20h para 10 pessoas", nome_cliente="Rodrigo Teste")
             final = agente.processar_mensagem(telefone, "Sim", nome_cliente="Rodrigo Teste")

@@ -33,6 +33,83 @@ class FluxoCoexistenciaTest(unittest.TestCase):
         fluxo_reservas._debounce_lotes.clear()
         fluxo_reservas._provider_ids_pendentes.clear()
 
+    def _pendente_debounce(
+        self,
+        *,
+        mensagem_id: str,
+        conversa_id: str,
+        telefone: str,
+        texto: str,
+        provider_message_id: str,
+        recebido_em: str,
+    ) -> dict:
+        chave = fluxo_reservas._debounce_key(telefone, conversa_id)
+        return {
+            "id": mensagem_id,
+            "conversa_id": conversa_id,
+            "remetente": "cliente",
+            "conteudo": texto,
+            "timestamp": recebido_em,
+            "created_at": recebido_em,
+            "metadata": {
+                "debounce_pending": True,
+                "debounce_processing": False,
+                "debounce_processed": False,
+                "debounce_key": chave,
+                "debounce_received_at": recebido_em,
+                "telefone": telefone,
+                "provider_message_id_original": provider_message_id,
+                "timestamp_provider": recebido_em,
+                "remetente_whatsapp": "Rodrigo",
+            },
+        }
+
+    def _fake_selecionar_pendentes(self, pendentes: list[dict], *, falhar: bool = False):
+        def selecionar(tabela, **kwargs):
+            if falhar:
+                return {"ok": False, "erro": "timeout temporario"}
+            filtros = kwargs.get("filtros") or {}
+            if filtros.get("metadata->>debounce_pending") != "eq.true":
+                return {"ok": True, "data": []}
+            conversa_id = str(filtros.get("conversa_id") or "").replace("eq.", "")
+            chave = str(filtros.get("metadata->>debounce_key") or "").replace("eq.", "")
+            return {
+                "ok": True,
+                "data": [
+                    {**dict(item), "metadata": dict(item.get("metadata") or {})}
+                    for item in pendentes
+                    if item.get("conversa_id") == conversa_id
+                    and (item.get("metadata") or {}).get("debounce_key") == chave
+                    and (item.get("metadata") or {}).get("debounce_pending") is True
+                ],
+            }
+
+        return selecionar
+
+    def _fake_atualizar_pendentes(self, pendentes: list[dict], *, ids_bloqueados: set[str] | None = None):
+        bloqueados = ids_bloqueados or set()
+
+        def atualizar(tabela, payload, **kwargs):
+            filtros = kwargs.get("filtros") or {}
+            mensagem_id = str(filtros.get("id") or "").replace("eq.", "")
+            if not mensagem_id:
+                return {"ok": True, "data": []}
+            for item in pendentes:
+                if item.get("id") != mensagem_id:
+                    continue
+                if mensagem_id in bloqueados:
+                    return {"ok": True, "data": []}
+                exige_pendente = filtros.get("metadata->>debounce_pending") == "eq.true"
+                if exige_pendente and (item.get("metadata") or {}).get("debounce_pending") is not True:
+                    return {"ok": True, "data": []}
+                item["metadata"] = dict(payload.get("metadata") or {})
+                if payload.get("provider_message_id"):
+                    item["provider_message_id"] = payload.get("provider_message_id")
+                return {"ok": True, "data": [{**dict(item), "metadata": dict(item.get("metadata") or {})}]}
+            return {"ok": True, "data": []}
+
+        return atualizar
+
     @patch.object(fluxo_reservas, "_mensagem_ja_processada", return_value=False)
     @patch.object(fluxo_reservas, "registrar_mensagem")
     @patch.object(fluxo_reservas, "iniciar_conversa")
@@ -621,25 +698,28 @@ class FluxoCoexistenciaTest(unittest.TestCase):
             segunda = fluxo_reservas.processar_mensagem_webhook(mensagem)
 
         self.assertEqual(primeira["status"], "debounce_pendente")
-        self.assertEqual(segunda["status"], "duplicada_pendente")
+        self.assertEqual(segunda["status"], "duplicada")
         self.assertEqual(registrar.call_count, 1)
         processar.assert_not_called()
 
     def test_debounce_persistente_processa_duas_mensagens_com_uma_resposta(self) -> None:
         telefone = "5511999999999"
         conversa = {"id": "conv-1", "status": "bot_ativo", "cliente_telefone": telefone, "metadata": {}}
+        chave = fluxo_reservas._debounce_key(telefone, "conv-1")
         pendentes = [
             {
                 "id": "msg-1",
                 "conversa_id": "conv-1",
                 "remetente": "cliente",
-                "conteudo": "Entao da pra ver se tem como ir pro salao?",
-                "timestamp": "2026-07-22T20:00:00+00:00",
+                "conteudo": "Tenho uma duvida sobre o pagamento",
+                "timestamp": "2026-07-22T20:00:00.000+00:00",
                 "metadata": {
                     "debounce_pending": True,
+                    "debounce_key": chave,
                     "telefone": telefone,
                     "provider_message_id_original": "wamid.1",
-                    "timestamp_provider": "2026-07-22T20:00:00+00:00",
+                    "timestamp_provider": "2026-07-22T20:00:00.000+00:00",
+                    "debounce_received_at": "2026-07-22T20:00:00.000+00:00",
                     "remetente_whatsapp": "Rodrigo",
                 },
             },
@@ -647,31 +727,44 @@ class FluxoCoexistenciaTest(unittest.TestCase):
                 "id": "msg-2",
                 "conversa_id": "conv-1",
                 "remetente": "cliente",
-                "conteudo": "por favor",
-                "timestamp": "2026-07-22T20:00:01+00:00",
+                "conteudo": "Posso mandar o comprovante em PDF?",
+                "timestamp": "2026-07-22T20:00:00.100+00:00",
                 "metadata": {
                     "debounce_pending": True,
+                    "debounce_key": chave,
                     "telefone": telefone,
                     "provider_message_id_original": "wamid.2",
-                    "timestamp_provider": "2026-07-22T20:00:01+00:00",
+                    "timestamp_provider": "2026-07-22T20:00:00.100+00:00",
+                    "debounce_received_at": "2026-07-22T20:00:00.100+00:00",
                     "remetente_whatsapp": "Rodrigo",
                 },
             },
         ]
-        fluxo_reservas._debounce_lotes[telefone] = {
+        fluxo_reservas._debounce_lotes[chave] = {
             "mensagens": [
-                {"telefone": telefone, "texto": "Entao da pra ver se tem como ir pro salao?", "provider_message_id": "wamid.1"},
-                {"telefone": telefone, "texto": "por favor", "provider_message_id": "wamid.2"},
+                {"telefone": telefone, "texto": "Tenho uma duvida sobre o pagamento", "provider_message_id": "wamid.1"},
+                {"telefone": telefone, "texto": "Posso mandar o comprovante em PDF?", "provider_message_id": "wamid.2"},
             ],
             "timer": None,
             "processando": False,
             "persistente": True,
+            "telefone": telefone,
         }
 
         def selecionar(tabela, **kwargs):
             filtros = kwargs.get("filtros") or {}
             if filtros.get("metadata->>debounce_pending") == "eq.true":
                 return {"ok": True, "data": [dict(item) for item in pendentes]}
+            return {"ok": True, "data": []}
+
+        def atualizar(tabela, payload, **kwargs):
+            filtros = kwargs.get("filtros") or {}
+            mensagem_id = str(filtros.get("id") or "").replace("eq.", "")
+            for item in pendentes:
+                if item["id"] == mensagem_id and item["metadata"].get("debounce_pending"):
+                    atualizado = {**dict(item), "metadata": dict(payload.get("metadata") or {})}
+                    item["metadata"] = dict(atualizado["metadata"])
+                    return {"ok": True, "data": [atualizado]}
             return {"ok": True, "data": []}
 
         with (
@@ -682,19 +775,279 @@ class FluxoCoexistenciaTest(unittest.TestCase):
             patch.object(fluxo_reservas.agente, "processar_mensagem", return_value=self.resposta_agente) as processar_ia,
             patch.object(fluxo_reservas.whatsapp, "enviar_com_resultado", return_value={"ok": True, "provider_message_id": "wamid.bot"}) as enviar,
             patch.object(fluxo_reservas.supabase, "selecionar", side_effect=selecionar),
-            patch.object(fluxo_reservas.supabase, "atualizar", return_value={"ok": True, "data": []}) as atualizar,
+            patch.object(fluxo_reservas.supabase, "atualizar", side_effect=atualizar) as atualizar_mock,
             patch.object(fluxo_reservas.supabase, "inserir", return_value={"ok": True, "data": []}),
         ):
-            fluxo_reservas._processar_lote_debounce(telefone)
+            fluxo_reservas._processar_lote_debounce(chave)
 
         processar_ia.assert_called_once()
         enviar.assert_called_once()
         chamada = processar_ia.call_args.kwargs
         self.assertEqual(
             chamada["mensagem_cliente"],
-            "Entao da pra ver se tem como ir pro salao?\npor favor",
+            "Tenho uma duvida sobre o pagamento\nPosso mandar o comprovante em PDF?",
         )
-        self.assertGreaterEqual(atualizar.call_count, 4)
+        self.assertGreaterEqual(atualizar_mock.call_count, 4)
+
+    def test_debounce_tres_mensagens_renovam_janela_e_formam_um_grupo(self) -> None:
+        telefone = "5511999999999"
+        conversa = {"id": "conv-1", "status": "bot_ativo", "cliente_telefone": telefone, "metadata": {}}
+        chave = fluxo_reservas._debounce_key(telefone, "conv-1")
+        pendentes = [
+            self._pendente_debounce(
+                mensagem_id="msg-1",
+                conversa_id="conv-1",
+                telefone=telefone,
+                texto="Tenho uma duvida",
+                provider_message_id="wamid.1",
+                recebido_em="2026-07-22T20:00:00.000+00:00",
+            ),
+            self._pendente_debounce(
+                mensagem_id="msg-2",
+                conversa_id="conv-1",
+                telefone=telefone,
+                texto="sobre o pagamento",
+                provider_message_id="wamid.2",
+                recebido_em="2026-07-22T20:00:00.100+00:00",
+            ),
+            self._pendente_debounce(
+                mensagem_id="msg-3",
+                conversa_id="conv-1",
+                telefone=telefone,
+                texto="pode ser PDF?",
+                provider_message_id="wamid.3",
+                recebido_em="2026-07-22T20:00:00.200+00:00",
+            ),
+        ]
+        fluxo_reservas._debounce_lotes[chave] = {"mensagens": [], "timer": None, "processando": False, "persistente": True, "telefone": telefone}
+
+        class TimerFake:
+            def __init__(self, intervalo, funcao, args=()):
+                self.intervalo = intervalo
+                self.funcao = funcao
+                self.args = args
+
+            def start(self):
+                return None
+
+            def cancel(self):
+                return None
+
+        ultimo = fluxo_reservas._timestamp_segundos("2026-07-22T20:00:00.200+00:00") or 0
+        with (
+            patch.object(fluxo_reservas, "buscar_conversa_ativa_por_telefone", return_value=conversa),
+            patch.object(fluxo_reservas, "buscar_conversa_por_telefone", return_value=conversa),
+            patch.object(fluxo_reservas.supabase, "selecionar", side_effect=self._fake_selecionar_pendentes(pendentes)),
+            patch.object(fluxo_reservas.supabase, "atualizar", side_effect=self._fake_atualizar_pendentes(pendentes)),
+            patch.object(fluxo_reservas.threading, "Timer", TimerFake),
+            patch.object(fluxo_reservas.agente, "processar_mensagem", return_value=self.resposta_agente) as processar_ia,
+            patch.object(fluxo_reservas.whatsapp, "enviar_com_resultado", return_value={"ok": True, "provider_message_id": "wamid.bot"}),
+            patch.object(fluxo_reservas.clientes_supabase, "buscar_cliente_por_telefone", return_value={"id": "cliente-1", "telefone": telefone, "nome": "Rodrigo"}),
+            patch.object(fluxo_reservas.supabase, "inserir", return_value={"ok": True, "data": []}),
+            patch.object(fluxo_reservas, "_timestamp_atual", return_value=ultimo + 1.0),
+        ):
+            fluxo_reservas._processar_lote_debounce(chave)
+            processar_ia.assert_not_called()
+
+        with (
+            patch.object(fluxo_reservas, "buscar_conversa_ativa_por_telefone", return_value=conversa),
+            patch.object(fluxo_reservas, "buscar_conversa_por_telefone", return_value=conversa),
+            patch.object(fluxo_reservas.supabase, "selecionar", side_effect=self._fake_selecionar_pendentes(pendentes)),
+            patch.object(fluxo_reservas.supabase, "atualizar", side_effect=self._fake_atualizar_pendentes(pendentes)),
+            patch.object(fluxo_reservas.agente, "processar_mensagem", return_value=self.resposta_agente) as processar_ia,
+            patch.object(fluxo_reservas.whatsapp, "enviar_com_resultado", return_value={"ok": True, "provider_message_id": "wamid.bot"}),
+            patch.object(fluxo_reservas.clientes_supabase, "buscar_cliente_por_telefone", return_value={"id": "cliente-1", "telefone": telefone, "nome": "Rodrigo"}),
+            patch.object(fluxo_reservas.supabase, "inserir", return_value={"ok": True, "data": []}),
+            patch.object(fluxo_reservas, "_timestamp_atual", return_value=ultimo + 3.0),
+        ):
+            fluxo_reservas._processar_lote_debounce(chave)
+
+        processar_ia.assert_called_once()
+        self.assertEqual(processar_ia.call_args.kwargs["mensagem_cliente"], "Tenho uma duvida\nsobre o pagamento\npode ser PDF?")
+
+    def test_debounce_duas_tentativas_do_mesmo_grupo_nao_duplicam_resposta(self) -> None:
+        telefone = "5511999999999"
+        conversa = {"id": "conv-1", "status": "bot_ativo", "cliente_telefone": telefone, "metadata": {}}
+        chave = fluxo_reservas._debounce_key(telefone, "conv-1")
+        pendentes = [
+            self._pendente_debounce(
+                mensagem_id="msg-1",
+                conversa_id="conv-1",
+                telefone=telefone,
+                texto="tem como ir pro salao?",
+                provider_message_id="wamid.1",
+                recebido_em="2026-07-22T20:00:00.000+00:00",
+            ),
+            self._pendente_debounce(
+                mensagem_id="msg-2",
+                conversa_id="conv-1",
+                telefone=telefone,
+                texto="por favor",
+                provider_message_id="wamid.2",
+                recebido_em="2026-07-22T20:00:00.100+00:00",
+            ),
+        ]
+
+        with (
+            patch.object(fluxo_reservas, "buscar_conversa_ativa_por_telefone", return_value=conversa),
+            patch.object(fluxo_reservas, "buscar_conversa_por_telefone", return_value=conversa),
+            patch.object(fluxo_reservas.supabase, "selecionar", side_effect=self._fake_selecionar_pendentes(pendentes)),
+            patch.object(fluxo_reservas.supabase, "atualizar", side_effect=self._fake_atualizar_pendentes(pendentes)),
+            patch.object(fluxo_reservas.agente, "processar_mensagem", return_value=self.resposta_agente) as processar_ia,
+            patch.object(fluxo_reservas.whatsapp, "enviar_com_resultado", return_value={"ok": True, "provider_message_id": "wamid.bot"}) as enviar,
+            patch.object(fluxo_reservas.clientes_supabase, "buscar_cliente_por_telefone", return_value={"id": "cliente-1", "telefone": telefone, "nome": "Rodrigo"}),
+            patch.object(fluxo_reservas.supabase, "inserir", return_value={"ok": True, "data": []}),
+        ):
+            fluxo_reservas._debounce_lotes[chave] = {"mensagens": [], "timer": None, "processando": False, "persistente": True, "telefone": telefone}
+            fluxo_reservas._processar_lote_debounce(chave)
+            fluxo_reservas._debounce_lotes[chave] = {"mensagens": [], "timer": None, "processando": False, "persistente": True, "telefone": telefone}
+            fluxo_reservas._processar_lote_debounce(chave)
+
+        processar_ia.assert_called_once()
+        enviar.assert_called_once()
+
+    def test_debounce_nao_agrupa_conversas_diferentes(self) -> None:
+        telefone = "5511999999999"
+        conversa_1 = {"id": "conv-1", "status": "bot_ativo", "cliente_telefone": telefone, "metadata": {}}
+        conversa_2 = {"id": "conv-2", "status": "bot_ativo", "cliente_telefone": telefone, "metadata": {}}
+        chave_1 = fluxo_reservas._debounce_key(telefone, "conv-1")
+        chave_2 = fluxo_reservas._debounce_key(telefone, "conv-2")
+        pendentes = [
+            self._pendente_debounce(
+                mensagem_id="msg-1",
+                conversa_id="conv-1",
+                telefone=telefone,
+                texto="Mensagem da primeira conversa",
+                provider_message_id="wamid.1",
+                recebido_em="2026-07-22T20:00:00.000+00:00",
+            ),
+            self._pendente_debounce(
+                mensagem_id="msg-2",
+                conversa_id="conv-2",
+                telefone=telefone,
+                texto="Mensagem da segunda conversa",
+                provider_message_id="wamid.2",
+                recebido_em="2026-07-22T20:00:00.100+00:00",
+            ),
+        ]
+
+        def buscar_ativa(_telefone):
+            return conversa_1 if fluxo_reservas._debounce_lotes.get(chave_1) else conversa_2
+
+        with (
+            patch.object(fluxo_reservas, "buscar_conversa_ativa_por_telefone", side_effect=buscar_ativa),
+            patch.object(fluxo_reservas, "buscar_conversa_por_telefone", return_value=conversa_1),
+            patch.object(fluxo_reservas.supabase, "selecionar", side_effect=self._fake_selecionar_pendentes(pendentes)),
+            patch.object(fluxo_reservas.supabase, "atualizar", side_effect=self._fake_atualizar_pendentes(pendentes)),
+            patch.object(fluxo_reservas.agente, "processar_mensagem", return_value=self.resposta_agente) as processar_ia,
+            patch.object(fluxo_reservas.whatsapp, "enviar_com_resultado", return_value={"ok": True, "provider_message_id": "wamid.bot"}),
+            patch.object(fluxo_reservas.clientes_supabase, "buscar_cliente_por_telefone", return_value={"id": "cliente-1", "telefone": telefone, "nome": "Rodrigo"}),
+            patch.object(fluxo_reservas.supabase, "inserir", return_value={"ok": True, "data": []}),
+        ):
+            fluxo_reservas._debounce_lotes[chave_1] = {"mensagens": [], "timer": None, "processando": False, "persistente": True, "telefone": telefone}
+            fluxo_reservas._processar_lote_debounce(chave_1)
+            fluxo_reservas._debounce_lotes[chave_2] = {"mensagens": [], "timer": None, "processando": False, "persistente": True, "telefone": telefone}
+            fluxo_reservas._processar_lote_debounce(chave_2)
+
+        textos = [call.kwargs["mensagem_cliente"] for call in processar_ia.call_args_list]
+        self.assertEqual(textos, ["Mensagem da primeira conversa", "Mensagem da segunda conversa"])
+
+    def test_provider_message_id_repetido_persistente_nao_processa(self) -> None:
+        with (
+            patch.object(fluxo_reservas, "_provider_message_id_registrado", return_value=True),
+            patch.object(fluxo_reservas, "processar_resposta_cliente") as processar,
+        ):
+            resultado = fluxo_reservas.processar_mensagem_webhook(
+                {
+                    "telefone": "5511999999999",
+                    "texto": "Oi",
+                    "remetente": "Rodrigo",
+                    "timestamp": "2026-07-22T20:00:00+00:00",
+                    "provider_message_id": "wamid.repetido",
+                }
+            )
+
+        self.assertEqual(resultado["status"], "duplicada")
+        processar.assert_not_called()
+
+    def test_mensagem_depois_da_janela_inicia_novo_grupo(self) -> None:
+        telefone = "5511999999999"
+        conversa = {"id": "conv-1", "status": "bot_ativo", "cliente_telefone": telefone, "metadata": {}}
+        chave = fluxo_reservas._debounce_key(telefone, "conv-1")
+        primeiro = [
+            self._pendente_debounce(
+                mensagem_id="msg-1",
+                conversa_id="conv-1",
+                telefone=telefone,
+                texto="Primeira duvida",
+                provider_message_id="wamid.1",
+                recebido_em="2026-07-22T20:00:00.000+00:00",
+            )
+        ]
+        segundo = [
+            self._pendente_debounce(
+                mensagem_id="msg-2",
+                conversa_id="conv-1",
+                telefone=telefone,
+                texto="Outra duvida depois",
+                provider_message_id="wamid.2",
+                recebido_em="2026-07-22T20:00:05.000+00:00",
+            )
+        ]
+        pendentes = primeiro
+
+        def selecionar(tabela, **kwargs):
+            return self._fake_selecionar_pendentes(pendentes)(tabela, **kwargs)
+
+        with (
+            patch.object(fluxo_reservas, "buscar_conversa_ativa_por_telefone", return_value=conversa),
+            patch.object(fluxo_reservas, "buscar_conversa_por_telefone", return_value=conversa),
+            patch.object(fluxo_reservas.supabase, "selecionar", side_effect=selecionar),
+            patch.object(fluxo_reservas.supabase, "atualizar", side_effect=lambda tabela, payload, **kwargs: self._fake_atualizar_pendentes(pendentes)(tabela, payload, **kwargs)),
+            patch.object(fluxo_reservas.agente, "processar_mensagem", return_value=self.resposta_agente) as processar_ia,
+            patch.object(fluxo_reservas.whatsapp, "enviar_com_resultado", return_value={"ok": True, "provider_message_id": "wamid.bot"}),
+            patch.object(fluxo_reservas.clientes_supabase, "buscar_cliente_por_telefone", return_value={"id": "cliente-1", "telefone": telefone, "nome": "Rodrigo"}),
+            patch.object(fluxo_reservas.supabase, "inserir", return_value={"ok": True, "data": []}),
+        ):
+            fluxo_reservas._debounce_lotes[chave] = {"mensagens": [], "timer": None, "processando": False, "persistente": True, "telefone": telefone}
+            fluxo_reservas._processar_lote_debounce(chave)
+            pendentes = segundo
+            fluxo_reservas._debounce_lotes[chave] = {"mensagens": [], "timer": None, "processando": False, "persistente": True, "telefone": telefone}
+            fluxo_reservas._processar_lote_debounce(chave)
+
+        textos = [call.kwargs["mensagem_cliente"] for call in processar_ia.call_args_list]
+        self.assertEqual(textos, ["Primeira duvida", "Outra duvida depois"])
+
+    def test_falha_temporaria_supabase_nao_envia_resposta_duplicada(self) -> None:
+        telefone = "5511999999999"
+        conversa = {"id": "conv-1", "status": "bot_ativo", "cliente_telefone": telefone, "metadata": {}}
+        chave = fluxo_reservas._debounce_key(telefone, "conv-1")
+        fluxo_reservas._debounce_lotes[chave] = {"mensagens": [], "timer": None, "processando": False, "persistente": True, "telefone": telefone}
+
+        class TimerFake:
+            def __init__(self, intervalo, funcao, args=()):
+                self.intervalo = intervalo
+                self.funcao = funcao
+                self.args = args
+
+            def start(self):
+                return None
+
+            def cancel(self):
+                return None
+
+        with (
+            patch.object(fluxo_reservas, "buscar_conversa_ativa_por_telefone", return_value=conversa),
+            patch.object(fluxo_reservas, "buscar_conversa_por_telefone", return_value=conversa),
+            patch.object(fluxo_reservas.supabase, "selecionar", side_effect=self._fake_selecionar_pendentes([], falhar=True)),
+            patch.object(fluxo_reservas.threading, "Timer", TimerFake),
+            patch.object(fluxo_reservas.agente, "processar_mensagem") as processar_ia,
+            patch.object(fluxo_reservas.whatsapp, "enviar_com_resultado") as enviar,
+        ):
+            fluxo_reservas._processar_lote_debounce(chave)
+
+        processar_ia.assert_not_called()
+        enviar.assert_not_called()
 
     def test_mensagens_fora_da_janela_nao_sao_agrupadas(self) -> None:
         with patch.dict(os.environ, {"RESERVABOT_COALESCENCIA_SEGUNDOS": "2"}):
