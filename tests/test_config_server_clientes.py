@@ -141,6 +141,7 @@ class ConfigServerClientesTest(unittest.TestCase):
                 "listar_conversas",
                 return_value={"items": [{"id": "conv-1"}], "page": 2, "page_size": 30, "total": 40, "has_next": True, "has_prev": True},
             ) as listar,
+            patch.object(config_server.ConfigHandler, "_exigir_config_admin", return_value=True),
             patch.object(config_server.ConfigHandler, "_responder_json", lambda _self, payload, status=None: respostas.append(payload)),
         ):
             config_server.ConfigHandler._listar_conversas(handler)
@@ -155,11 +156,22 @@ class ConfigServerClientesTest(unittest.TestCase):
 
         with (
             patch.object(config_server.conversas_supabase, "listar_mensagens_conversa", return_value=None),
+            patch.object(config_server.ConfigHandler, "_exigir_config_admin", return_value=True),
             patch.object(config_server.ConfigHandler, "_responder_erro", lambda _self, status, mensagem: respostas.append((status, mensagem))),
         ):
             config_server.ConfigHandler._obter_conversa_ou_mensagens(handler, "/api/conversas/conv-1/mensagens")
 
         self.assertEqual(respostas[0][0], config_server.HTTPStatus.NOT_FOUND)
+
+    def test_conversas_nao_sao_listadas_sem_sessao_admin(self) -> None:
+        handler = object.__new__(config_server.ConfigHandler)
+        handler.path = "/api/conversas"
+        with (
+            patch.object(config_server.ConfigHandler, "_exigir_config_admin", return_value=False),
+            patch.object(config_server.conversas_supabase, "listar_conversas") as listar,
+        ):
+            config_server.ConfigHandler._listar_conversas(handler)
+        listar.assert_not_called()
 
 
 if __name__ == "__main__":

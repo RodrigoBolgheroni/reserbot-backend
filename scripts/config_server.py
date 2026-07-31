@@ -138,6 +138,14 @@ class ConfigHandler(BaseHTTPRequestHandler):
         if rota == "/api/conversas/status":
             self._atualizar_status_conversa()
             return
+        comprovante_aprovar_id = _id_rota_comprovante_acao(rota, "aprovar")
+        if comprovante_aprovar_id:
+            self._decidir_comprovante_humano(comprovante_aprovar_id, acao="aprovar")
+            return
+        comprovante_rejeitar_id = _id_rota_comprovante_acao(rota, "rejeitar")
+        if comprovante_rejeitar_id:
+            self._decidir_comprovante_humano(comprovante_rejeitar_id, acao="rejeitar")
+            return
         reserva_confirmar_id = _id_rota_reserva_recurso(rota, "confirmar")
         if reserva_confirmar_id:
             self._confirmar_reserva_humana(reserva_confirmar_id)
@@ -260,6 +268,7 @@ class ConfigHandler(BaseHTTPRequestHandler):
     def _exigir_config_admin(self) -> bool:
         autorizacao = _autorizar_config_admin(self.headers)
         if autorizacao["ok"]:
+            self._config_admin_autorizacao = autorizacao
             return True
         self._responder_json(
             {
@@ -409,6 +418,8 @@ class ConfigHandler(BaseHTTPRequestHandler):
         )
 
     def _listar_conversas(self) -> None:
+        if not self._exigir_config_admin():
+            return
         page, page_size = _paginacao_conversas(self.path)
         query = parse_qs(urlparse(self.path).query)
         resultado = conversas_supabase.listar_conversas(
@@ -420,6 +431,8 @@ class ConfigHandler(BaseHTTPRequestHandler):
         self._responder_json({"ok": True, **resultado})
 
     def _obter_conversa_ou_mensagens(self, rota: str) -> None:
+        if not self._exigir_config_admin():
+            return
         partes = [parte for parte in rota.split("/") if parte]
         if len(partes) not in {3, 4} or partes[:2] != ["api", "conversas"]:
             self._responder_erro(HTTPStatus.NOT_FOUND, "conversa nao encontrada")
@@ -445,6 +458,8 @@ class ConfigHandler(BaseHTTPRequestHandler):
         self._responder_erro(HTTPStatus.NOT_FOUND, "conversa nao encontrada")
 
     def _listar_reservas(self) -> None:
+        if not self._exigir_config_admin():
+            return
         limite = _query_int(self.path, "limit", 500)
         reservas = fluxo_reservas.listar_reservas(limite=limite)
         self._responder_json({"ok": True, "reservas": reservas, "total": len(reservas)})
@@ -504,9 +519,45 @@ class ConfigHandler(BaseHTTPRequestHandler):
     def _confirmar_reserva_humana(self, reserva_id: str) -> None:
         if not self._exigir_config_admin():
             return
-        resultado = fluxo_reservas.confirmar_reserva_por_humano(reserva_id, analisado_por="painel_autenticado")
+        resultado = fluxo_reservas.confirmar_reserva_por_humano(
+            reserva_id,
+            analisado_por=self._identidade_config_admin(),
+        )
         status = HTTPStatus(int(resultado.pop("status", HTTPStatus.OK if resultado.get("ok") else HTTPStatus.BAD_REQUEST)))
         self._responder_json(resultado, status=status)
+
+    def _decidir_comprovante_humano(self, comprovante_id: str, *, acao: str) -> None:
+        if not self._exigir_config_admin():
+            return
+        operador = self._identidade_config_admin()
+        if acao == "aprovar":
+            resultado = fluxo_reservas.aprovar_comprovante_por_humano(
+                comprovante_id,
+                analisado_por=operador,
+            )
+        else:
+            try:
+                payload = self._ler_json_body()
+            except ValueError as erro:
+                self._responder_erro(HTTPStatus.BAD_REQUEST, str(erro))
+                return
+            motivo = str(payload.get("motivo") or "") if isinstance(payload, dict) else ""
+            resultado = fluxo_reservas.rejeitar_comprovante_por_humano(
+                comprovante_id,
+                motivo=motivo,
+                analisado_por=operador,
+            )
+        status = HTTPStatus(int(resultado.pop("status", HTTPStatus.OK if resultado.get("ok") else HTTPStatus.BAD_REQUEST)))
+        self._responder_json(resultado, status=status)
+
+    def _identidade_config_admin(self) -> dict[str, str]:
+        autorizacao = getattr(self, "_config_admin_autorizacao", {})
+        usuario = autorizacao.get("usuario") if isinstance(autorizacao.get("usuario"), dict) else {}
+        return {
+            "id": str(usuario.get("id") or "painel_autenticado"),
+            "email": str(usuario.get("email") or ""),
+            "modo": str(autorizacao.get("modo") or ""),
+        }
 
     def _salvar_perfil(self) -> None:
         try:
@@ -889,8 +940,14 @@ def _autorizar_config_admin(headers: Any) -> dict[str, Any]:
                 "mensagem": "Sessao do painel ausente.",
                 "status": HTTPStatus.UNAUTHORIZED,
             }
-        if _validar_token_supabase(token_recebido):
-            return {"ok": True, "modo": "supabase_auth"}
+        usuario_validado = _validar_token_supabase(token_recebido)
+        if usuario_validado:
+            usuario = (
+                dict(usuario_validado)
+                if isinstance(usuario_validado, dict)
+                else {"id": "supabase_auth", "email": ""}
+            )
+            return {"ok": True, "modo": "supabase_auth", "usuario": usuario}
         return {
             "ok": False,
             "erro": "acesso_negado",
@@ -911,10 +968,14 @@ def _autorizar_config_admin(headers: Any) -> dict[str, Any]:
             "mensagem": "Token administrativo invalido.",
             "status": HTTPStatus.FORBIDDEN,
         }
-    return {"ok": True, "modo": "token"}
+    return {
+        "ok": True,
+        "modo": "token",
+        "usuario": {"id": "config_admin", "email": ""},
+    }
 
 
-def _validar_token_supabase(token: str) -> bool:
+def _validar_token_supabase(token: str) -> dict[str, str] | bool:
     token = str(token or "").strip()
     if not token:
         return False
@@ -939,7 +1000,18 @@ def _validar_token_supabase(token: str) -> bool:
     )
     try:
         with urlopen(request, timeout=SUPABASE_AUTH_TIMEOUT_SEGUNDOS) as response:
-            return 200 <= int(getattr(response, "status", 200)) < 300
+            if not 200 <= int(getattr(response, "status", 200)) < 300:
+                return False
+            try:
+                usuario = json.loads(response.read().decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                usuario = {}
+            if not isinstance(usuario, dict):
+                usuario = {}
+            return {
+                "id": str(usuario.get("id") or "supabase_auth"),
+                "email": str(usuario.get("email") or ""),
+            }
     except HTTPError as erro:
         logger.warning("Supabase Auth recusou sessao do painel: HTTP %s", erro.code)
         return False
@@ -1006,6 +1078,13 @@ def _id_rota_reserva_recurso(rota: str, recurso: str) -> str:
 def _id_rota_comprovante_arquivo(rota: str) -> str:
     partes = [parte for parte in rota.split("/") if parte]
     if len(partes) == 4 and partes[:2] == ["api", "comprovantes"] and partes[3] == "arquivo":
+        return partes[2]
+    return ""
+
+
+def _id_rota_comprovante_acao(rota: str, acao: str) -> str:
+    partes = [parte for parte in rota.split("/") if parte]
+    if len(partes) == 4 and partes[:2] == ["api", "comprovantes"] and partes[3] == acao:
         return partes[2]
     return ""
 

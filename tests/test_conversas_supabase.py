@@ -178,11 +178,29 @@ class ConversasSupabaseTest(unittest.TestCase):
                         },
                     ],
                 }
+            if tabela == "reservas":
+                return {
+                    "ok": True,
+                    "data": [
+                        {
+                            "id": "res-1",
+                            "conversa_id": "conv-1",
+                            "data_reserva": "2030-08-03",
+                            "horario": "13:00:00",
+                            "pessoas": 14,
+                            "status": "aguardando_analise",
+                            "status_pagamento": "aguardando_analise",
+                            "espaco_id": "esp-1",
+                            "metadata": {"preferencia_espaco_nome": "Areia"},
+                        }
+                    ],
+                }
             raise AssertionError(tabela)
 
         comprovantes = [
             {
                 "id": "comp-img",
+                "reserva_id": "res-1",
                 "provider_message_id": "wamid.img",
                 "mime_type": "image/jpeg",
                 "nome_original": "pix.jpg",
@@ -192,6 +210,7 @@ class ConversasSupabaseTest(unittest.TestCase):
             },
             {
                 "id": "comp-pdf",
+                "reserva_id": "res-1",
                 "provider_message_id": "wamid.pdf",
                 "mime_type": "application/pdf",
                 "nome_original": "pix.pdf",
@@ -213,6 +232,13 @@ class ConversasSupabaseTest(unittest.TestCase):
         self.assertEqual(imagem["media"]["filename"], "pix.jpg")
         self.assertEqual(imagem["media"]["tamanho"], 1234)
         self.assertEqual(imagem["media"]["comprovante_status"], "aguardando_analise")
+        self.assertEqual(imagem["media"]["comprovante_id"], "comp-img")
+        self.assertEqual(imagem["media"]["reserva_id"], "res-1")
+        self.assertEqual(imagem["media"]["reserva"]["data"], "2030-08-03")
+        self.assertEqual(imagem["media"]["reserva"]["horario"], "13:00")
+        self.assertEqual(imagem["media"]["reserva"]["pessoas"], 14)
+        self.assertEqual(imagem["media"]["reserva"]["espaco"], "Areia")
+        self.assertFalse(imagem["media"]["reserva"]["local_flexivel"])
         self.assertEqual(imagem["media"]["url_endpoint"], "/api/mensagens/msg-img/midia?conversa_id=conv-1")
         self.assertEqual(pdf["tipo"], "document")
         self.assertEqual(pdf["media"]["mime_type"], "application/pdf")

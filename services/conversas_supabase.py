@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONVERSAS_TABLE: Final[str] = "conversas"
 DEFAULT_MENSAGENS_TABLE: Final[str] = "mensagens"
 DEFAULT_CLIENTES_TABLE: Final[str] = "clientes"
+DEFAULT_RESERVAS_TABLE: Final[str] = "reservas"
 PAGE_SIZE_PADRAO: Final[int] = 30
 PAGE_SIZE_MAX: Final[int] = 100
 BUSCA_LIMITE: Final[int] = 500
@@ -155,11 +156,17 @@ def listar_mensagens_conversa(conversa_id: str) -> dict[str, Any] | None:
         for item in comprovantes
         if item.get("provider_message_id")
     }
+    reservas_por_id = _reservas_por_ids(
+        str(item.get("reserva_id") or "")
+        for item in comprovantes
+        if item.get("reserva_id")
+    )
     mensagens = [
         _resumir_mensagem(
             item,
             comprovantes_por_id=comprovantes_por_id,
             comprovantes_por_provider=comprovantes_por_provider,
+            reservas_por_id=reservas_por_id,
         )
         for item in itens_mensagem
     ]
@@ -327,6 +334,7 @@ def _resumir_mensagem(
     *,
     comprovantes_por_id: Mapping[str, Mapping[str, Any]] | None = None,
     comprovantes_por_provider: Mapping[str, Mapping[str, Any]] | None = None,
+    reservas_por_id: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     metadata = _metadata(mensagem)
     resumo = {
@@ -358,13 +366,32 @@ def _resumir_mensagem(
         filename = "comprovante.pdf" if tipo == "document" else "comprovante.jpg"
     mensagem_id = str(mensagem.get("id") or "")
     conversa_id = str(mensagem.get("conversa_id") or "")
+    reserva_id = str(comprovante.get("reserva_id") or "")
+    reserva = (reservas_por_id or {}).get(reserva_id) or {}
+    comprovante_metadata = comprovante.get("metadata") if isinstance(comprovante.get("metadata"), Mapping) else {}
+    auditoria = (
+        comprovante_metadata.get("analise_humana")
+        if isinstance(comprovante_metadata.get("analise_humana"), Mapping)
+        else {}
+    )
     resumo["tipo"] = tipo
     resumo["media"] = {
+        "comprovante_id": str(comprovante.get("id") or ""),
+        "reserva_id": reserva_id,
         "disponivel": bool(comprovante.get("disponivel")),
         "mime_type": mime_type or ("application/pdf" if tipo == "document" else "image/jpeg"),
         "filename": filename,
         "tamanho": _inteiro_seguro(comprovante.get("tamanho_bytes")),
         "comprovante_status": str(comprovante.get("status_analise") or metadata.get("comprovante_status") or ""),
+        "analisado_em": str(comprovante.get("analisado_em") or ""),
+        "analisado_por": str(comprovante.get("analisado_por") or ""),
+        "motivo_rejeicao": str(auditoria.get("motivo") or ""),
+        "notificacao_status": str(
+            (auditoria.get("notificacao") or {}).get("status")
+            if isinstance(auditoria.get("notificacao"), Mapping)
+            else ""
+        ),
+        "reserva": _resumir_reserva_comprovante(reserva),
         "url_endpoint": (
             f"/api/mensagens/{quote(mensagem_id, safe='')}/midia?conversa_id={quote(conversa_id, safe='')}"
             if mensagem_id and conversa_id and comprovante
@@ -372,6 +399,55 @@ def _resumir_mensagem(
         ),
     }
     return resumo
+
+
+def _reservas_por_ids(reserva_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+    ids = list(dict.fromkeys(str(item or "").strip() for item in reserva_ids if str(item or "").strip()))
+    if not ids:
+        return {}
+    resultado = supabase.selecionar(
+        _tabela_reservas(),
+        filtros={"id": _filtro_in(ids)},
+        colunas=(
+            "id,conversa_id,cliente_telefone,data_reserva,horario,pessoas,observacoes,"
+            "status,status_pagamento,espaco_id,metadata"
+        ),
+        limite=len(ids),
+    )
+    if not resultado.get("ok"):
+        logger.warning("Reservas de comprovantes nao carregadas: %s", resultado.get("erro"))
+        return {}
+    return {
+        str(item.get("id") or ""): dict(item)
+        for item in (resultado.get("data") or [])
+        if isinstance(item, Mapping) and item.get("id")
+    }
+
+
+def _resumir_reserva_comprovante(reserva: Mapping[str, Any]) -> dict[str, Any]:
+    if not reserva:
+        return {}
+    metadata = reserva.get("metadata") if isinstance(reserva.get("metadata"), Mapping) else {}
+    horario = str(reserva.get("horario") or "")[:5]
+    flexivel = horario in {"18:00", "19:00"} or not reserva.get("espaco_id")
+    espaco = ""
+    if not flexivel:
+        espaco = str(
+            metadata.get("espaco_sugerido_nome")
+            or metadata.get("preferencia_espaco_nome")
+            or ""
+        )
+    return {
+        "id": str(reserva.get("id") or ""),
+        "data": str(reserva.get("data_reserva") or ""),
+        "horario": horario,
+        "pessoas": _inteiro_seguro(reserva.get("pessoas")),
+        "observacoes": str(reserva.get("observacoes") or ""),
+        "status": str(reserva.get("status") or ""),
+        "status_pagamento": str(reserva.get("status_pagamento") or ""),
+        "espaco": espaco,
+        "local_flexivel": flexivel,
+    }
 
 
 def _mensagem_tem_indicio_midia(mensagem: Mapping[str, Any]) -> bool:
@@ -552,3 +628,7 @@ def _tabela_mensagens() -> str:
 
 def _tabela_clientes() -> str:
     return supabase.tabela_env("SUPABASE_CLIENTES_TABLE", DEFAULT_CLIENTES_TABLE)
+
+
+def _tabela_reservas() -> str:
+    return supabase.tabela_env("SUPABASE_RESERVAS_TABLE", DEFAULT_RESERVAS_TABLE)

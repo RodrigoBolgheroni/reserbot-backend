@@ -7,7 +7,7 @@ import threading
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any, TypedDict
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from services import agente, clientes_supabase, comprovantes_reserva, config_restaurante, dados, perfis, supabase, whatsapp
 from services.comunicacao import MensagemRecebida
@@ -2036,64 +2036,724 @@ def listar_comprovantes_reserva(reserva_id: str) -> list[dict[str, Any]]:
     return comprovantes_reserva.listar_por_reserva(reserva_id)
 
 
-def confirmar_reserva_por_humano(reserva_id: str, *, analisado_por: str = "painel") -> dict[str, Any]:
+def confirmar_reserva_por_humano(
+    reserva_id: str,
+    *,
+    analisado_por: str | Mapping[str, Any] = "painel",
+) -> dict[str, Any]:
     reserva_id_limpo = str(reserva_id or "").strip()
+    comprovantes = comprovantes_reserva.listar_por_reserva(reserva_id_limpo)
+    pendente = next(
+        (item for item in comprovantes if str(item.get("status_analise") or "") == "aguardando_analise"),
+        None,
+    )
+    escolhido = pendente or (comprovantes[0] if comprovantes else None)
+    if not escolhido:
+        resultado = supabase.selecionar(
+            _tabela_reservas(),
+            filtros={"id": f"eq.{reserva_id_limpo}"},
+            limite=1,
+        )
+        reserva = _primeiro(resultado.get("data")) if resultado.get("ok") else None
+        if reserva and str(reserva.get("status") or "") == "confirmada":
+            return {"ok": True, "reserva": reserva, "ja_decidido": True, "ja_confirmada": True}
+        return {"ok": False, "status": 409, "erro": "reserva sem comprovante registrado"}
+    return aprovar_comprovante_por_humano(str(escolhido.get("id") or ""), analisado_por=analisado_por)
+
+
+def aprovar_comprovante_por_humano(
+    comprovante_id: str,
+    *,
+    analisado_por: str | Mapping[str, Any] = "painel",
+) -> dict[str, Any]:
+    contexto = _contexto_decisao_comprovante(comprovante_id)
+    if not contexto.get("ok"):
+        return contexto
+    comprovante = contexto["comprovante"]
+    reserva = contexto["reserva"]
+    conversa = contexto.get("conversa") or {}
+    operador = _normalizar_operador(analisado_por)
+    status_comprovante = str(comprovante.get("status_analise") or "")
+    status_reserva = str(reserva.get("status") or "")
+
+    if status_comprovante == "aprovado" and status_reserva == "confirmada":
+        sincronizacao = _sincronizar_conversa_aprovada(conversa)
+        if not sincronizacao:
+            return {
+                "ok": False,
+                "status": 502,
+                "erro": "pagamento aprovado, mas a conversa ainda nao foi finalizada; tente novamente",
+                "decisao_aplicada": True,
+                "comprovante": comprovante,
+                "reserva": reserva,
+            }
+        texto = _mensagem_aprovacao_reserva(reserva)
+        notificacao = _notificar_decisao_comprovante(
+            comprovante=comprovante,
+            reserva=reserva,
+            conversa=conversa,
+            acao="aprovacao",
+            texto=texto,
+        )
+        return {
+            "ok": True,
+            "comprovante": comprovante,
+            "reserva": reserva,
+            "ja_decidido": True,
+            "ja_confirmada": True,
+            "notificacao": notificacao,
+            "sincronizacao_conversa": sincronizacao,
+        }
+    if status_comprovante != "aguardando_analise":
+        return {"ok": False, "status": 409, "erro": "comprovante ja foi analisado"}
+    if status_reserva != "aguardando_analise":
+        return {"ok": False, "status": 409, "erro": "reserva nao esta aguardando analise"}
+    if not conversa:
+        return {"ok": False, "status": 409, "erro": "conversa da reserva nao encontrada"}
+
+    analisado_em = _agora()
+    operador_id = _operador_id_auditoria(operador)
+    atualizado = supabase.chamar_rpc(
+        "confirmar_reserva_comprovante",
+        {"p_reserva_id": str(reserva.get("id") or ""), "p_analisado_por": operador_id},
+    )
+    reserva_confirmada = _primeiro(atualizado.get("data")) if atualizado.get("ok") else None
+    if not reserva_confirmada:
+        recarregado = _contexto_decisao_comprovante(str(comprovante.get("id") or ""))
+        comprovante_atual = recarregado.get("comprovante") if recarregado.get("ok") else None
+        reserva_atual = recarregado.get("reserva") if recarregado.get("ok") else None
+        if (
+            comprovante_atual
+            and reserva_atual
+            and str(comprovante_atual.get("status_analise") or "") == "aprovado"
+            and str(reserva_atual.get("status") or "") == "confirmada"
+        ):
+            return aprovar_comprovante_por_humano(
+                str(comprovante_atual.get("id") or ""),
+                analisado_por=operador,
+            )
+        logger.warning(
+            "Confirmacao humana transacional recusada: comprovante_id=%s reserva_id=%s erro=%s detalhe=%s.",
+            comprovante.get("id", ""),
+            reserva.get("id", ""),
+            atualizado.get("erro", ""),
+            atualizado.get("detalhe", ""),
+        )
+        return {"ok": False, "status": 409, "erro": "comprovante foi alterado durante a analise"}
+
+    comprovante_aprovado = {
+        **comprovante,
+        "status_analise": "aprovado",
+        "analisado_em": analisado_em,
+        "analisado_por": operador_id,
+    }
+    sincronizacao = _sincronizar_conversa_aprovada(conversa)
+    texto = _mensagem_aprovacao_reserva(reserva_confirmada)
+    auditoria = _auditoria_decisao(
+        comprovante=comprovante,
+        reserva=reserva,
+        conversa=conversa,
+        acao="aprovacao",
+        motivo="",
+        operador=operador,
+        analisado_em=analisado_em,
+        texto=texto,
+    )
+    auditoria["sincronizacao_conversa"] = sincronizacao
+    auditoria_inicial_salva = _salvar_auditoria_comprovante(comprovante_aprovado, auditoria)
+    if not sincronizacao:
+        return {
+            "ok": False,
+            "status": 502,
+            "erro": "pagamento aprovado, mas a conversa ainda nao foi finalizada; tente novamente",
+            "decisao_aplicada": True,
+            "comprovante": {
+                **comprovante_aprovado,
+                "metadata": _metadata_com_auditoria(comprovante, auditoria),
+            },
+            "reserva": reserva_confirmada,
+            "auditoria_salva": auditoria_inicial_salva,
+        }
+    notificacao = _notificar_decisao_comprovante(
+        comprovante=comprovante_aprovado,
+        reserva=reserva_confirmada,
+        conversa=conversa,
+        acao="aprovacao",
+        texto=texto,
+    )
+    auditoria["notificacao"] = notificacao
+    auditoria_salva = _salvar_auditoria_comprovante(comprovante_aprovado, auditoria)
+    logger.info(
+        "Comprovante aprovado por operador autenticado: comprovante_id=%s reserva_id=%s analisado_por=%s notificacao=%s.",
+        comprovante.get("id", ""),
+        reserva.get("id", ""),
+        operador_id,
+        notificacao.get("status", ""),
+    )
+    return {
+        "ok": True,
+        "comprovante": {
+            **comprovante_aprovado,
+            "metadata": _metadata_com_auditoria(comprovante, auditoria),
+        },
+        "reserva": reserva_confirmada,
+        "notificacao": notificacao,
+        "notificacao_enviada": notificacao.get("status") == "enviado",
+        "sincronizacao_conversa": sincronizacao,
+        "auditoria_salva": auditoria_salva,
+    }
+
+
+def rejeitar_comprovante_por_humano(
+    comprovante_id: str,
+    *,
+    motivo: str,
+    analisado_por: str | Mapping[str, Any] = "painel",
+) -> dict[str, Any]:
+    motivo_limpo = re.sub(r"\s+", " ", str(motivo or "")).strip()
+    if len(motivo_limpo) < 3:
+        return {"ok": False, "status": 400, "erro": "informe o motivo da rejeicao"}
+    if len(motivo_limpo) > 500:
+        return {"ok": False, "status": 400, "erro": "motivo da rejeicao deve ter no maximo 500 caracteres"}
+
+    contexto = _contexto_decisao_comprovante(comprovante_id)
+    if not contexto.get("ok"):
+        return contexto
+    comprovante = contexto["comprovante"]
+    reserva = contexto["reserva"]
+    conversa = contexto.get("conversa") or {}
+    operador = _normalizar_operador(analisado_por)
+    operador_id = _operador_id_auditoria(operador)
+    status_comprovante = str(comprovante.get("status_analise") or "")
+
+    if status_comprovante == "rejeitado":
+        auditoria_existente = _auditoria_comprovante(comprovante)
+        motivo_existente = str(auditoria_existente.get("motivo") or "")
+        if motivo_existente and motivo_existente != motivo_limpo:
+            return {"ok": False, "status": 409, "erro": "comprovante ja foi rejeitado com outro motivo"}
+        sincronizacao = _sincronizar_rejeicao_existente(reserva=reserva, conversa=conversa)
+        if not sincronizacao.get("ok"):
+            return {
+                "ok": False,
+                "status": 502,
+                "erro": "comprovante rejeitado, mas os estados ainda nao foram sincronizados; tente novamente",
+                "decisao_aplicada": True,
+                "comprovante": comprovante,
+                "reserva": sincronizacao.get("reserva") or reserva,
+            }
+        texto = _mensagem_rejeicao_comprovante(motivo_existente or motivo_limpo)
+        notificacao = _notificar_decisao_comprovante(
+            comprovante=comprovante,
+            reserva=reserva,
+            conversa=conversa,
+            acao="rejeicao",
+            texto=texto,
+        )
+        return {
+            "ok": True,
+            "comprovante": comprovante,
+            "reserva": sincronizacao.get("reserva") or reserva,
+            "ja_decidido": True,
+            "notificacao": notificacao,
+            "sincronizacao": sincronizacao,
+        }
+    if status_comprovante != "aguardando_analise":
+        return {"ok": False, "status": 409, "erro": "comprovante ja foi analisado"}
+    if str(reserva.get("status") or "") != "aguardando_analise":
+        return {"ok": False, "status": 409, "erro": "reserva nao esta aguardando analise"}
+    if not conversa:
+        return {"ok": False, "status": 409, "erro": "conversa da reserva nao encontrada"}
+
+    analisado_em = _agora()
+    texto = _mensagem_rejeicao_comprovante(motivo_limpo)
+    auditoria = _auditoria_decisao(
+        comprovante=comprovante,
+        reserva=reserva,
+        conversa=conversa,
+        acao="rejeicao",
+        motivo=motivo_limpo,
+        operador=operador,
+        analisado_em=analisado_em,
+        texto=texto,
+    )
+    metadata_comprovante = _metadata_com_auditoria(comprovante, auditoria)
+    rejeicao = supabase.atualizar(
+        comprovantes_reserva.TABELA_COMPROVANTES,
+        {
+            "status_analise": "rejeitado",
+            "analisado_em": analisado_em,
+            "analisado_por": operador_id,
+            "metadata": metadata_comprovante,
+        },
+        filtros={
+            "id": f"eq.{comprovante.get('id')}",
+            "status_analise": "eq.aguardando_analise",
+        },
+    )
+    comprovante_rejeitado = _primeiro(rejeicao.get("data")) if rejeicao.get("ok") else None
+    if not comprovante_rejeitado:
+        return {"ok": False, "status": 409, "erro": "comprovante foi alterado durante a analise"}
+
+    metadata_reserva = dict(reserva.get("metadata") or {}) if isinstance(reserva.get("metadata"), Mapping) else {}
+    metadata_reserva.update(
+        {
+            "comprovante_rejeitado_em": analisado_em,
+            "comprovante_rejeitado_por": operador_id,
+            "comprovante_rejeitado_motivo": motivo_limpo,
+        }
+    )
+    atualizacao_reserva = supabase.atualizar(
+        _tabela_reservas(),
+        {
+            "status": "aguardando_comprovante",
+            "status_pagamento": "aguardando_comprovante",
+            "metadata": metadata_reserva,
+        },
+        filtros={
+            "id": f"eq.{reserva.get('id')}",
+            "status": "eq.aguardando_analise",
+        },
+    )
+    reserva_reaberta = _primeiro(atualizacao_reserva.get("data")) if atualizacao_reserva.get("ok") else None
+    if not reserva_reaberta:
+        _compensar_rejeicao_comprovante(comprovante=comprovante)
+        return {"ok": False, "status": 409, "erro": "reserva foi alterada durante a analise"}
+
+    conversa_atualizada = _reabrir_conversa_para_comprovante(conversa)
+    if not conversa_atualizada:
+        _compensar_rejeicao_reserva(reserva=reserva)
+        _compensar_rejeicao_comprovante(comprovante=comprovante)
+        return {
+            "ok": False,
+            "status": 502,
+            "erro": "nao foi possivel reabrir a conversa; a rejeicao foi desfeita com seguranca",
+        }
+
+    telefone = str(reserva_reaberta.get("cliente_telefone") or "")
+    if telefone:
+        estado = (conversa_atualizada.get("metadata") or {}).get("estado_reserva")
+        if isinstance(estado, Mapping):
+            agente.definir_estado_reserva(telefone, dict(estado))
+
+    notificacao = _notificar_decisao_comprovante(
+        comprovante=comprovante_rejeitado,
+        reserva=reserva_reaberta,
+        conversa=conversa_atualizada,
+        acao="rejeicao",
+        texto=texto,
+    )
+    auditoria["notificacao"] = notificacao
+    auditoria["sincronizacao_conversa"] = True
+    auditoria_salva = _salvar_auditoria_comprovante(comprovante_rejeitado, auditoria)
+    logger.info(
+        "Comprovante rejeitado por operador autenticado: comprovante_id=%s reserva_id=%s analisado_por=%s motivo=%s notificacao=%s.",
+        comprovante.get("id", ""),
+        reserva.get("id", ""),
+        operador_id,
+        motivo_limpo,
+        notificacao.get("status", ""),
+    )
+    return {
+        "ok": True,
+        "comprovante": {
+            **comprovante_rejeitado,
+            "metadata": _metadata_com_auditoria(comprovante_rejeitado, auditoria),
+        },
+        "reserva": reserva_reaberta,
+        "conversa": conversa_atualizada,
+        "notificacao": notificacao,
+        "notificacao_enviada": notificacao.get("status") == "enviado",
+        "auditoria_salva": auditoria_salva,
+    }
+
+
+def _contexto_decisao_comprovante(comprovante_id: str) -> dict[str, Any]:
+    comprovante = comprovantes_reserva.obter_por_id(comprovante_id)
+    if not comprovante:
+        return {"ok": False, "status": 404, "erro": "comprovante nao encontrado"}
+    reserva_id = str(comprovante.get("reserva_id") or "")
+    if not reserva_id:
+        return {"ok": False, "status": 409, "erro": "comprovante sem reserva vinculada"}
     resultado = supabase.selecionar(
         _tabela_reservas(),
-        filtros={"id": f"eq.{reserva_id_limpo}"},
+        filtros={"id": f"eq.{reserva_id}"},
         limite=1,
     )
     reserva = _primeiro(resultado.get("data")) if resultado.get("ok") else None
     if not reserva:
         return {"ok": False, "status": 404, "erro": "reserva nao encontrada"}
-    if str(reserva.get("status") or "") == "confirmada":
-        return {"ok": True, "reserva": reserva, "ja_confirmada": True}
-    if str(reserva.get("status") or "") != "aguardando_analise":
-        return {"ok": False, "status": 409, "erro": "reserva nao esta aguardando analise"}
-    comprovantes = comprovantes_reserva.listar_por_reserva(reserva_id_limpo)
-    if not comprovantes:
-        return {"ok": False, "status": 409, "erro": "reserva sem comprovante registrado"}
+    conversa_id = str(comprovante.get("conversa_id") or reserva.get("conversa_id") or "")
+    conversa = _buscar_conversa_por_id(conversa_id) if conversa_id else None
+    return {"ok": True, "comprovante": comprovante, "reserva": reserva, "conversa": conversa}
 
-    atualizado = supabase.chamar_rpc(
-        "confirmar_reserva_comprovante",
-        {"p_reserva_id": reserva_id_limpo, "p_analisado_por": analisado_por},
+
+def _normalizar_operador(analisado_por: str | Mapping[str, Any]) -> dict[str, str]:
+    if isinstance(analisado_por, Mapping):
+        operador = {
+            "id": str(analisado_por.get("id") or "").strip(),
+            "email": str(analisado_por.get("email") or "").strip(),
+            "modo": str(analisado_por.get("modo") or "").strip(),
+        }
+    else:
+        operador = {"id": str(analisado_por or "").strip(), "email": "", "modo": ""}
+    if not operador["id"] and not operador["email"]:
+        operador["id"] = "painel_autenticado"
+    return operador
+
+
+def _operador_id_auditoria(operador: Mapping[str, Any]) -> str:
+    return str(operador.get("email") or operador.get("id") or "painel_autenticado")[:250]
+
+
+def _auditoria_decisao(
+    *,
+    comprovante: Mapping[str, Any],
+    reserva: Mapping[str, Any],
+    conversa: Mapping[str, Any],
+    acao: str,
+    motivo: str,
+    operador: Mapping[str, Any],
+    analisado_em: str,
+    texto: str,
+) -> dict[str, Any]:
+    aprovado = acao == "aprovacao"
+    return {
+        "comprovante_id": str(comprovante.get("id") or ""),
+        "reserva_id": str(reserva.get("id") or ""),
+        "conversa_id": str(conversa.get("id") or comprovante.get("conversa_id") or ""),
+        "acao": acao,
+        "status_anterior": {
+            "comprovante": str(comprovante.get("status_analise") or ""),
+            "reserva": str(reserva.get("status") or ""),
+            "pagamento": str(reserva.get("status_pagamento") or ""),
+            "conversa": str(conversa.get("status") or ""),
+        },
+        "status_novo": {
+            "comprovante": "aprovado" if aprovado else "rejeitado",
+            "reserva": "confirmada" if aprovado else "aguardando_comprovante",
+            "pagamento": "aprovado" if aprovado else "aguardando_comprovante",
+            "conversa": "finalizada" if aprovado else "bot_ativo",
+        },
+        "motivo": motivo,
+        "usuario": dict(operador),
+        "analisado_em": analisado_em,
+        "mensagem_cliente": texto,
+        "notificacao": {"status": "pendente"},
+    }
+
+
+def _metadata_com_auditoria(
+    comprovante: Mapping[str, Any],
+    auditoria: Mapping[str, Any],
+) -> dict[str, Any]:
+    metadata = dict(comprovante.get("metadata") or {}) if isinstance(comprovante.get("metadata"), Mapping) else {}
+    metadata["analise_humana"] = dict(auditoria)
+    return metadata
+
+
+def _auditoria_comprovante(comprovante: Mapping[str, Any]) -> dict[str, Any]:
+    metadata = comprovante.get("metadata") if isinstance(comprovante.get("metadata"), Mapping) else {}
+    auditoria = metadata.get("analise_humana") if isinstance(metadata.get("analise_humana"), Mapping) else {}
+    return dict(auditoria)
+
+
+def _salvar_auditoria_comprovante(
+    comprovante: Mapping[str, Any],
+    auditoria: Mapping[str, Any],
+) -> bool:
+    comprovante_id = str(comprovante.get("id") or "")
+    status = str(comprovante.get("status_analise") or "")
+    if not comprovante_id or not status:
+        return False
+    resultado = supabase.atualizar(
+        comprovantes_reserva.TABELA_COMPROVANTES,
+        {"metadata": _metadata_com_auditoria(comprovante, auditoria)},
+        filtros={"id": f"eq.{comprovante_id}", "status_analise": f"eq.{status}"},
     )
-    reserva_confirmada = _primeiro(atualizado.get("data")) if atualizado.get("ok") else None
-    if not reserva_confirmada:
-        logger.warning(
-            "Confirmacao humana transacional recusada: reserva_id=%s erro=%s detalhe=%s.",
-            reserva_id_limpo,
-            atualizado.get("erro", ""),
-            atualizado.get("detalhe", ""),
-        )
-        return {"ok": False, "status": 409, "erro": "reserva foi alterada durante a analise"}
-    conversa_id = str(reserva_confirmada.get("conversa_id") or "")
-    conversa = _buscar_conversa_por_id(conversa_id)
-    if conversa:
-        finalizar_conversa(conversa, status="finalizada")
+    salvo = bool(_primeiro(resultado.get("data"))) if resultado.get("ok") else False
+    if not salvo:
+        logger.warning("Auditoria da analise nao persistida: comprovante_id=%s erro=%s.", comprovante_id, resultado.get("erro"))
+    return salvo
 
-    telefone = str(reserva_confirmada.get("cliente_telefone") or "")
+
+def _sincronizar_conversa_aprovada(conversa: Mapping[str, Any]) -> bool:
+    conversa_id = str(conversa.get("id") or "")
+    if not conversa_id:
+        return False
+    if str(conversa.get("status") or "") == "finalizada":
+        return True
+    resultado = supabase.atualizar(
+        _tabela_conversas(),
+        {"status": "finalizada", "data_fim": _agora()},
+        filtros={"id": f"eq.{conversa_id}"},
+    )
+    atualizada = _primeiro(resultado.get("data")) if resultado.get("ok") else None
+    return bool(atualizada)
+
+
+def _reabrir_conversa_para_comprovante(conversa: Mapping[str, Any]) -> dict[str, Any] | None:
+    conversa_id = str(conversa.get("id") or "")
+    if not conversa_id:
+        return None
+    metadata = dict(conversa.get("metadata") or {}) if isinstance(conversa.get("metadata"), Mapping) else {}
+    estado = dict(metadata.get("estado_reserva") or {}) if isinstance(metadata.get("estado_reserva"), Mapping) else {}
+    estado.update(
+        {
+            "etapa": "aguardando_comprovante",
+            "campo_pendente": "comprovante",
+            "comprovante_status": "aguardando_comprovante",
+        }
+    )
+    metadata["estado_reserva"] = estado
+    metadata["status_reserva"] = "aguardando_comprovante"
+    resultado = supabase.atualizar(
+        _tabela_conversas(),
+        {"status": "bot_ativo", "data_fim": None, "metadata": metadata},
+        filtros={"id": f"eq.{conversa_id}"},
+    )
+    atualizada = _primeiro(resultado.get("data")) if resultado.get("ok") else None
+    return dict(atualizada) if isinstance(atualizada, Mapping) else None
+
+
+def _sincronizar_rejeicao_existente(
+    *,
+    reserva: Mapping[str, Any],
+    conversa: Mapping[str, Any],
+) -> dict[str, Any]:
+    reserva_final = dict(reserva)
+    reserva_ok = str(reserva.get("status") or "") == "aguardando_comprovante"
+    if not reserva_ok:
+        if str(reserva.get("status") or "") != "aguardando_analise":
+            return {"ok": False, "reserva": reserva_final, "conversa": None}
+        metadata = dict(reserva.get("metadata") or {}) if isinstance(reserva.get("metadata"), Mapping) else {}
+        resultado = supabase.atualizar(
+            _tabela_reservas(),
+            {
+                "status": "aguardando_comprovante",
+                "status_pagamento": "aguardando_comprovante",
+                "metadata": metadata,
+            },
+            filtros={"id": f"eq.{reserva.get('id')}"},
+        )
+        atualizada = _primeiro(resultado.get("data")) if resultado.get("ok") else None
+        if atualizada:
+            reserva_final = dict(atualizada)
+            reserva_ok = True
+    conversa_final = _reabrir_conversa_para_comprovante(conversa)
+    return {
+        "ok": reserva_ok and bool(conversa_final),
+        "reserva": reserva_final,
+        "conversa": conversa_final,
+    }
+
+
+def _compensar_rejeicao_comprovante(*, comprovante: Mapping[str, Any]) -> None:
+    metadata = dict(comprovante.get("metadata") or {}) if isinstance(comprovante.get("metadata"), Mapping) else {}
+    resultado = supabase.atualizar(
+        comprovantes_reserva.TABELA_COMPROVANTES,
+        {
+            "status_analise": "aguardando_analise",
+            "analisado_em": None,
+            "analisado_por": None,
+            "metadata": metadata,
+        },
+        filtros={"id": f"eq.{comprovante.get('id')}", "status_analise": "eq.rejeitado"},
+        retornar=False,
+    )
+    if not resultado.get("ok"):
+        logger.error("Falha ao desfazer rejeicao parcial do comprovante %s.", comprovante.get("id", ""))
+
+
+def _compensar_rejeicao_reserva(*, reserva: Mapping[str, Any]) -> None:
+    metadata = dict(reserva.get("metadata") or {}) if isinstance(reserva.get("metadata"), Mapping) else {}
+    resultado = supabase.atualizar(
+        _tabela_reservas(),
+        {
+            "status": str(reserva.get("status") or "aguardando_analise"),
+            "status_pagamento": str(reserva.get("status_pagamento") or "aguardando_analise"),
+            "metadata": metadata,
+        },
+        filtros={"id": f"eq.{reserva.get('id')}", "status": "eq.aguardando_comprovante"},
+        retornar=False,
+    )
+    if not resultado.get("ok"):
+        logger.error("Falha ao desfazer rejeicao parcial da reserva %s.", reserva.get("id", ""))
+
+
+def _notificar_decisao_comprovante(
+    *,
+    comprovante: Mapping[str, Any],
+    reserva: Mapping[str, Any],
+    conversa: Mapping[str, Any],
+    acao: str,
+    texto: str,
+) -> dict[str, Any]:
+    comprovante_id = str(comprovante.get("id") or "")
+    conversa_id = str(conversa.get("id") or comprovante.get("conversa_id") or reserva.get("conversa_id") or "")
+    mensagem_id = str(uuid5(NAMESPACE_URL, f"reserva:{comprovante_id}:{acao}"))
+    existente = _buscar_mensagem_decisao(mensagem_id)
+    if existente:
+        metadata = existente.get("metadata") if isinstance(existente.get("metadata"), Mapping) else {}
+        return {
+            "status": str(metadata.get("status_entrega") or "pendente"),
+            "mensagem_id": mensagem_id,
+            "provider_message_id": str(existente.get("provider_message_id") or ""),
+            "idempotente": True,
+        }
+    if not conversa_id:
+        return {"status": "nao_persistida", "erro": "conversa nao encontrada"}
+
+    metadata_mensagem = {
+        "analise_humana": True,
+        "acao": acao,
+        "comprovante_id": comprovante_id,
+        "reserva_id": str(reserva.get("id") or ""),
+        "status_entrega": "pendente",
+    }
+    insercao = supabase.inserir(
+        _tabela_mensagens(),
+        {
+            "id": mensagem_id,
+            "conversa_id": conversa_id,
+            "remetente": "bot",
+            "conteudo": texto,
+            "timestamp": _agora(),
+            "metadata": dict(metadata_mensagem),
+        },
+    )
+    mensagem = _primeiro(insercao.get("data")) if insercao.get("ok") else None
+    if not mensagem:
+        concorrente = _buscar_mensagem_decisao(mensagem_id)
+        if concorrente:
+            metadata = concorrente.get("metadata") if isinstance(concorrente.get("metadata"), Mapping) else {}
+            return {
+                "status": str(metadata.get("status_entrega") or "pendente"),
+                "mensagem_id": mensagem_id,
+                "provider_message_id": str(concorrente.get("provider_message_id") or ""),
+                "idempotente": True,
+            }
+        return {
+            "status": "nao_persistida",
+            "mensagem_id": mensagem_id,
+            "erro": insercao.get("detalhe") or insercao.get("erro") or "falha ao persistir mensagem",
+        }
+
+    telefone = str(reserva.get("cliente_telefone") or "")
+    envio = whatsapp.enviar_com_resultado(telefone, texto) if telefone else {"ok": False, "erro": "telefone ausente"}
+    envio_ok = bool(envio.get("ok"))
+    metadata_mensagem.update(
+        {
+            "status_entrega": "enviado" if envio_ok else "erro",
+            "envio_ok": envio_ok,
+            "erro_entrega": "" if envio_ok else str(envio.get("detalhe") or envio.get("erro") or "falha no envio"),
+            "provider": str(envio.get("provider") or ""),
+        }
+    )
+    provider_message_id = str(envio.get("provider_message_id") or "")
+    payload_atualizacao: dict[str, Any] = {"metadata": metadata_mensagem}
+    if provider_message_id:
+        payload_atualizacao["provider_message_id"] = provider_message_id
+    persistencia = supabase.atualizar(
+        _tabela_mensagens(),
+        payload_atualizacao,
+        filtros={"id": f"eq.{mensagem_id}"},
+        retornar=False,
+    )
+    return {
+        "status": "enviado" if envio_ok else "erro",
+        "mensagem_id": mensagem_id,
+        "provider_message_id": provider_message_id,
+        "provider": str(envio.get("provider") or ""),
+        "erro": "" if envio_ok else str(envio.get("detalhe") or envio.get("erro") or "falha no envio"),
+        "persistida": bool(persistencia.get("ok")),
+        "idempotente": False,
+    }
+
+
+def _buscar_mensagem_decisao(mensagem_id: str) -> dict[str, Any] | None:
+    resultado = supabase.selecionar(
+        _tabela_mensagens(),
+        filtros={"id": f"eq.{mensagem_id}"},
+        colunas="id,conversa_id,provider_message_id,metadata",
+        limite=1,
+    )
+    mensagem = _primeiro(resultado.get("data")) if resultado.get("ok") else None
+    return dict(mensagem) if isinstance(mensagem, Mapping) else None
+
+
+def _mensagem_aprovacao_reserva(reserva: Mapping[str, Any]) -> str:
+    data = _formatar_data_reserva(reserva.get("data_reserva"))
+    horario = _formatar_horario_reserva(reserva.get("horario"))
+    pessoas = _inteiro_reserva(reserva.get("pessoas"))
+    metadata = reserva.get("metadata") if isinstance(reserva.get("metadata"), Mapping) else {}
+    horario_cru = str(reserva.get("horario") or "")[:5]
+    flexivel = horario_cru in {"18:00", "19:00"} or not reserva.get("espaco_id")
+    espaco = ""
+    if not flexivel:
+        espaco = str(
+            metadata.get("espaco_sugerido_nome")
+            or metadata.get("preferencia_espaco_nome")
+            or ""
+        ).strip()
     texto = (
-        "Comprovante aprovado! Sua reserva foi confirmada para "
-        f"{reserva_confirmada.get('data_reserva')}, as {str(reserva_confirmada.get('horario') or '')[:5]}, "
-        f"para {reserva_confirmada.get('pessoas')} pessoas."
+        f"Pagamento conferido! Sua reserva foi confirmada para {data} às {horario}, "
+        f"para {pessoas} {'pessoa' if pessoas == 1 else 'pessoas'}"
     )
-    envio = whatsapp.enviar_com_resultado(telefone, texto) if telefone else {"ok": False}
-    if conversa:
-        registrar_mensagem(
-            conversa,
-            remetente="bot",
-            conteudo=texto,
-            provider_message_id=str(envio.get("provider_message_id") or ""),
-            metadata={"confirmacao_humana": True, "reserva_id": reserva_id_limpo, "envio_ok": bool(envio.get("ok"))},
-        )
-    logger.info(
-        "Reserva confirmada por acao humana autenticada: reserva_id=%s analisado_por=%s envio_ok=%s.",
-        reserva_id_limpo,
-        analisado_por,
-        bool(envio.get("ok")),
+    if espaco:
+        artigo = "na" if _normalizar_espaco_texto(espaco) in {"areia", "area externa", "praia"} else "no"
+        texto += f", {artigo} {espaco}"
+    texto += "."
+    if flexivel:
+        texto += " Nesse horário, o atendimento poderá ser em qualquer ambiente disponível."
+    return texto + " Qualquer alteração ou dúvida, fale com a nossa equipe."
+
+
+def _mensagem_rejeicao_comprovante(motivo: str) -> str:
+    return (
+        f"Não conseguimos aprovar seu comprovante porque: {motivo}. "
+        "Por favor, envie um novo comprovante ou fale com a nossa equipe."
     )
-    return {"ok": True, "reserva": reserva_confirmada, "notificacao_enviada": bool(envio.get("ok"))}
+
+
+def _formatar_data_reserva(valor: Any) -> str:
+    texto = str(valor or "").strip()
+    try:
+        return datetime.fromisoformat(texto[:10]).strftime("%d/%m/%Y")
+    except ValueError:
+        return texto
+
+
+def _formatar_horario_reserva(valor: Any) -> str:
+    horario = str(valor or "").strip()[:5]
+    if len(horario) != 5 or horario[2] != ":":
+        return horario
+    hora, minuto = horario.split(":", 1)
+    return f"{int(hora)}h" + (minuto if minuto != "00" else "")
+
+
+def _inteiro_reserva(valor: Any) -> int:
+    try:
+        return int(valor or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _normalizar_espaco_texto(valor: Any) -> str:
+    texto = str(valor or "").strip().lower()
+    return (
+        texto.replace("á", "a")
+        .replace("à", "a")
+        .replace("â", "a")
+        .replace("ã", "a")
+        .replace("é", "e")
+        .replace("ê", "e")
+        .replace("í", "i")
+        .replace("ó", "o")
+        .replace("ô", "o")
+        .replace("õ", "o")
+        .replace("ú", "u")
+        .replace("ç", "c")
+    )
 
 
 def _espaco_operacional_id(estado: Mapping[str, Any]) -> str:

@@ -779,23 +779,14 @@ class ComprovanteWebhookTest(unittest.TestCase):
 
 
 class ConfirmacaoHumanaTest(unittest.TestCase):
-    @patch.object(fluxo_reservas, "registrar_mensagem")
-    @patch.object(fluxo_reservas, "finalizar_conversa")
-    @patch.object(fluxo_reservas, "_buscar_conversa_por_id", return_value={"id": "conv-1", "status": "aguardando_humano"})
-    @patch.object(fluxo_reservas.whatsapp, "enviar_com_resultado", return_value={"ok": True, "provider_message_id": "wamid-ok"})
-    @patch.object(fluxo_reservas.comprovantes_reserva, "listar_por_reserva", return_value=[{"id": "comp-1"}])
-    @patch.object(fluxo_reservas.supabase, "chamar_rpc")
-    @patch.object(fluxo_reservas.supabase, "selecionar")
-    def test_acao_humana_autenticada_confirma_e_notifica(
-        self,
-        selecionar,
-        chamar_rpc,
-        _listar,
-        _enviar,
-        _buscar_conversa,
-        finalizar,
-        _registrar,
-    ) -> None:
+    def _contexto(self, *, status_comprovante: str = "aguardando_analise", status_reserva: str = "aguardando_analise"):
+        comprovante = {
+            "id": "comp-1",
+            "reserva_id": "res-1",
+            "conversa_id": "conv-1",
+            "status_analise": status_comprovante,
+            "metadata": {},
+        }
         reserva = {
             "id": "res-1",
             "conversa_id": "conv-1",
@@ -803,24 +794,242 @@ class ConfirmacaoHumanaTest(unittest.TestCase):
             "data_reserva": "2030-08-03",
             "horario": "13:00:00",
             "pessoas": 14,
-            "status": "aguardando_analise",
-            "metadata": {},
+            "status": status_reserva,
+            "status_pagamento": "aguardando_analise",
+            "espaco_id": "esp-1",
+            "metadata": {"preferencia_espaco_nome": "Areia"},
         }
-        selecionar.return_value = {"ok": True, "data": [reserva]}
-        chamar_rpc.return_value = {"ok": True, "data": {**reserva, "status": "confirmada", "status_pagamento": "aprovado"}}
-        resultado = fluxo_reservas.confirmar_reserva_por_humano("res-1")
+        conversa = {
+            "id": "conv-1",
+            "status": "aguardando_humano",
+            "metadata": {"estado_reserva": {"etapa": "aguardando_analise"}},
+        }
+        return {"ok": True, "comprovante": comprovante, "reserva": reserva, "conversa": conversa}
+
+    @patch.object(fluxo_reservas, "_notificar_decisao_comprovante")
+    @patch.object(fluxo_reservas, "_salvar_auditoria_comprovante", return_value=True)
+    @patch.object(fluxo_reservas, "_sincronizar_conversa_aprovada", return_value=True)
+    @patch.object(fluxo_reservas, "_contexto_decisao_comprovante")
+    @patch.object(fluxo_reservas.supabase, "chamar_rpc")
+    def test_acao_humana_autenticada_confirma_e_notifica(
+        self,
+        chamar_rpc,
+        contexto,
+        _sincronizar,
+        _salvar_auditoria,
+        notificar,
+    ) -> None:
+        dados = self._contexto()
+        contexto.return_value = dados
+        reserva = dados["reserva"]
+        chamar_rpc.return_value = {
+            "ok": True,
+            "data": {**reserva, "status": "confirmada", "status_pagamento": "aprovado"},
+        }
+        notificar.return_value = {
+            "status": "enviado",
+            "mensagem_id": "msg-1",
+            "provider_message_id": "wamid-ok",
+        }
+
+        resultado = fluxo_reservas.aprovar_comprovante_por_humano(
+            "comp-1",
+            analisado_por={"id": "user-1", "email": "operador@praia.test", "modo": "supabase_auth"},
+        )
+
         self.assertTrue(resultado["ok"])
         self.assertEqual(resultado["reserva"]["status"], "confirmada")
         chamar_rpc.assert_called_once_with(
             "confirmar_reserva_comprovante",
-            {"p_reserva_id": "res-1", "p_analisado_por": "painel"},
+            {"p_reserva_id": "res-1", "p_analisado_por": "operador@praia.test"},
         )
-        finalizar.assert_called_once()
+        texto = notificar.call_args.kwargs["texto"]
+        self.assertIn("Pagamento conferido!", texto)
+        self.assertIn("03/08/2030 às 13h", texto)
+        self.assertIn("na Areia", texto)
+
+    @patch.object(fluxo_reservas, "_notificar_decisao_comprovante")
+    @patch.object(fluxo_reservas, "_sincronizar_conversa_aprovada", return_value=True)
+    @patch.object(fluxo_reservas, "_contexto_decisao_comprovante")
+    @patch.object(fluxo_reservas.supabase, "chamar_rpc")
+    def test_aprovacao_repetida_nao_executa_rpc_novamente(
+        self,
+        chamar_rpc,
+        contexto,
+        _sincronizar,
+        notificar,
+    ) -> None:
+        contexto.return_value = self._contexto(status_comprovante="aprovado", status_reserva="confirmada")
+        notificar.return_value = {"status": "enviado", "idempotente": True}
+
+        resultado = fluxo_reservas.aprovar_comprovante_por_humano("comp-1")
+
+        self.assertTrue(resultado["ok"])
+        self.assertTrue(resultado["ja_decidido"])
+        chamar_rpc.assert_not_called()
+
+    @patch.object(fluxo_reservas, "_notificar_decisao_comprovante")
+    @patch.object(fluxo_reservas, "_salvar_auditoria_comprovante", return_value=True)
+    @patch.object(fluxo_reservas, "_sincronizar_conversa_aprovada", return_value=False)
+    @patch.object(fluxo_reservas, "_contexto_decisao_comprovante")
+    @patch.object(fluxo_reservas.supabase, "chamar_rpc")
+    def test_aprovacao_nao_notifica_antes_de_sincronizar_conversa(
+        self,
+        chamar_rpc,
+        contexto,
+        _sincronizar,
+        _salvar,
+        notificar,
+    ) -> None:
+        dados = self._contexto()
+        contexto.return_value = dados
+        chamar_rpc.return_value = {
+            "ok": True,
+            "data": {**dados["reserva"], "status": "confirmada", "status_pagamento": "aprovado"},
+        }
+
+        resultado = fluxo_reservas.aprovar_comprovante_por_humano("comp-1")
+
+        self.assertFalse(resultado["ok"])
+        self.assertTrue(resultado["decisao_aplicada"])
+        self.assertEqual(resultado["status"], 502)
+        notificar.assert_not_called()
+
+    @patch.object(fluxo_reservas, "_notificar_decisao_comprovante")
+    @patch.object(fluxo_reservas, "_salvar_auditoria_comprovante", return_value=True)
+    @patch.object(fluxo_reservas, "_contexto_decisao_comprovante")
+    @patch.object(fluxo_reservas.supabase, "atualizar")
+    def test_rejeicao_reabre_reserva_conversa_e_registra_motivo(
+        self,
+        atualizar,
+        contexto,
+        _salvar,
+        notificar,
+    ) -> None:
+        dados = self._contexto()
+        contexto.return_value = dados
+        comprovante_rejeitado = {**dados["comprovante"], "status_analise": "rejeitado"}
+        reserva_reaberta = {
+            **dados["reserva"],
+            "status": "aguardando_comprovante",
+            "status_pagamento": "aguardando_comprovante",
+        }
+        conversa_reaberta = {
+            **dados["conversa"],
+            "status": "bot_ativo",
+            "metadata": {
+                "estado_reserva": {
+                    "etapa": "aguardando_comprovante",
+                    "campo_pendente": "comprovante",
+                    "comprovante_status": "aguardando_comprovante",
+                }
+            },
+        }
+        atualizar.side_effect = [
+            {"ok": True, "data": [comprovante_rejeitado]},
+            {"ok": True, "data": [reserva_reaberta]},
+            {"ok": True, "data": [conversa_reaberta]},
+        ]
+        notificar.return_value = {"status": "enviado", "provider_message_id": "wamid-rejeicao"}
+
+        resultado = fluxo_reservas.rejeitar_comprovante_por_humano(
+            "comp-1",
+            motivo="Valor não confere",
+            analisado_por={"id": "user-1", "email": "operador@praia.test"},
+        )
+
+        self.assertTrue(resultado["ok"])
+        self.assertEqual(resultado["reserva"]["status"], "aguardando_comprovante")
+        self.assertEqual(atualizar.call_args_list[0].args[0], "comprovantes_reserva")
+        self.assertEqual(atualizar.call_args_list[1].args[0], fluxo_reservas._tabela_reservas())
+        conversa_payload = atualizar.call_args_list[2].args[1]
+        self.assertEqual(conversa_payload["status"], "bot_ativo")
+        self.assertEqual(conversa_payload["metadata"]["estado_reserva"]["campo_pendente"], "comprovante")
+        texto = notificar.call_args.kwargs["texto"]
+        self.assertEqual(
+            texto,
+            "Não conseguimos aprovar seu comprovante porque: Valor não confere. "
+            "Por favor, envie um novo comprovante ou fale com a nossa equipe.",
+        )
+
+    @patch.object(fluxo_reservas, "_notificar_decisao_comprovante")
+    @patch.object(fluxo_reservas, "_contexto_decisao_comprovante")
+    @patch.object(fluxo_reservas.supabase, "atualizar")
+    def test_falha_no_meio_da_rejeicao_desfaz_comprovante(
+        self,
+        atualizar,
+        contexto,
+        notificar,
+    ) -> None:
+        dados = self._contexto()
+        contexto.return_value = dados
+        atualizar.side_effect = [
+            {"ok": True, "data": [{**dados["comprovante"], "status_analise": "rejeitado"}]},
+            {"ok": True, "data": []},
+            {"ok": True, "data": []},
+        ]
+
+        resultado = fluxo_reservas.rejeitar_comprovante_por_humano(
+            "comp-1",
+            motivo="Pagamento não identificado",
+        )
+
+        self.assertFalse(resultado["ok"])
+        self.assertEqual(resultado["status"], 409)
+        self.assertEqual(atualizar.call_args_list[2].args[1]["status_analise"], "aguardando_analise")
+        notificar.assert_not_called()
+
+    @patch.object(fluxo_reservas.whatsapp, "enviar_com_resultado")
+    @patch.object(fluxo_reservas.supabase, "atualizar", return_value={"ok": True})
+    @patch.object(fluxo_reservas.supabase, "inserir")
+    @patch.object(fluxo_reservas.supabase, "selecionar")
+    def test_notificacao_persistida_antes_do_envio_e_idempotente(
+        self,
+        selecionar,
+        inserir,
+        _atualizar,
+        enviar,
+    ) -> None:
+        mensagem_persistida = {
+            "id": "deterministico",
+            "provider_message_id": "wamid-ok",
+            "metadata": {"status_entrega": "enviado"},
+        }
+        selecionar.side_effect = [
+            {"ok": True, "data": []},
+            {"ok": True, "data": [mensagem_persistida]},
+        ]
+        inserir.side_effect = lambda _tabela, payload: {"ok": True, "data": [payload]}
+        enviar.return_value = {"ok": True, "provider": "cloud", "provider_message_id": "wamid-ok"}
+        dados = self._contexto()
+
+        primeira = fluxo_reservas._notificar_decisao_comprovante(
+            comprovante=dados["comprovante"],
+            reserva=dados["reserva"],
+            conversa=dados["conversa"],
+            acao="aprovacao",
+            texto="Confirmada.",
+        )
+        segunda = fluxo_reservas._notificar_decisao_comprovante(
+            comprovante=dados["comprovante"],
+            reserva=dados["reserva"],
+            conversa=dados["conversa"],
+            acao="aprovacao",
+            texto="Confirmada.",
+        )
+
+        self.assertEqual(primeira["status"], "enviado")
+        self.assertTrue(segunda["idempotente"])
+        inserir.assert_called_once()
+        enviar.assert_called_once()
+        self.assertEqual(inserir.call_args.args[1]["metadata"]["status_entrega"], "pendente")
 
     def test_rotas_seguras_de_comprovante_sao_reconhecidas(self) -> None:
         self.assertEqual(config_server._id_rota_reserva_recurso("/api/reservas/res-1/comprovantes", "comprovantes"), "res-1")
         self.assertEqual(config_server._id_rota_reserva_recurso("/api/reservas/res-1/confirmar", "confirmar"), "res-1")
         self.assertEqual(config_server._id_rota_comprovante_arquivo("/api/comprovantes/comp-1/arquivo"), "comp-1")
+        self.assertEqual(config_server._id_rota_comprovante_acao("/api/comprovantes/comp-1/aprovar", "aprovar"), "comp-1")
+        self.assertEqual(config_server._id_rota_comprovante_acao("/api/comprovantes/comp-1/rejeitar", "rejeitar"), "comp-1")
         self.assertEqual(config_server._id_rota_mensagem_midia("/api/mensagens/msg-1/midia"), "msg-1")
 
     @patch.object(config_server.comprovantes_reserva, "baixar_arquivo_mensagem")

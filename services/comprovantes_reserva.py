@@ -117,7 +117,7 @@ def listar_por_reserva(reserva_id: str) -> list[dict[str, Any]]:
         filtros={"reserva_id": f"eq.{reserva_id}"},
         colunas=(
             "id,reserva_id,conversa_id,provider_message_id,tipo_midia,mime_type,nome_original,"
-            "tamanho_bytes,recebido_em,status_analise,analisado_em,analisado_por,created_at"
+            "tamanho_bytes,recebido_em,status_analise,analisado_em,analisado_por,metadata,created_at"
         ),
         order="recebido_em.desc",
     )
@@ -136,7 +136,7 @@ def listar_por_conversa(conversa_id: str) -> list[dict[str, Any]]:
         filtros={"conversa_id": f"eq.{conversa_id_limpo}"},
         colunas=(
             "id,reserva_id,conversa_id,provider_message_id,tipo_midia,mime_type,nome_original,"
-            "tamanho_bytes,recebido_em,status_analise,bucket,storage_path"
+            "tamanho_bytes,recebido_em,status_analise,analisado_em,analisado_por,metadata,bucket,storage_path"
         ),
         order="recebido_em.asc",
     )
@@ -159,10 +159,26 @@ def listar_por_conversa(conversa_id: str) -> list[dict[str, Any]]:
                 "tamanho_bytes": _inteiro_seguro(item.get("tamanho_bytes")),
                 "recebido_em": str(item.get("recebido_em") or ""),
                 "status_analise": str(item.get("status_analise") or ""),
+                "analisado_em": str(item.get("analisado_em") or ""),
+                "analisado_por": str(item.get("analisado_por") or ""),
+                "metadata": dict(item.get("metadata") or {}) if isinstance(item.get("metadata"), Mapping) else {},
                 "disponivel": bool(item.get("bucket") and item.get("storage_path")),
             }
         )
     return comprovantes
+
+
+def obter_por_id(comprovante_id: str) -> dict[str, Any] | None:
+    comprovante_id_limpo = str(comprovante_id or "").strip()
+    if not comprovante_id_limpo:
+        return None
+    resultado = supabase.selecionar(
+        TABELA_COMPROVANTES,
+        filtros={"id": f"eq.{comprovante_id_limpo}"},
+        limite=1,
+    )
+    comprovante = _primeiro(resultado.get("data")) if resultado.get("ok") else None
+    return dict(comprovante) if isinstance(comprovante, Mapping) else None
 
 
 def obter_por_provider_message_id(provider_message_id: str) -> dict[str, Any] | None:
