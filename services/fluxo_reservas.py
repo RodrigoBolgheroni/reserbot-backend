@@ -256,6 +256,15 @@ def processar_resposta_cliente(
     logger.info("Bot respondeu porque conversa esta ativa. telefone=%s", telefone_limpo)
     _carregar_estado_reserva_conversa(conversa_atual, telefone_limpo)
     contexto_mensagem = _contexto_midia_metadata(metadata_mensagem)
+
+    turn_id = (
+        provider_message_id
+        or str((metadata_mensagem or {}).get("lote_id") or "")
+        or str((metadata_mensagem or {}).get("provider_message_id") or "")
+        or str(uuid4())
+    )
+    conversa_id = str(conversa_atual.get("id") or "")
+
     resposta = agente.processar_mensagem(
         telefone=telefone_limpo,
         mensagem_cliente=mensagem_limpa,
@@ -263,6 +272,14 @@ def processar_resposta_cliente(
         perfil_cliente=perfil_cliente,
         contexto_mensagem=contexto_mensagem,
     )
+    logger.info(
+        "DIAG_RESERVA resposta_bruta_ia telefone=%s turn_id=%s conversa_id=%s texto=%r",
+        telefone_limpo,
+        turn_id,
+        conversa_id,
+        resposta.get("texto"),
+    )
+
     resposta = _aplicar_fluxo_comprovante(
         telefone=telefone_limpo,
         mensagem_cliente=mensagem_limpa,
@@ -298,22 +315,71 @@ def processar_resposta_cliente(
         telefone=telefone_limpo,
         resposta=resposta,
     )
-    _salvar_estado_reserva_conversa(conversa_atual, telefone_limpo, resposta=resposta)
+    logger.info(
+        "DIAG_RESERVA resposta_pos_fluxo telefone=%s turn_id=%s conversa_id=%s texto=%r",
+        telefone_limpo,
+        turn_id,
+        conversa_id,
+        resposta.get("texto"),
+    )
 
     if resposta["texto"]:
         envio = whatsapp.enviar_com_resultado(telefone_limpo, resposta["texto"])
-        registrar_mensagem(
-            conversa_atual,
-            remetente="bot",
-            conteudo=resposta["texto"],
-            provider_message_id=str(envio.get("provider_message_id") or ""),
-            metadata={
-                "envio": envio,
-                "envio_ok": bool(envio.get("ok")),
-                "status_reserva": resposta.get("status_reserva", ""),
-                "confianca": resposta.get("confianca", 0),
-            },
-        )
+        envio_ok = bool(envio.get("ok"))
+        if envio_ok:
+            logger.info(
+                "DIAG_RESERVA resposta_enviada_whatsapp telefone=%s turn_id=%s provider_message_id=%s texto=%r",
+                telefone_limpo,
+                turn_id,
+                envio.get("provider_message_id"),
+                resposta["texto"],
+            )
+            registrar_mensagem(
+                conversa_atual,
+                remetente="bot",
+                conteudo=resposta["texto"],
+                provider_message_id=str(envio.get("provider_message_id") or ""),
+                metadata={
+                    "envio": envio,
+                    "envio_ok": True,
+                    "turn_id": turn_id,
+                    "status_reserva": resposta.get("status_reserva", ""),
+                    "confianca": resposta.get("confianca", 0),
+                },
+            )
+            agente.registrar_resposta_assistente_historico(
+                telefone_limpo,
+                conversa_id=conversa_id,
+                turn_id=turn_id,
+                texto_final=resposta["texto"],
+            )
+            _salvar_estado_reserva_conversa(conversa_atual, telefone_limpo, resposta=resposta)
+        else:
+            logger.error(
+                "DIAG_RESERVA envio_whatsapp_falhou telefone=%s turn_id=%s erro=%s texto=%r",
+                telefone_limpo,
+                turn_id,
+                envio.get("erro"),
+                resposta["texto"],
+            )
+            registrar_mensagem(
+                conversa_atual,
+                remetente="bot",
+                conteudo=resposta["texto"],
+                provider_message_id="",
+                metadata={
+                    "envio": envio,
+                    "envio_ok": False,
+                    "turn_id": turn_id,
+                    "status_reserva": "falha_envio",
+                    "erro": envio.get("erro"),
+                },
+            )
+            return {
+                **resposta,
+                "status_reserva": "falha_envio",
+                "envio_ok": False,
+            }
 
     if resposta.get("status_reserva") == "aguardando_humano":
         atualizar_status_conversa(conversa_atual, status="aguardando_humano")
@@ -651,6 +717,17 @@ def _aplicar_fluxo_comprovante(
     if not estado.get("informacoes_cancelamento_apresentadas"):
         partes.append(_texto_cancelamento_config(config))
         estado["informacoes_cancelamento_apresentadas"] = True
+
+    normalizado_msg = _normalizar_texto(mensagem_cliente)
+    pref_nome = str(estado.get("preferencia_espaco_nome") or "").strip()
+    if pref_nome:
+        pref_texto = ""
+        if re.search(r"\b(ja\s+disse|ja\s+falei|ja\s+informei)\b", normalizado_msg):
+            pref_texto = f"Voce tem razao, o {pref_nome} ja esta anotado como preferencia. Vamos seguir com a reserva."
+        elif estado.pop("preferencia_espaco_recem_registrada", False):
+            pref_texto = f"Perfeito, anotei o {pref_nome} como preferencia. A definicao do local depende da disponibilidade no dia."
+        if pref_texto and not any(pref_texto[:15].lower() in p.lower() for p in partes):
+            partes.insert(0, pref_texto)
 
     agente.definir_estado_reserva(telefone, estado)
     texto_final = "\n\n".join(parte.strip() for parte in partes if parte.strip())

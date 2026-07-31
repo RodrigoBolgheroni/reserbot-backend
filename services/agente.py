@@ -242,6 +242,7 @@ CHAVES_ESTADO_PERSISTIDO: Final[set[str]] = {
     "observacoes",
     "preferencia_espaco_id",
     "preferencia_espaco_nome",
+    "preferencia_espaco_recem_registrada",
     "preferencia_espaco_permitida",
     "espaco_confirmado",
     "local_garantido",
@@ -409,6 +410,8 @@ def _processar_mensagem_sem_lock(
     historico.append({"role": "user", "content": mensagem_limpa})
     _limitar_historico(historico)
 
+    _atualizar_preferencia_espaco_estado(estado_atual, mensagem_cliente=mensagem_limpa)
+
     if not ia_fallback.tem_provedor_configurado():
         logger.warning("Nenhum provedor de IA configurado. Usando handoff tecnico.")
         texto_modelo = _payload_fallback_tecnico()
@@ -490,8 +493,6 @@ def _processar_mensagem_sem_lock(
     texto_cliente = resposta_segura["texto"]
 
     if texto_cliente:
-        historico.append({"role": "assistant", "content": texto_cliente})
-        _limitar_historico(historico)
         _registrar_ultima_resposta(telefone_limpo, texto_cliente)
 
     if reserva_confirmada:
@@ -522,6 +523,33 @@ def _lock_conversa(telefone: str) -> threading.RLock:
             lock = threading.RLock()
             _locks_conversa[telefone] = lock
         return lock
+
+
+def registrar_resposta_assistente_historico(
+    telefone: str,
+    *,
+    conversa_id: str = "",
+    turn_id: str = "",
+    texto_final: str = "",
+) -> None:
+    telefone_limpo = str(telefone or "").strip()
+    if not telefone_limpo or not texto_final:
+        return
+    with _lock_conversa(telefone_limpo):
+        historico = _historicos.setdefault(telefone_limpo, [])
+        if turn_id:
+            for item in reversed(historico):
+                if item.get("role") == "assistant" and item.get("turn_id") == turn_id:
+                    item["content"] = texto_final
+                    return
+        entry: dict[str, str] = {"role": "assistant", "content": texto_final}
+        if turn_id:
+            entry["turn_id"] = turn_id
+        if conversa_id:
+            entry["conversa_id"] = conversa_id
+        historico.append(entry)
+        _limitar_historico(historico)
+        _registrar_ultima_resposta(telefone_limpo, texto_final)
 
 
 def limpar_historico(telefone: str) -> None:
@@ -595,6 +623,7 @@ def _normalizar_estado_reserva_persistido(estado: Mapping[str, Any] | None) -> E
             "regra_espaco_obrigatoria",
             "quantidade_abaixo_minima",
             "preferencia_espaco_permitida",
+            "preferencia_espaco_recem_registrada",
             "espaco_confirmado",
             "local_garantido",
             "disponibilidade_espaco_consultada",
@@ -1338,11 +1367,10 @@ def _texto_horarios_reserva_config(config: config_restaurante.ConfigRestaurante)
 
 
 def _texto_quantidade_minima_config(config: config_restaurante.ConfigRestaurante) -> str:
-    if config.quantidade_minima_reserva is None:
-        return f"Consigo confirmar automaticamente reservas de ate {config.limite_pessoas_reserva} pessoas por aqui."
+    minimo = config.quantidade_minima_reserva or 11
     return (
-        f"As reservas sao feitas a partir de {config.quantidade_minima_reserva} pessoas. "
-        f"Consigo confirmar automaticamente ate {config.limite_pessoas_reserva} pessoas por aqui."
+        f"As reservas sao realizadas a partir de {minimo} pessoas. "
+        "A confirmacao ocorre somente apos analise humana do comprovante e validacao da equipe."
     )
 
 
@@ -2719,6 +2747,75 @@ def _atualizar_contexto_conversacional_estado(estado: EstadoReserva, interpretac
         estado["dados_confirmados"] = _mesclar_dict_contexto(dict(estado.get("dados_confirmados") or {}), dict(dados_confirmados))
 
 
+def _analisar_escolha_espaco_na_mensagem(
+    config: config_restaurante.ConfigRestaurante,
+    mensagem_cliente: str,
+    estado: Mapping[str, Any],
+) -> config_restaurante.EspacoRestaurante | None:
+    normalizado = _normalizar_busca(mensagem_cliente)
+    if not normalizado:
+        return None
+
+    espacos_ativos = _espacos_ativos(config)
+    if not espacos_ativos:
+        return None
+
+    mencionados: list[config_restaurante.EspacoRestaurante] = []
+    for espaco in espacos_ativos:
+        nome_norm = _normalizar_busca(espaco.nome)
+        if nome_norm and re.search(rf"\b{re.escape(nome_norm)}\b", normalizado):
+            mencionados.append(espaco)
+
+    if not mencionados:
+        return None
+
+    negados: set[str] = set()
+    for espaco in espacos_ativos:
+        nome_norm = _normalizar_busca(espaco.nome)
+        padrao_negacao = (
+            rf"\b(nao|não)\s+(?:\w+\s+){{0,3}}{re.escape(nome_norm)}\b|"
+            rf"\b{re.escape(nome_norm)}\s+(?:nao|não)\b"
+        )
+        if re.search(padrao_negacao, normalizado):
+            negados.add(espaco.id)
+
+    candidatos = [e for e in mencionados if e.id not in negados]
+
+    if len(candidatos) > 1:
+        com_escolha: list[config_restaurante.EspacoRestaurante] = []
+        for e in candidatos:
+            nome_norm = _normalizar_busca(e.nome)
+            if re.search(rf"\b(prefiro|preferia|preferencia|escolho|quero|pode ser|coloca|anota)\b\s+(?:\w+\s+){{0,3}}{re.escape(nome_norm)}\b", normalizado):
+                com_escolha.append(e)
+        if len(com_escolha) == 1:
+            candidatos = com_escolha
+
+    if len(candidatos) == 1:
+        candidato = candidatos[0]
+        candidato_norm = _normalizar_busca(candidato.nome)
+        tem_pergunta = "?" in mensagem_cliente or bool(
+            re.search(r"\b(qual|quais|onde|como|fica|diferenca|diferença)\b", normalizado)
+        )
+        tem_escolha_explicita = bool(
+            re.search(
+                rf"\b(prefiro|preferia|preferencia|escolho|quero|pode ser|coloca|anota)\b.*?\b{re.escape(candidato_norm)}\b|"
+                rf"\b{re.escape(candidato_norm)}\b.*?\b(nao|não)\b|"
+                rf"\b(nao|não)\b.*?\b(prefiro|quero|pode ser)\b.*?\b{re.escape(candidato_norm)}\b",
+                normalizado,
+            )
+            or _mensagem_solicita_preferencia_espaco(mensagem_cliente)
+        )
+        espera_espaco = _campo_aguardado(estado) in {"espaco", "preferencia_espaco"} or estado.get("etapa") == "aguardando_espaco"
+
+        if tem_pergunta and not tem_escolha_explicita:
+            return None
+
+        if tem_escolha_explicita or espera_espaco:
+            return candidato
+
+    return None
+
+
 def _atualizar_preferencia_espaco_estado(estado: EstadoReserva, *, mensagem_cliente: str) -> None:
     config = _config_restaurante_atual()
     espacos = _espacos_ativos(config)
@@ -2734,7 +2831,7 @@ def _atualizar_preferencia_espaco_estado(estado: EstadoReserva, *, mensagem_clie
     )
     _registrar_conflitos_espaco_faq(config)
 
-    espaco = _identificar_espaco_na_mensagem(config, mensagem_cliente)
+    espaco = _analisar_escolha_espaco_na_mensagem(config, mensagem_cliente, estado)
     if espaco is None:
         return
 
@@ -2744,8 +2841,6 @@ def _atualizar_preferencia_espaco_estado(estado: EstadoReserva, *, mensagem_clie
         espaco.nome,
         espaco.permite_preferencia,
     )
-    if not _mensagem_solicita_preferencia_espaco(mensagem_cliente):
-        return
 
     logger.info("preferencia_espaco_solicitada espaco_id=%s nome=%s", espaco.id, espaco.nome)
     if not espaco.permite_preferencia:
@@ -2762,11 +2857,13 @@ def _atualizar_preferencia_espaco_estado(estado: EstadoReserva, *, mensagem_clie
             espaco.nome,
         )
         logger.warning(
-            "espaco_confirmacao_bloqueada espaco_id=%s motivo=preferencia_nao_permitida",
+            "espaco_confirmacao_bloqueada espaco_id=%s motivo=nao_permite_preferencia",
             espaco.id,
         )
         return
 
+    if estado.get("preferencia_espaco_id") != espaco.id or estado.get("preferencia_espaco_recem_registrada"):
+        estado["preferencia_espaco_recem_registrada"] = True
     estado["preferencia_espaco_id"] = espaco.id
     estado["preferencia_espaco_nome"] = espaco.nome
     estado["preferencia_espaco_permitida"] = True
@@ -2836,7 +2933,7 @@ def _mensagem_solicita_preferencia_espaco(texto: str) -> bool:
     return bool(
         re.search(
             r"\b(prefiro|preferia|preferencia|preferir|escolher|escolho|quero|queria|"
-            r"pode ser|coloca|coloque|anota|anote|fica|ficar|mesa|reserva)\b",
+            r"pode ser|coloca|coloque|anota|anote|mesa|reserva)\b",
             normalizado,
         )
     )
@@ -5073,7 +5170,6 @@ def _mensagem_sistema(
             f"- Funcionamento: {config.dias_funcionamento}, das {config.horario_abertura} as {config.horario_fechamento}\n"
             f"- Horarios aceitos para reserva: {config.horarios_aceitos_reserva}\n"
             f"- Quantidade minima para reserva: {_texto_quantidade_minima_config(config)}\n"
-            f"- Limite de pessoas por reserva automatica: {config.limite_pessoas_reserva}\n"
             f"- Taxa de reserva: {_texto_taxa_reserva_config(config)}\n"
             f"- Comprovante de Pix: {'obrigatorio' if config.exige_comprovante else 'nao configurado como obrigatorio'}\n"
             f"- Formas de pagamento: {config.formas_pagamento}\n"
