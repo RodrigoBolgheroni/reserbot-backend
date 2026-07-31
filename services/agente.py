@@ -4619,6 +4619,24 @@ def _payload_fallback_tecnico() -> str:
     )
 
 
+def _payload_fallback_tecnico_temporario() -> str:
+    return json.dumps(
+        {
+            "resposta": "Tivemos uma oscilacao temporaria no processamento. Como gostaria de prosseguir com sua reserva?",
+            "intencao": "duvida",
+            "dados_confirmados": {},
+            "dados_mencionados": {},
+            "dados_incertos": {},
+            "correcoes": {},
+            "acao": "coletar",
+            "deve_avancar_estado": False,
+            "campo_sugerido": None,
+            "confianca": 0.5,
+        },
+        ensure_ascii=False,
+    )
+
+
 def _reparar_interpretacao_texto_simples(
     *,
     telefone: str,
@@ -4689,6 +4707,13 @@ def _chamar_groq(mensagens: Sequence[Mensagem], modelo: str, *, response_format_
     )
     if resultado.get("ok") and resultado.get("conteudo"):
         return str(resultado["conteudo"]).strip()
+    if resultado.get("erro_codigo") == "bad_request" or not resultado.get("encaminhar_humano"):
+        logger.warning(
+            "ai_chamada_falhou_payload_invalido telefone=%s erro_codigo=%s. Usando resposta temporaria sem pausar atendimento.",
+            telefone,
+            resultado.get("erro_codigo"),
+        )
+        return _payload_fallback_tecnico_temporario()
     return _payload_fallback_tecnico()
 
 

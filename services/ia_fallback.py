@@ -104,6 +104,50 @@ class JsonRepairFailed(RuntimeError):
     pass
 
 
+ROLES_VALIDOS_MODELO: Final[set[str]] = {
+    "system",
+    "user",
+    "assistant",
+    "developer",
+    "tool",
+    "function",
+}
+
+
+def sanitizar_mensagens_para_modelo(
+    mensagens: Sequence[Mapping[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """
+    Sanitiza uma lista de mensagens (incluindo histórico interno com metadados)
+    para um formato estritamente aceito pelas APIs OpenAI-compatible / Groq.
+    Preserva o objeto original.
+    """
+    if not mensagens:
+        return []
+
+    resultado: list[dict[str, Any]] = []
+    for item in mensagens:
+        if not isinstance(item, Mapping):
+            continue
+
+        role = str(item.get("role") or "").strip().lower()
+        if role not in ROLES_VALIDOS_MODELO:
+            continue
+
+        msg_limpa: dict[str, Any] = {
+            "role": role,
+            "content": str(item.get("content") or ""),
+        }
+
+        for campo in ("name", "tool_calls", "tool_call_id", "function_call"):
+            if campo in item and item[campo] is not None:
+                msg_limpa[campo] = item[campo]
+
+        resultado.append(msg_limpa)
+
+    return resultado
+
+
 def tem_provedor_configurado() -> bool:
     return bool(
         os.getenv("GROQ_API_KEY", "").strip()
@@ -116,13 +160,14 @@ def tem_provedor_configurado() -> bool:
 
 
 def executar_ia_com_fallback(
-    mensagens: Sequence[Mapping[str, str]],
+    mensagens: Sequence[Mapping[str, Any]],
     *,
     telefone: str | None = None,
     conversa_id: str | None = None,
     modelo_preferido: str | None = None,
     response_format_json: bool = False,
 ) -> ResultadoIA:
+    mensagens_limpas = sanitizar_mensagens_para_modelo(mensagens)
     candidatos = _candidatos_groq(modelo_preferido)
     erros: list[str] = []
 
@@ -148,7 +193,7 @@ def executar_ia_com_fallback(
         )
         try:
             conteudo = _executar_groq_modelo(
-                mensagens,
+                mensagens_limpas,
                 modelo=modelo,
                 response_format_json=response_format_json,
             )
@@ -218,7 +263,7 @@ def executar_ia_com_fallback(
         }
 
     resultado_provider = _executar_provider_alternativo(
-        mensagens,
+        mensagens_limpas,
         telefone=telefone,
         conversa_id=conversa_id,
         response_format_json=response_format_json,
@@ -227,6 +272,26 @@ def executar_ia_com_fallback(
         return resultado_provider
     if resultado_provider.get("erro_codigo"):
         erros.append(str(resultado_provider["erro_codigo"]))
+
+    codigos = [e.split(":")[-1] for e in erros]
+    apenas_bad_request = bool(codigos and all(c == "bad_request" for c in codigos))
+
+    if apenas_bad_request:
+        logger.error(
+            "ai_bad_request_payload_error telefone=%s conversa_id=%s erros=%s",
+            _mascarar_telefone(telefone),
+            conversa_id or "",
+            ",".join(erros[-5:]),
+        )
+        return {
+            "ok": False,
+            "provider": None,
+            "model": None,
+            "conteudo": None,
+            "usou_fallback": bool(candidatos) or bool(_provider_fallback_config()),
+            "encaminhar_humano": False,
+            "erro_codigo": "bad_request",
+        }
 
     logger.error(
         "ai_all_providers_failed telefone=%s conversa_id=%s erros=%s",
@@ -344,7 +409,7 @@ def _executar_groq_modelo(
 
 
 def _kwargs_chat_groq(
-    mensagens: Sequence[Mapping[str, str]],
+    mensagens: Sequence[Mapping[str, Any]],
     *,
     modelo: str,
     response_format_json: bool,
@@ -355,7 +420,7 @@ def _kwargs_chat_groq(
     modelo_gpt_oss = _modelo_gpt_oss(modelo_nome)
     kwargs: dict[str, Any] = {
         "model": modelo_nome,
-        "messages": [dict(mensagem) for mensagem in mensagens],
+        "messages": sanitizar_mensagens_para_modelo(mensagens),
         "temperature": temperature,
     }
     if modelo_gpt_oss:
@@ -479,8 +544,8 @@ def _executar_groq_sem_json_mode_tolerante(
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _mensagens_json_tolerante(mensagens: Sequence[Mapping[str, str]]) -> list[dict[str, str]]:
-    mensagens_tolerantes = [dict(mensagem) for mensagem in mensagens]
+def _mensagens_json_tolerante(mensagens: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    mensagens_tolerantes = sanitizar_mensagens_para_modelo(mensagens)
     for indice in range(len(mensagens_tolerantes) - 1, -1, -1):
         if mensagens_tolerantes[indice].get("role") == "system":
             conteudo = str(mensagens_tolerantes[indice].get("content") or "").rstrip()
@@ -722,7 +787,7 @@ def _executar_fallback_provider(
 
     payload: dict[str, Any] = {
         "model": model,
-        "messages": [dict(mensagem) for mensagem in mensagens],
+        "messages": sanitizar_mensagens_para_modelo(mensagens),
         "temperature": 0.4,
         "max_tokens": 500,
     }
