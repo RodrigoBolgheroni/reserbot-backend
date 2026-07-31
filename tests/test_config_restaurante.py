@@ -343,7 +343,12 @@ class ConfigRestauranteTest(unittest.TestCase):
         self.assertIn("on conflict (slug) do update", sql)
         self.assertIn("pix_chave = coalesce(nullif(public.configuracoes_reserva.pix_chave, ''), excluded.pix_chave)", sql)
         self.assertIn("pix_titular = coalesce(nullif(public.configuracoes_reserva.pix_titular, ''), excluded.pix_titular)", sql)
-        self.assertIn("on conflict (estabelecimento_id, categoria, titulo) do nothing", sql)
+        self.assertIn("on conflict (estabelecimento_id, categoria, titulo) do update", sql)
+        self.assertIn("Lista de aniversário", sql)
+        self.assertIn("Bolo de aniversário", sql)
+        migration = Path("supabase/20260730_informacoes_aniversario.sql").read_text(encoding="utf-8")
+        self.assertIn("on conflict (estabelecimento_id, categoria, titulo) do update", migration)
+        self.assertIn("set ativo = false", migration)
         self.assertIn("reservas acima de 25 pessoas devem ser direcionadas para a Areia", sql)
 
 

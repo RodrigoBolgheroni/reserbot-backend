@@ -156,6 +156,7 @@ class EstadoReserva(TypedDict, total=False):
     cliente_autorizou_confirmacao: bool
     ultima_confirmacao_oferecida_em: str
     informacoes_aniversario_apresentadas: bool
+    contexto_aniversario: bool
     informacoes_pagamento_apresentadas: bool
     informacoes_cancelamento_apresentadas: bool
     regra_horario_sem_preferencia_apresentada: bool
@@ -266,6 +267,7 @@ CHAVES_ESTADO_PERSISTIDO: Final[set[str]] = {
     "cliente_autorizou_confirmacao",
     "ultima_confirmacao_oferecida_em",
     "informacoes_aniversario_apresentadas",
+    "contexto_aniversario",
     "informacoes_pagamento_apresentadas",
     "informacoes_cancelamento_apresentadas",
     "regra_horario_sem_preferencia_apresentada",
@@ -597,6 +599,7 @@ def _normalizar_estado_reserva_persistido(estado: Mapping[str, Any] | None) -> E
             "local_garantido",
             "disponibilidade_espaco_consultada",
             "informacoes_aniversario_apresentadas",
+            "contexto_aniversario",
             "informacoes_pagamento_apresentadas",
             "informacoes_cancelamento_apresentadas",
             "regra_horario_sem_preferencia_apresentada",
@@ -655,6 +658,7 @@ def _mensagem_contexto_reserva(telefone: str) -> Mensagem:
         "confirmacao_pausada": bool(estado.get("confirmacao_pausada")),
         "cliente_autorizou_confirmacao": bool(estado.get("cliente_autorizou_confirmacao")),
         "informacoes_aniversario_apresentadas": bool(estado.get("informacoes_aniversario_apresentadas")),
+        "contexto_aniversario": bool(estado.get("contexto_aniversario")),
         "informacoes_pagamento_apresentadas": bool(estado.get("informacoes_pagamento_apresentadas")),
         "informacoes_cancelamento_apresentadas": bool(estado.get("informacoes_cancelamento_apresentadas")),
         "comprovante_status": estado.get("comprovante_status", ""),
@@ -1421,6 +1425,12 @@ def aplicar_guardrails_reserva(
 
     intencao_conversacional = _intencao_conversacional(mensagem_cliente)
     categoria_pergunta_restaurante = _categoria_pergunta_restaurante(mensagem_cliente)
+    if (
+        not categoria_pergunta_restaurante
+        and estado.get("contexto_aniversario")
+        and re.search(r"\blista\b", _normalizar_busca(mensagem_cliente))
+    ):
+        categoria_pergunta_restaurante = "lista_aniversario"
     if not categoria_pergunta_restaurante and intencao_modelo == "pergunta_restaurante":
         categoria_pergunta_restaurante = "geral"
     if (
@@ -1542,7 +1552,14 @@ def aplicar_guardrails_reserva(
     if resposta_dados_conhecidos is not None:
         return resposta_dados_conhecidos
 
-    if intencao_conversacional:
+    categoria_aniversario_deterministica = categoria_pergunta_restaurante in {
+        "lista_aniversario",
+        "bolo_aniversario",
+        "geladeira_aniversario",
+        "utensilios_aniversario",
+        "aniversario",
+    }
+    if intencao_conversacional and not categoria_aniversario_deterministica:
         return _responder_intencao_conversacional(
             intencao=intencao_conversacional,
             telefone=telefone_limpo,
@@ -4109,8 +4126,19 @@ def _categoria_pergunta_restaurante(texto: str) -> str | None:
         return "taxa_reserva"
     if re.search(r"\b(pagamento|pagar|pix|cartao|debito|credito|dinheiro|voucher|vale refeicao)\b", normalizado):
         return "pagamento"
-    if re.search(r"\b(bolo|decoracao|decorar|parabens)\b", normalizado):
-        return "bolo"
+    if re.search(r"\b(lista)\b", normalizado) and re.search(
+        r"\b(aniversario|festa|comemoracao|convidados|nomes|entrada)\b",
+        normalizado,
+    ):
+        return "lista_aniversario"
+    if re.search(r"\b(prato|pratos|garfo|garfos|talher|talheres|utensilio|utensilios)\b", normalizado):
+        return "utensilios_aniversario"
+    if re.search(r"\b(geladeira|refriger\w*|guard\w*)\b", normalizado):
+        return "geladeira_aniversario"
+    if re.search(r"\b(bolo|parabens)\b", normalizado):
+        return "bolo_aniversario"
+    if re.search(r"\b(decoracao|decorar|ornamentacao|ornamentar)\b", normalizado):
+        return "decoracao_aniversario"
     if re.search(r"\b(aniversario|bolo|decoracao|decorar|parabens|comemorar)\b", normalizado):
         return "aniversario"
     if re.search(
@@ -4144,6 +4172,27 @@ def _responder_pergunta_restaurante(
     campo = _campo_retomada_apos_informacao(estado, telefone)
     if campo:
         _definir_campo_pendente(estado, campo)
+    if categoria in {
+        "lista_aniversario",
+        "bolo_aniversario",
+        "geladeira_aniversario",
+        "utensilios_aniversario",
+        "aniversario",
+    }:
+        texto = _texto_pergunta_restaurante(categoria, estado)
+        _log_resposta_substituida(
+            texto_ia=str((interpretacao or {}).get("texto") or ""),
+            texto_final=texto,
+            funcao="_responder_pergunta_restaurante",
+            motivo=f"informacao_aniversario_deterministica:{categoria}",
+        )
+        return {
+            "texto": texto,
+            "reserva_confirmada": False,
+            "dados_reserva": _dados_reserva_do_estado(estado),
+            "status_reserva": _status_reserva_para_campo(campo),
+            "confianca": max(confianca, 0.95),
+        }
     logger.info(
         "Pergunta sobre restaurante preservou resposta da IA: categoria=%s campo_retomada=%s.",
         categoria,
@@ -4166,6 +4215,16 @@ def _campo_retomada_apos_informacao(estado: EstadoReserva, telefone: str) -> str
     if not faltantes:
         return "confirmacao"
     return faltantes[0]
+
+
+def _status_reserva_para_campo(campo: str) -> str:
+    if campo == "comprovante":
+        return "aguardando_comprovante"
+    if campo == "analise_comprovante":
+        return "aguardando_analise"
+    if campo == "confirmacao":
+        return "aguardando_confirmacao"
+    return "em_coleta"
 
 
 def _texto_pergunta_restaurante(categoria: str, estado: EstadoReserva) -> str:
@@ -4196,8 +4255,16 @@ def _texto_pergunta_restaurante(categoria: str, estado: EstadoReserva) -> str:
         base = f"Aceitamos {config.formas_pagamento}."
     elif categoria == "taxa_reserva":
         base = _texto_taxa_reserva_config(config)
+    elif categoria == "lista_aniversario":
+        base = config_restaurante.TEXTO_LISTA_ANIVERSARIO
+    elif categoria == "bolo_aniversario":
+        base = config_restaurante.TEXTO_BOLO_ANIVERSARIO
+    elif categoria == "geladeira_aniversario":
+        base = config_restaurante.TEXTO_GELADEIRA_ANIVERSARIO
+    elif categoria == "utensilios_aniversario":
+        base = config_restaurante.TEXTO_UTENSILIOS_ANIVERSARIO
     elif categoria == "aniversario":
-        base = config.aniversario
+        base = config_restaurante.TEXTO_ANIVERSARIO_OBRIGATORIO
     elif categoria == "limite_pessoas":
         base = _texto_quantidade_minima_config(config)
     elif categoria == "cancelamento":

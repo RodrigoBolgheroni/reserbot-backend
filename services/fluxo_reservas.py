@@ -84,6 +84,7 @@ def iniciar_conversa(
             "perfil_mensagem": cliente.get("perfil_mensagem") or (perfil_cliente or {}).get("nome"),
             "perfil_id": (perfil_cliente or {}).get("id"),
             "perfil_nome": (perfil_cliente or {}).get("nome"),
+            "contexto_aniversario": str(origem or "").strip().lower() == "aniversario",
         },
     }
 
@@ -266,6 +267,12 @@ def processar_resposta_cliente(
         telefone=telefone_limpo,
         mensagem_cliente=mensagem_limpa,
         cliente=cliente,
+        conversa=conversa_atual,
+        resposta=resposta,
+    )
+    resposta = _aplicar_guardrail_aniversario_backend(
+        telefone=telefone_limpo,
+        mensagem_cliente=mensagem_limpa,
         conversa=conversa_atual,
         resposta=resposta,
     )
@@ -718,14 +725,96 @@ def _texto_cancelamento_config(config: config_restaurante.ConfigRestaurante) -> 
 
 
 def _texto_aniversario_config(config: config_restaurante.ConfigRestaurante) -> str:
-    return (
-        "Como é aniversário, não trabalhamos com lista. Pode trazer bolo, e conseguimos guardá-lo "
-        "na geladeira até a hora do parabéns. Recomendamos trazer pratos e garfos para servir."
-    )
+    return config_restaurante.TEXTO_ANIVERSARIO_OBRIGATORIO
 
 
 def _conversa_de_aniversario(conversa: Mapping[str, Any], estado: Mapping[str, Any]) -> bool:
-    return str(conversa.get("origem") or estado.get("origem_conversa") or "").strip().lower() == "aniversario"
+    if estado.get("contexto_aniversario"):
+        return True
+    metadata = _metadata_conversa(conversa)
+    if metadata.get("contexto_aniversario"):
+        return True
+    valores = [
+        conversa.get("origem"),
+        estado.get("origem_conversa"),
+        metadata.get("origem"),
+        metadata.get("campanha"),
+        metadata.get("campaign"),
+        metadata.get("tipo_disparo"),
+        metadata.get("proposito"),
+        metadata.get("finalidade"),
+        metadata.get("motivo_reserva"),
+        metadata.get("evento"),
+    ]
+    return any("anivers" in _normalizar_texto(str(valor or "")) for valor in valores)
+
+
+def _aplicar_guardrail_aniversario_backend(
+    *,
+    telefone: str,
+    mensagem_cliente: str,
+    conversa: Mapping[str, Any],
+    resposta: agente.RespostaAgente,
+) -> agente.RespostaAgente:
+    estado = agente.obter_estado_reserva(telefone) or {}
+    categoria = agente._categoria_pergunta_restaurante(mensagem_cliente)
+    texto = str(resposta.get("texto") or "").strip()
+
+    if (
+        categoria is None
+        and _conversa_de_aniversario(conversa, estado)
+        and re.search(r"\blista\b", _normalizar_texto(mensagem_cliente))
+    ):
+        categoria = "lista_aniversario"
+    if categoria in {
+        "lista_aniversario",
+        "bolo_aniversario",
+        "geladeira_aniversario",
+        "utensilios_aniversario",
+        "aniversario",
+    }:
+        texto = agente._texto_pergunta_restaurante(categoria, estado)
+
+    contexto_aniversario = _conversa_de_aniversario(conversa, estado)
+    if contexto_aniversario:
+        estado["contexto_aniversario"] = True
+        texto_antes_guardrail = texto
+        texto = _substituir_handoff_generico_aniversario(texto, categoria=categoria)
+        if texto != texto_antes_guardrail:
+            continuacao = agente._continuacao_fluxo_apos_informacao(estado)
+            if continuacao and continuacao not in texto:
+                texto = f"{texto} {continuacao}"
+        if (
+            not estado.get("informacoes_aniversario_apresentadas")
+            and str(estado.get("etapa") or "") == "aguardando_comprovante"
+            and estado.get("informacoes_pagamento_apresentadas")
+        ):
+            texto_aniversario = _texto_aniversario_config(config_restaurante.obter_config())
+            if texto_aniversario not in texto:
+                texto = f"{texto_aniversario}\n\n{texto}".strip()
+            estado["informacoes_aniversario_apresentadas"] = True
+        agente.definir_estado_reserva(telefone, estado)
+
+    return {**resposta, "texto": texto}
+
+
+def _substituir_handoff_generico_aniversario(texto: str, *, categoria: str | None) -> str:
+    if categoria == "decoracao_aniversario":
+        return texto
+    normalizado = _normalizar_texto(texto)
+    menciona_operacao = bool(
+        re.search(
+            r"\b(bolo|lista|geladeira|refriger\w*|prato|pratos|garfo|garfos|talher|talheres|utensilio|utensilios|aniversario)\b",
+            normalizado,
+        )
+    )
+    handoff_generico = bool(
+        re.search(r"\b(confirm|verific|consult|falar).{0,50}\b(equipe|restaurante|atendente)\b", normalizado)
+        or re.search(r"\b(equipe|restaurante|atendente).{0,50}\b(confirm|verific|consult)\b", normalizado)
+    )
+    if menciona_operacao and handoff_generico:
+        return config_restaurante.TEXTO_ANIVERSARIO_OBRIGATORIO
+    return texto
 
 
 def _mensagem_informa_pagamento_sem_midia(texto: str) -> bool:
@@ -924,12 +1013,18 @@ def _carregar_estado_reserva_conversa(conversa: Mapping[str, Any], telefone: str
         agente.obter_estado_reserva(telefone),
     )
     if isinstance(estado, Mapping):
+        contexto_aniversario = _conversa_de_aniversario(conversa, estado)
         agente.definir_estado_reserva(
             telefone,
             {
                 **dict(estado),
                 "conversa_id": conversa_id,
                 "origem_conversa": str(conversa.get("origem") or estado.get("origem_conversa") or ""),
+                "contexto_aniversario": contexto_aniversario,
+                "informacoes_aniversario_apresentadas": bool(
+                    estado.get("informacoes_aniversario_apresentadas")
+                    or metadata.get("informacoes_aniversario_apresentadas")
+                ),
             },
         )
         logger.info("Estado de reserva carregado da conversa %s para telefone=%s.", conversa_id, telefone)
@@ -940,11 +1035,13 @@ def _carregar_estado_reserva_conversa(conversa: Mapping[str, Any], telefone: str
         agente.limpar_historico(telefone)
         estado_memoria = {}
     if not estado_memoria:
+        contexto_aniversario = _conversa_de_aniversario(conversa, {})
         agente.definir_estado_reserva(
             telefone,
             {
                 "conversa_id": conversa_id,
                 "origem_conversa": str(conversa.get("origem") or ""),
+                "contexto_aniversario": contexto_aniversario,
             },
         )
 
@@ -961,6 +1058,10 @@ def _salvar_estado_reserva_conversa(
     estado["conversa_id"] = str(conversa.get("id") or "")
     metadata = _metadata_conversa(conversa)
     metadata["estado_reserva"] = estado
+    metadata["contexto_aniversario"] = bool(estado.get("contexto_aniversario"))
+    metadata["informacoes_aniversario_apresentadas"] = bool(
+        estado.get("informacoes_aniversario_apresentadas")
+    )
     metadata["dados_reserva"] = dict(resposta.get("dados_reserva") or {})
     metadata["status_reserva"] = resposta.get("status_reserva", "")
     logger.info(

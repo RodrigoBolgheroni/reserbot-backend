@@ -90,6 +90,29 @@ def _resposta(dados=None, *, texto="Dados completos. Posso confirmar?"):
     }
 
 
+def _interpretacao_pergunta(texto: str):
+    return {
+        "texto": texto,
+        "reserva_confirmada": False,
+        "dados_reserva": {},
+        "dados_confirmados": {},
+        "dados_mencionados": {},
+        "dados_incertos": {},
+        "status_reserva": "em_coleta",
+        "confianca": 0.9,
+        "intencao": "pergunta_restaurante",
+        "acao": "responder",
+        "proximo_campo": "",
+        "deve_avancar_estado": False,
+        "correcoes": {},
+        "assunto_atual": "",
+        "pergunta_aberta": "",
+        "tom_cliente": "",
+        "resumo_conversa": "",
+        "contrato_novo": True,
+    }
+
+
 class FluxoConclusaoReservaTest(unittest.TestCase):
     def setUp(self) -> None:
         agente._estados_reserva.clear()
@@ -776,6 +799,172 @@ class ComprovanteWebhookTest(unittest.TestCase):
             "Como é aniversário, não trabalhamos com lista. Pode trazer bolo, e conseguimos guardá-lo "
             "na geladeira até a hora do parabéns. Recomendamos trazer pratos e garfos para servir.",
         )
+
+
+class InformacoesAniversarioTest(unittest.TestCase):
+    def setUp(self) -> None:
+        agente._estados_reserva.clear()
+
+    def tearDown(self) -> None:
+        agente._estados_reserva.clear()
+
+    def test_contexto_de_campanha_persiste_sem_repetir_aniversario_na_mensagem(self) -> None:
+        conversa = {
+            "id": "conv-campanha",
+            "origem": "whatsapp",
+            "metadata": {"campanha": "Campanha de aniversário 2026"},
+        }
+        fluxo_reservas._carregar_estado_reserva_conversa(conversa, TELEFONE)
+
+        estado = agente.obter_estado_reserva(TELEFONE)
+        self.assertTrue(estado["contexto_aniversario"])
+        self.assertTrue(fluxo_reservas._conversa_de_aniversario(conversa, estado))
+
+    def test_flag_aniversario_recarrega_do_metadata_persistido(self) -> None:
+        conversa = {
+            "id": "conv-flag",
+            "origem": "aniversario",
+            "metadata": {
+                "contexto_aniversario": True,
+                "informacoes_aniversario_apresentadas": True,
+                "estado_reserva": {"etapa": "aguardando_comprovante", "campo_pendente": "comprovante"},
+            },
+        }
+        fluxo_reservas._carregar_estado_reserva_conversa(conversa, TELEFONE)
+
+        estado = agente.obter_estado_reserva(TELEFONE)
+        self.assertTrue(estado["contexto_aniversario"])
+        self.assertTrue(estado["informacoes_aniversario_apresentadas"])
+
+    @patch.object(agente.config_restaurante, "obter_config", return_value=_config_praia())
+    def test_pergunta_bolo_responde_e_retoma_data(self, _config) -> None:
+        agente.definir_estado_reserva(
+            TELEFONE,
+            {"contexto_aniversario": True, "etapa": "aguardando_data", "campo_pendente": "data_reserva"},
+        )
+        resposta = agente.aplicar_guardrails_reserva(
+            telefone=TELEFONE,
+            mensagem_cliente="Posso levar bolo?",
+            interpretacao=_interpretacao_pergunta("Confirme com a equipe se pode levar bolo."),
+            nome_cliente="Rodrigo",
+        )
+
+        self.assertEqual(
+            resposta["texto"],
+            "Pode sim! Conseguimos guardar na geladeira até a hora do parabéns. "
+            "Recomendamos trazer pratos e garfos para servir. Me fala o dia que voce quer reservar.",
+        )
+        self.assertEqual(agente.obter_estado_reserva(TELEFONE)["etapa"], "aguardando_data")
+
+    @patch.object(agente.config_restaurante, "obter_config", return_value=_config_praia())
+    def test_pergunta_lista_preserva_dados_e_retoma_quantidade(self, _config) -> None:
+        agente.definir_estado_reserva(
+            TELEFONE,
+            {
+                "contexto_aniversario": True,
+                "data_reserva": "2030-08-03",
+                "horario": "13:00",
+                "etapa": "aguardando_quantidade",
+                "campo_pendente": "pessoas",
+            },
+        )
+        resposta = agente.aplicar_guardrails_reserva(
+            telefone=TELEFONE,
+            mensagem_cliente="Vocês trabalham com lista?",
+            interpretacao=_interpretacao_pergunta("Detalhes devem ser confirmados com a equipe."),
+            nome_cliente="Rodrigo",
+        )
+
+        self.assertEqual(
+            resposta["texto"],
+            "Não trabalhamos com lista de aniversário. Para quantas pessoas sera a reserva?",
+        )
+        estado = agente.obter_estado_reserva(TELEFONE)
+        self.assertEqual(estado["data_reserva"], "2030-08-03")
+        self.assertEqual(estado["horario"], "13:00")
+        self.assertEqual(estado["campo_pendente"], "pessoas")
+
+    @patch.object(agente.config_restaurante, "obter_config", return_value=_config_praia())
+    def test_pergunta_geladeira_preserva_etapa_comprovante(self, _config) -> None:
+        agente.definir_estado_reserva(
+            TELEFONE,
+            _estado_completo(
+                contexto_aniversario=True,
+                etapa="aguardando_comprovante",
+                campo_pendente="comprovante",
+                informacoes_aniversario_apresentadas=True,
+            ),
+        )
+        resposta = agente.aplicar_guardrails_reserva(
+            telefone=TELEFONE,
+            mensagem_cliente="Vocês guardam o bolo?",
+            interpretacao=_interpretacao_pergunta("Vou verificar a geladeira com a equipe."),
+            nome_cliente="Rodrigo",
+        )
+
+        self.assertEqual(resposta["texto"], "Sim, conseguimos guardar na geladeira até a hora do parabéns.")
+        self.assertEqual(resposta["status_reserva"], "aguardando_comprovante")
+        self.assertEqual(agente.obter_estado_reserva(TELEFONE)["campo_pendente"], "comprovante")
+
+    @patch.object(agente.config_restaurante, "obter_config", return_value=_config_praia())
+    def test_pergunta_prato_preserva_dados_e_retoma_horario(self, _config) -> None:
+        agente.definir_estado_reserva(
+            TELEFONE,
+            {
+                "contexto_aniversario": True,
+                "data_reserva": "2030-08-03",
+                "etapa": "aguardando_horario",
+                "campo_pendente": "horario",
+            },
+        )
+        resposta = agente.aplicar_guardrails_reserva(
+            telefone=TELEFONE,
+            mensagem_cliente="Preciso levar prato?",
+            interpretacao=_interpretacao_pergunta("Confirme os utensílios com a equipe."),
+            nome_cliente="Rodrigo",
+        )
+
+        self.assertEqual(
+            resposta["texto"],
+            "Recomendamos levar pratos e garfos para servir o bolo. "
+            "Qual horario dentro desse periodo fica melhor para voce?",
+        )
+        self.assertEqual(agente.obter_estado_reserva(TELEFONE)["campo_pendente"], "horario")
+
+    @patch.object(fluxo_reservas.config_restaurante, "obter_config", return_value=_config_praia())
+    def test_guardrail_final_insere_aniversario_antes_do_comprovante(self, _config) -> None:
+        agente.definir_estado_reserva(
+            TELEFONE,
+            _estado_completo(
+                contexto_aniversario=True,
+                etapa="aguardando_comprovante",
+                campo_pendente="comprovante",
+                informacoes_pagamento_apresentadas=True,
+                informacoes_aniversario_apresentadas=False,
+            ),
+        )
+        resposta = fluxo_reservas._aplicar_guardrail_aniversario_backend(
+            telefone=TELEFONE,
+            mensagem_cliente="Quero reservar",
+            conversa={"id": "conv-guard", "origem": "aniversario"},
+            resposta=_resposta(texto="Envie a imagem ou o PDF do comprovante."),
+        )
+
+        self.assertLess(resposta["texto"].index("Como é aniversário"), resposta["texto"].index("comprovante"))
+        self.assertTrue(agente.obter_estado_reserva(TELEFONE)["informacoes_aniversario_apresentadas"])
+
+    def test_guardrail_substitui_handoff_mas_preserva_decoracao_especifica(self) -> None:
+        generico = fluxo_reservas._substituir_handoff_generico_aniversario(
+            "Confirme com a equipe se pode levar bolo.",
+            categoria="bolo_aniversario",
+        )
+        decoracao = fluxo_reservas._substituir_handoff_generico_aniversario(
+            "Sobre decoração específica, a equipe precisa confirmar com você.",
+            categoria="decoracao_aniversario",
+        )
+
+        self.assertEqual(generico, config_restaurante.TEXTO_ANIVERSARIO_OBRIGATORIO)
+        self.assertEqual(decoracao, "Sobre decoração específica, a equipe precisa confirmar com você.")
 
 
 class ConfirmacaoHumanaTest(unittest.TestCase):

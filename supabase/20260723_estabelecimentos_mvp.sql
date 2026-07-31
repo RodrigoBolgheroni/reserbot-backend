@@ -333,9 +333,17 @@ begin
         (
             praia_id,
             'aniversario',
-            'Bolo e decoração',
-            'Informações sobre bolo, decoração e detalhes de comemoração devem ser confirmadas com a equipe.',
-            array['bolo', 'decoracao', 'aniversario'],
+            'Lista de aniversário',
+            'A Praia da Radial não trabalha com lista de aniversário.',
+            array['lista', 'aniversario', 'convidados'],
+            true
+        ),
+        (
+            praia_id,
+            'aniversario',
+            'Bolo de aniversário',
+            'O cliente pode levar bolo. A equipe pode guardá-lo na geladeira até a hora do parabéns. Recomenda-se que o cliente leve pratos e garfos para servir.',
+            array['bolo', 'aniversario', 'geladeira', 'pratos', 'garfos', 'utensilios'],
             true
         ),
         (
@@ -378,5 +386,9 @@ begin
             array['salao', 'areia', 'espacos'],
             true
         )
-    on conflict (estabelecimento_id, categoria, titulo) do nothing;
+    on conflict (estabelecimento_id, categoria, titulo) do update
+    set
+        conteudo = excluded.conteudo,
+        tags = excluded.tags,
+        ativo = true;
 end $$;

@@ -16,6 +16,18 @@ from services import repositorio_config_restaurante as repositorio
 
 logger = logging.getLogger(__name__)
 
+TEXTO_ANIVERSARIO_OBRIGATORIO = (
+    "Como é aniversário, não trabalhamos com lista. Pode trazer bolo, e conseguimos guardá-lo "
+    "na geladeira até a hora do parabéns. Recomendamos trazer pratos e garfos para servir."
+)
+TEXTO_LISTA_ANIVERSARIO = "Não trabalhamos com lista de aniversário."
+TEXTO_BOLO_ANIVERSARIO = (
+    "Pode sim! Conseguimos guardar na geladeira até a hora do parabéns. "
+    "Recomendamos trazer pratos e garfos para servir."
+)
+TEXTO_GELADEIRA_ANIVERSARIO = "Sim, conseguimos guardar na geladeira até a hora do parabéns."
+TEXTO_UTENSILIOS_ANIVERSARIO = "Recomendamos levar pratos e garfos para servir o bolo."
+
 TABELA_ESTABELECIMENTOS = repositorio.TABELA_ESTABELECIMENTOS
 TABELA_HORARIOS_FUNCIONAMENTO = repositorio.TABELA_HORARIOS_FUNCIONAMENTO
 TABELA_CONFIGURACOES_RESERVA = repositorio.TABELA_CONFIGURACOES_RESERVA
@@ -214,10 +226,7 @@ def _obter_config_env() -> ConfigRestaurante:
             "RESTAURANTE_ESTACIONAMENTO",
             "Ainda nao tenho informacao de estacionamento configurada.",
         ),
-        aniversario=_texto_env(
-            "RESTAURANTE_INFO_ANIVERSARIO",
-            "Para aniversarios, posso registrar a reserva e a equipe confirma os detalhes se precisar.",
-        ),
+        aniversario=TEXTO_ANIVERSARIO_OBRIGATORIO,
         regras_reservas_imediatas=_texto_env(
             "RESTAURANTE_REGRAS_RESERVAS_IMEDIATAS",
             "Reservas em cima da hora precisam de confirmacao da equipe.",
@@ -333,7 +342,7 @@ def _obter_config_supabase() -> ConfigRestaurante | None:
         politica_cancelamento=politica_cancelamento,
         telefone_atendimento=_texto(estabelecimento.get("telefone")) or fallback.telefone_atendimento,
         estacionamento=_conteudo_faq(faq_conteudos, "estacionamento") or fallback.estacionamento,
-        aniversario=_conteudo_faq(faq_conteudos, "aniversario") or fallback.aniversario,
+        aniversario=TEXTO_ANIVERSARIO_OBRIGATORIO,
         regras_reservas_imediatas=instrucoes_reserva or fallback.regras_reservas_imediatas,
         informacoes_gerais=fallback.informacoes_gerais,
         whatsapp=_texto(estabelecimento.get("whatsapp")) or fallback.whatsapp,
