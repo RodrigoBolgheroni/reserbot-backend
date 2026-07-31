@@ -932,7 +932,11 @@ class InformacoesAniversarioTest(unittest.TestCase):
         self.assertEqual(agente.obter_estado_reserva(TELEFONE)["campo_pendente"], "horario")
 
     @patch.object(fluxo_reservas.config_restaurante, "obter_config", return_value=_config_praia())
-    def test_guardrail_final_insere_aniversario_antes_do_comprovante(self, _config) -> None:
+    def test_guardrail_nao_insere_aniversario_diretamente_delegado_ao_fluxo(self, _config) -> None:
+        """O guardrail de aniversario NAO insere o bloco diretamente.
+        A insercao e responsabilidade exclusiva de _aplicar_fluxo_comprovante.
+        O guardrail somente registra a flag quando a IA gerou o bloco corretamente.
+        """
         agente.definir_estado_reserva(
             TELEFONE,
             _estado_completo(
@@ -943,6 +947,7 @@ class InformacoesAniversarioTest(unittest.TestCase):
                 informacoes_aniversario_apresentadas=False,
             ),
         )
+        # Texto da IA NAO contem o bloco de aniversario
         resposta = fluxo_reservas._aplicar_guardrail_aniversario_backend(
             telefone=TELEFONE,
             mensagem_cliente="Quero reservar",
@@ -950,8 +955,12 @@ class InformacoesAniversarioTest(unittest.TestCase):
             resposta=_resposta(texto="Envie a imagem ou o PDF do comprovante."),
         )
 
-        self.assertLess(resposta["texto"].index("Como é aniversário"), resposta["texto"].index("comprovante"))
-        self.assertTrue(agente.obter_estado_reserva(TELEFONE)["informacoes_aniversario_apresentadas"])
+        # Guardrail nao deve inserir o bloco (delegado ao _aplicar_fluxo_comprovante)
+        self.assertNotIn("Como aniversario", resposta["texto"].lower().replace("\u00e9", "e"))
+        # Texto original deve ser preservado
+        self.assertIn("comprovante", resposta["texto"].lower())
+        # Flag NAO deve ter sido marcada (a IA nao gerou o bloco)
+        self.assertFalse(agente.obter_estado_reserva(TELEFONE)["informacoes_aniversario_apresentadas"])
 
     def test_guardrail_substitui_handoff_mas_preserva_decoracao_especifica(self) -> None:
         generico = fluxo_reservas._substituir_handoff_generico_aniversario(

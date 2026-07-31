@@ -623,7 +623,7 @@ def _aplicar_fluxo_comprovante(
         )
         estado["regra_horario_sem_preferencia_apresentada"] = True
 
-    if _conversa_de_aniversario(conversa, estado) and not estado.get("informacoes_aniversario_apresentadas"):
+    if _deve_apresentar_informacoes_aniversario(conversa, estado):
         partes.append(_texto_aniversario_config(config))
         estado["informacoes_aniversario_apresentadas"] = True
 
@@ -749,56 +749,88 @@ def _conversa_de_aniversario(conversa: Mapping[str, Any], estado: Mapping[str, A
     return any("anivers" in _normalizar_texto(str(valor or "")) for valor in valores)
 
 
-def _aplicar_guardrail_aniversario_backend(
-    *,
-    telefone: str,
-    mensagem_cliente: str,
+def _deve_apresentar_informacoes_aniversario(
     conversa: Mapping[str, Any],
-    resposta: agente.RespostaAgente,
-) -> agente.RespostaAgente:
-    estado = agente.obter_estado_reserva(telefone) or {}
-    categoria = agente._categoria_pergunta_restaurante(mensagem_cliente)
-    texto = str(resposta.get("texto") or "").strip()
+    estado: Mapping[str, Any],
+) -> bool:
+    """Condição centralizada e única para apresentação automática das informações de aniversário.
 
-    if (
-        categoria is None
-        and _conversa_de_aniversario(conversa, estado)
-        and re.search(r"\blista\b", _normalizar_texto(mensagem_cliente))
-    ):
-        categoria = "lista_aniversario"
-    if categoria in {
-        "lista_aniversario",
-        "bolo_aniversario",
-        "geladeira_aniversario",
-        "utensilios_aniversario",
-        "aniversario",
-    }:
-        texto = agente._texto_pergunta_restaurante(categoria, estado)
-
-    contexto_aniversario = _conversa_de_aniversario(conversa, estado)
-    if contexto_aniversario:
-        estado["contexto_aniversario"] = True
-        texto_antes_guardrail = texto
-        texto = _substituir_handoff_generico_aniversario(texto, categoria=categoria)
-        if texto != texto_antes_guardrail:
-            continuacao = agente._continuacao_fluxo_apos_informacao(estado)
-            if continuacao and continuacao not in texto:
-                texto = f"{texto} {continuacao}"
-        if (
-            not estado.get("informacoes_aniversario_apresentadas")
-            and str(estado.get("etapa") or "") == "aguardando_comprovante"
-            and estado.get("informacoes_pagamento_apresentadas")
-        ):
-            texto_aniversario = _texto_aniversario_config(config_restaurante.obter_config())
-            if texto_aniversario not in texto:
-                texto = f"{texto_aniversario}\n\n{texto}".strip()
-            estado["informacoes_aniversario_apresentadas"] = True
-        agente.definir_estado_reserva(telefone, estado)
-
-    return {**resposta, "texto": texto}
+    Exige que conversa seja de aniversário, flag ainda não setada, todos os campos
+    estruturais preenchidos e direcionamento obrigatório de espaço já resolvido.
+    """
+    if not _conversa_de_aniversario(conversa, estado):
+        return False
+    if estado.get("informacoes_aniversario_apresentadas"):
+        return False
+    if not str(estado.get("data_reserva") or "").strip():
+        return False
+    if not str(estado.get("horario") or "").strip():
+        return False
+    if not estado.get("pessoas"):
+        return False
+    # Direcionamento obrigatório de espaço pendente impede apresentação antes do aceite
+    if estado.get("regra_espaco_obrigatoria") and not estado.get("cliente_autorizou_espaco_direcionado"):
+        return False
+    return True
 
 
+def _texto_contem_informacoes_aniversario(texto: str) -> bool:
+    """Verifica se o texto já contém as quatro informações obrigatórias de aniversário
+    (lista, bolo, geladeira, utensílios). Usado para detectar quando a IA gerou o bloco
+    completo e apenas precisamos registrar a flag, sem inserir novamente.
+    """
+    normalizado = _normalizar_texto(texto)
+    tem_lista = bool(
+        re.search(r"\b(nao\s+trabalh\w*\s+com\s+lista|sem\s+lista)\b", normalizado)
+    )
+    tem_bolo = bool(re.search(r"\bbolo\b", normalizado))
+    tem_geladeira = bool(re.search(r"\bgeladeira\b", normalizado))
+    tem_utensilios = bool(re.search(r"\b(pratos?|garfos?|talher|talheres|utensilio|utensilios)\b", normalizado))
+    return tem_lista and tem_bolo and tem_geladeira and tem_utensilios
+
+
+def _remover_informacoes_aniversario_prematuras(texto: str, estado: Mapping[str, Any]) -> str:
+    """Remove o bloco completo das quatro informações de aniversário quando inserido
+    prematuramente (antes que todos os campos estruturais estejam resolvidos).
+
+    Retorna a continuação natural do fluxo de coleta (campo pendente).
+    Se o texto não contiver o bloco completo, retorna o texto original.
+    """
+    if not _texto_contem_informacoes_aniversario(texto):
+        return texto
+    continuacao = agente._continuacao_fluxo_apos_informacao(estado)
+    return continuacao or "Que ótimo! Me fala o dia que você quer reservar."
+
+
+def _corrigir_handoff_aniversario_prematuro(texto: str, estado: Mapping[str, Any]) -> str:
+    """Quando a IA sugere 'confirmar bolo/lista com a equipe' prematuramente (handoff
+    incorreto), substitui por uma continuação neutra do fluxo sem revelar as regras.
+
+    Diferente de _substituir_handoff_generico_aniversario, esta função nunca insere
+    TEXTO_ANIVERSARIO_OBRIGATORIO — apenas devolve o campo pendente da coleta.
+    """
+    normalizado = _normalizar_texto(texto)
+    menciona_operacao = bool(
+        re.search(
+            r"\b(bolo|lista|geladeira|refriger\w*|prato|pratos|garfo|garfos|talher|talheres|utensilio|utensilios)\b",
+            normalizado,
+        )
+    )
+    handoff_generico = bool(
+        re.search(r"\b(confirm|verific|consult|falar).{0,50}\b(equipe|restaurante|atendente)\b", normalizado)
+        or re.search(r"\b(equipe|restaurante|atendente).{0,50}\b(confirm|verific|consult)\b", normalizado)
+    )
+    if menciona_operacao and handoff_generico:
+        continuacao = agente._continuacao_fluxo_apos_informacao(estado)
+        return continuacao or "Me fala o dia que você quer reservar."
+    return texto
+
+
+# Mantida por compatibilidade; não é mais chamada pelo guardrail principal.
 def _substituir_handoff_generico_aniversario(texto: str, *, categoria: str | None) -> str:
+    """Legado: substituía handoff genérico pelo TEXTO_ANIVERSARIO_OBRIGATORIO completo.
+    Use _corrigir_handoff_aniversario_prematuro para comportamento sem inserção prematura.
+    """
     if categoria == "decoracao_aniversario":
         return texto
     normalizado = _normalizar_texto(texto)
@@ -815,6 +847,103 @@ def _substituir_handoff_generico_aniversario(texto: str, *, categoria: str | Non
     if menciona_operacao and handoff_generico:
         return config_restaurante.TEXTO_ANIVERSARIO_OBRIGATORIO
     return texto
+
+
+# ---------------------------------------------------------------------------
+# Guardrail de aniversário (backend)
+#
+# Ponto único de decisão pós-agente para conversas de aniversário:
+#   – Perguntas explícitas → resposta individual, flag NÃO marcada.
+#   – Bloco prematuro (completo ou handoff) → removido, continuação do fluxo.
+#   – Momento correto (IA gerou) → apenas registra flag, sem duplicar.
+#   – Inserção automática → delegada exclusivamente a _aplicar_fluxo_comprovante.
+# ---------------------------------------------------------------------------
+_CATEGORIAS_ANIVERSARIO_INDIVIDUAIS: frozenset[str] = frozenset({
+    "lista_aniversario",
+    "bolo_aniversario",
+    "geladeira_aniversario",
+    "utensilios_aniversario",
+    # NOTA: "aniversario" genérico não está aqui — é intenção de fluxo (cliente quer
+    # reservar aniversário), não pergunta operacional. Cai no caminho de prematuridade.
+})
+
+
+def _aplicar_guardrail_aniversario_backend(
+    *,
+    telefone: str,
+    mensagem_cliente: str,
+    conversa: Mapping[str, Any],
+    resposta: agente.RespostaAgente,
+) -> agente.RespostaAgente:
+    estado = agente.obter_estado_reserva(telefone) or {}
+    categoria = agente._categoria_pergunta_restaurante(mensagem_cliente)
+    texto = str(resposta.get("texto") or "").strip()
+
+    # Corrigir categoria "lista" sem marcador de pergunta em conversa de aniversário
+    if (
+        categoria is None
+        and _conversa_de_aniversario(conversa, estado)
+        and re.search(r"\blista\b", _normalizar_texto(mensagem_cliente))
+    ):
+        categoria = "lista_aniversario"
+
+    # --- Caso 1: Pergunta EXPLÍCITA do cliente sobre detalhes de aniversário ---
+    # Responder individualmente com o texto específico (lista, bolo, geladeira, utensílios).
+    # NÃO marcar informacoes_aniversario_apresentadas — o bloco completo das 4 informações
+    # será apresentado automaticamente no momento correto por _aplicar_fluxo_comprovante.
+    if categoria in _CATEGORIAS_ANIVERSARIO_INDIVIDUAIS:
+        texto_individual = agente._texto_pergunta_restaurante(categoria, estado)
+        if _conversa_de_aniversario(conversa, estado):
+            estado["contexto_aniversario"] = True
+            agente.definir_estado_reserva(telefone, estado)
+        return {**resposta, "texto": texto_individual}
+
+    # --- A partir daqui: não é pergunta explícita sobre detalhes de aniversário ---
+    if not _conversa_de_aniversario(conversa, estado):
+        return {**resposta, "texto": texto}
+
+    estado["contexto_aniversario"] = True
+
+    # Flag já setada (pelo _aplicar_fluxo_comprovante desta mesma mensagem ou de mensagem
+    # anterior) → o bloco foi apresentado corretamente; não interferir no texto.
+    if estado.get("informacoes_aniversario_apresentadas"):
+        agente.definir_estado_reserva(telefone, estado)
+        return {**resposta, "texto": texto}
+
+    deve_apresentar = _deve_apresentar_informacoes_aniversario(conversa, estado)
+
+    if deve_apresentar:
+        # Momento correto de apresentação.
+        # _aplicar_fluxo_comprovante é o ponto de inserção; ao rodar antes deste
+        # guardrail, já setou a flag para True (lida acima) ou inseriu o texto.
+        # Se a IA gerou as 4 informações espontaneamente de forma correta, apenas
+        # registrar a flag para evitar duplicação futura.
+        if _texto_contem_informacoes_aniversario(texto):
+            estado["informacoes_aniversario_apresentadas"] = True
+            logger.info(
+                "Guardrail reconheceu informacoes de aniversario geradas pela IA no momento correto. telefone=%s",
+                telefone,
+            )
+    else:
+        # Ainda em coleta: corrigir qualquer conteúdo de aniversário inserido prematuramente.
+
+        # Passo 1 — bloco completo das 4 informações (IA espontânea ou handoff já substituído)
+        texto_corrigido = _remover_informacoes_aniversario_prematuras(texto, estado)
+
+        # Passo 2 — handoff incorreto ("confirmar com a equipe") sem o bloco completo
+        if texto_corrigido == texto:
+            texto_corrigido = _corrigir_handoff_aniversario_prematuro(texto, estado)
+
+        if texto_corrigido != texto:
+            logger.info(
+                "Guardrail removeu conteudo de aniversario prematuro. telefone=%s categoria=%s",
+                telefone,
+                categoria,
+            )
+            texto = texto_corrigido
+
+    agente.definir_estado_reserva(telefone, estado)
+    return {**resposta, "texto": texto}
 
 
 def _mensagem_informa_pagamento_sem_midia(texto: str) -> bool:
