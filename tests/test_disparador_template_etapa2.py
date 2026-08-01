@@ -18,6 +18,7 @@ class TestDisparadorTemplateEtapa2(unittest.TestCase):
             "telefone": "5511999991111",
             "data_nascimento": "1995-10-20",
             "categoria": "m",
+            "perfil_id": "perf-m-25-35",
             "ativo": True,
             "autoriza_marketing": True,
             "opt_out": False,
@@ -48,7 +49,7 @@ class TestDisparadorTemplateEtapa2(unittest.TestCase):
 
     # 3. template não é escolhido manualmente
     def test_03_template_nao_escolhido_manualmente(self):
-        cli = self._cliente_valido(categoria="f", data_nascimento="2005-02-10")
+        cli = self._cliente_valido(categoria="f", data_nascimento="2005-02-10", perfil_id="perf-f-18-24")
         with patch.object(whatsapp, "enviar_template", return_value={"ok": True, "provider_message_id": "wamid.123"}):
             with patch.object(disparador, "_disparo_ja_registrado_supabase", return_value=False), patch.object(disparador, "_registrar_disparo_supabase"):
                 with patch.object(fluxo_reservas, "iniciar_conversa", return_value={"id": "conv-100"}):

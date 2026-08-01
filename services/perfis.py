@@ -29,15 +29,23 @@ def listar_perfis(*, ativos: bool | None = None, tabela: str | None = None) -> l
     tabela_final = tabela or _tabela_perfis()
     filtros = {"ativo": f"eq.{str(ativos).lower()}"} if ativos is not None else None
     resultado = supabase.selecionar(tabela_final, filtros=filtros)
-    if not resultado.get("ok"):
-        logger.warning("Nao foi possivel listar perfis de clientes: %s", resultado.get("erro"))
-        return []
 
-    dados = resultado.get("data")
-    if not isinstance(dados, list):
-        return []
+    dados = []
+    if resultado.get("ok") and isinstance(resultado.get("data"), list):
+        dados = resultado.get("data")
 
     perfis = [_normalizar_perfil_bruto(perfil) for perfil in dados if isinstance(perfil, dict)]
+
+    from services.templates_aniversario import PERFIS_ANIVERSARIO_PADRAO
+
+    nomes_existentes = {p.get("nome", "").casefold() for p in perfis}
+    ids_existentes = {p.get("id") for p in perfis if p.get("id")}
+
+    for padrao in PERFIS_ANIVERSARIO_PADRAO:
+        if padrao.get("nome", "").casefold() not in nomes_existentes and padrao.get("id") not in ids_existentes:
+            if ativos is None or padrao.get("ativo", True) == ativos:
+                perfis.append(dict(padrao))
+
     return sorted(perfis, key=lambda perfil: perfil.get("nome", "").casefold())
 
 
@@ -51,10 +59,18 @@ def buscar_perfil(perfil_id: str, *, tabela: str | None = None) -> PerfilCliente
         filtros={"id": f"eq.{perfil_id_limpo}"},
         limite=1,
     )
-    if not resultado.get("ok"):
-        logger.warning("Nao foi possivel buscar perfil %s: %s", perfil_id_limpo, resultado.get("erro"))
-        return None
-    return _primeiro_perfil(resultado.get("data"))
+    if resultado.get("ok"):
+        p = _primeiro_perfil(resultado.get("data"))
+        if p:
+            return p
+
+    from services.templates_aniversario import PERFIS_ANIVERSARIO_PADRAO
+
+    for padrao in PERFIS_ANIVERSARIO_PADRAO:
+        if padrao.get("id") == perfil_id_limpo or padrao.get("nome", "").casefold() == perfil_id_limpo.casefold():
+            return dict(padrao)
+
+    return None
 
 
 def buscar_perfil_por_nome(nome: str, *, tabela: str | None = None) -> PerfilCliente | None:
@@ -67,10 +83,18 @@ def buscar_perfil_por_nome(nome: str, *, tabela: str | None = None) -> PerfilCli
         filtros={"nome": f"eq.{nome_limpo}"},
         limite=1,
     )
-    if not resultado.get("ok"):
-        logger.warning("Nao foi possivel buscar perfil %s: %s", nome_limpo, resultado.get("erro"))
-        return None
-    return _primeiro_perfil(resultado.get("data"))
+    if resultado.get("ok"):
+        p = _primeiro_perfil(resultado.get("data"))
+        if p:
+            return p
+
+    from services.templates_aniversario import PERFIS_ANIVERSARIO_PADRAO
+
+    for padrao in PERFIS_ANIVERSARIO_PADRAO:
+        if padrao.get("nome", "").casefold() == nome_limpo.casefold():
+            return dict(padrao)
+
+    return None
 
 
 def salvar_perfil(perfil: Mapping[str, Any], *, tabela: str | None = None) -> ResultadoPerfil:
@@ -172,7 +196,8 @@ def classificar_cliente(
     if not perfis_ativos:
         return None
 
-    idade = mensagens.calcular_idade(cliente.get("data_nascimento"), cliente.get("idade"))
+    data_nasc = cliente.get("data_nascimento") or (cliente.get("metadata") if isinstance(cliente.get("metadata"), Mapping) else {}).get("data_nascimento")
+    idade = mensagens.calcular_idade(data_nasc, cliente.get("idade"))
     texto_cliente = _normalizar_texto(" ".join(_valores_cliente(cliente)))
     frequencia = _frequencia_cliente(cliente)
     historico_consumo = _historico_consumo(cliente)
@@ -259,14 +284,24 @@ def _pontuar_perfil(
     )
     score = 0
 
-    idade_min = _int_opcional(criterios.get("idade_min") if isinstance(criterios, dict) else None)
-    idade_max = _int_opcional(criterios.get("idade_max") if isinstance(criterios, dict) else None)
+    idade_min = _int_opcional(criterios.get("idade_minima") or criterios.get("idade_min") if isinstance(criterios, dict) else None)
+    idade_max = _int_opcional(criterios.get("idade_maxima") or criterios.get("idade_max") if isinstance(criterios, dict) else None)
     if idade_min is None and idade_max is None:
         idade_min, idade_max = _extrair_faixa_idade(texto_perfil)
     if idade is not None and (idade_min is not None or idade_max is not None):
         dentro_min = idade_min is None or idade >= idade_min
         dentro_max = idade_max is None or idade <= idade_max
-        score += 8 if dentro_min and dentro_max else -4
+        score += 10 if dentro_min and dentro_max else -10
+
+    # Sexo / Categoria
+    from services.templates_aniversario import extrair_categoria_perfil_ou_cliente, normalizar_categoria
+    cat_cli = extrair_categoria_perfil_ou_cliente(cliente)
+    cat_perf = normalizar_categoria(criterios.get("categoria_template") or criterios.get("sexo") or criterios.get("categoria"))
+    if cat_cli and cat_perf:
+        if cat_cli == cat_perf:
+            score += 10
+        else:
+            score -= 20
 
     if idade is not None:
         if "jovem" in texto_perfil and idade <= 30:
@@ -329,12 +364,19 @@ def _normalizar_criterios(valor: Any) -> dict[str, Any]:
     else:
         criterios.pop("texto", None)
 
-    for campo in ("idade_min", "idade_max", "frequencia_min"):
+    for campo in ("idade_min", "idade_max", "idade_minima", "idade_maxima", "frequencia_min"):
         numero = _int_opcional(criterios.get(campo))
         if numero is None:
             criterios.pop(campo, None)
         else:
             criterios[campo] = numero
+
+    if "configuracao_aniversario" in criterios and isinstance(criterios["configuracao_aniversario"], dict):
+        criterios["configuracao_aniversario"] = dict(criterios["configuracao_aniversario"])
+
+    for campo in ("categoria_template", "sexo", "categoria", "tom_assistente"):
+        if campo in criterios and criterios[campo] is not None:
+            criterios[campo] = str(criterios[campo]).strip()
 
     palavras = criterios.get("palavras_chave")
     if isinstance(palavras, str):
