@@ -1209,7 +1209,7 @@ def _finalizar_mensagens_debounce_persistidas(metadata: Mapping[str, Any]) -> No
 
 def _carregar_estado_reserva_conversa(conversa: Mapping[str, Any], telefone: str) -> None:
     metadata = _metadata_conversa(conversa)
-    estado = metadata.get("estado_reserva")
+    estado = metadata.get("estado_reserva") or metadata.get("snapshot_estado_reserva")
     conversa_id = str(conversa.get("id") or "")
     logger.info(
         "DIAG_RESERVA estado_carregado_antes telefone=%s conversa_id=%s metadata_estado=%s cache_memoria=%s",
@@ -1218,21 +1218,20 @@ def _carregar_estado_reserva_conversa(conversa: Mapping[str, Any], telefone: str
         estado if isinstance(estado, Mapping) else {},
         agente.obter_estado_reserva(telefone),
     )
-    if isinstance(estado, Mapping):
+    if isinstance(estado, Mapping) and estado:
         contexto_aniversario = _conversa_de_aniversario(conversa, estado)
-        agente.definir_estado_reserva(
-            telefone,
-            {
-                **dict(estado),
-                "conversa_id": conversa_id,
-                "origem_conversa": str(conversa.get("origem") or estado.get("origem_conversa") or ""),
-                "contexto_aniversario": contexto_aniversario,
-                "informacoes_aniversario_apresentadas": bool(
-                    estado.get("informacoes_aniversario_apresentadas")
-                    or metadata.get("informacoes_aniversario_apresentadas")
-                ),
-            },
-        )
+        estado_restaurado = {
+            **dict(estado),
+            "conversa_id": conversa_id,
+            "origem_conversa": str(conversa.get("origem") or estado.get("origem_conversa") or ""),
+            "contexto_aniversario": contexto_aniversario,
+            "informacoes_aniversario_apresentadas": bool(
+                estado.get("informacoes_aniversario_apresentadas")
+                or metadata.get("informacoes_aniversario_apresentadas")
+            ),
+        }
+        agente._limpar_e_recalcular_regras_derivadas(estado_restaurado)
+        agente.definir_estado_reserva(telefone, estado_restaurado)
         logger.info("Estado de reserva carregado da conversa %s para telefone=%s.", conversa_id, telefone)
         return
 
@@ -1263,7 +1262,8 @@ def _salvar_estado_reserva_conversa(
         return
     estado["conversa_id"] = str(conversa.get("id") or "")
     metadata = _metadata_conversa(conversa)
-    metadata["estado_reserva"] = estado
+    metadata["estado_reserva"] = dict(estado)
+    metadata["snapshot_estado_reserva"] = dict(estado)
     metadata["contexto_aniversario"] = bool(estado.get("contexto_aniversario"))
     metadata["informacoes_aniversario_apresentadas"] = bool(
         estado.get("informacoes_aniversario_apresentadas")
@@ -1282,11 +1282,14 @@ def _salvar_estado_reserva_conversa(
 
 def _limpar_estado_reserva_conversa(conversa: Mapping[str, Any], telefone: str) -> None:
     metadata = _metadata_conversa(conversa)
-    if "estado_reserva" not in metadata and "dados_reserva" not in metadata:
+    if "estado_reserva" not in metadata and "snapshot_estado_reserva" not in metadata and "dados_reserva" not in metadata:
         return
     metadata.pop("estado_reserva", None)
+    metadata.pop("snapshot_estado_reserva", None)
     metadata.pop("dados_reserva", None)
     metadata["estado_reserva_finalizado_em"] = _agora()
+    if isinstance(conversa, dict):
+        conversa["metadata"] = metadata
     _atualizar_metadata_conversa(conversa, metadata)
     agente.limpar_historico(telefone)
 
