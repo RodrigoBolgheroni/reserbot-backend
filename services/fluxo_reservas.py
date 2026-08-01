@@ -242,8 +242,8 @@ def processar_resposta_cliente(
     )
     if _pediu_atendimento_humano(mensagem_limpa):
         atualizar_status_conversa(conversa_atual, status="humano")
-        _limpar_estado_reserva_conversa(conversa_atual, telefone_limpo)
-        logger.info("Bot pausado por pedido de humano. telefone=%s", telefone_limpo)
+        _salvar_estado_reserva_conversa(conversa_atual, telefone_limpo, resposta={"status_reserva": "humano"})
+        logger.info("Bot pausado por pedido de humano (snapshot preservado). telefone=%s", telefone_limpo)
         return {
             "texto": "",
             "reserva_confirmada": False,
@@ -384,8 +384,8 @@ def processar_resposta_cliente(
     if resposta.get("status_reserva") == "aguardando_humano":
         atualizar_status_conversa(conversa_atual, status="aguardando_humano")
         agente.limpar_historico(telefone_limpo)
-        _limpar_estado_reserva_conversa(conversa_atual, telefone_limpo)
-        logger.info("Bot pausado para atendimento humano. telefone=%s motivo=%s", telefone_limpo, resposta.get("status_reserva"))
+        _salvar_estado_reserva_conversa(conversa_atual, telefone_limpo, resposta=resposta)
+        logger.info("Bot pausado para atendimento humano (snapshot preservado). telefone=%s motivo=%s", telefone_limpo, resposta.get("status_reserva"))
         return resposta
 
     if resposta.get("status_reserva") == "sem_interesse":
@@ -1277,6 +1277,8 @@ def _salvar_estado_reserva_conversa(
         estado,
         resposta.get("status_reserva", ""),
     )
+    if isinstance(conversa, dict):
+        conversa["metadata"] = metadata
     _atualizar_metadata_conversa(conversa, metadata)
 
 

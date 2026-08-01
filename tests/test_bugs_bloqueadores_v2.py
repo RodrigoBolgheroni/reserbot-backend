@@ -311,6 +311,33 @@ class BugsBloqueadoresV2Test(unittest.TestCase):
             self.assertEqual(est_depois.get("data_reserva"), "2026-08-06")
             self.assertEqual(est_depois.get("pessoas"), 15)
 
+    def test_atendimento_humano_preserva_snapshot_e_dados_coletados(self):
+        cfg = _config_teste()
+        conversa = {
+            "id": "conv-humano",
+            "origem": "aniversario",
+            "status": "bot_ativo",
+            "metadata": {
+                "estado_reserva": {
+                    "data_reserva": "2026-08-06",
+                    "horario": "13:00",
+                    "pessoas": 15,
+                }
+            },
+        }
+        agente.definir_estado_reserva(TELEFONE, {"data_reserva": "2026-08-06", "horario": "13:00", "pessoas": 15})
+
+        with patch.object(config_restaurante, "obter_config", return_value=cfg), patch.object(fluxo_reservas, "_atualizar_metadata_conversa"):
+            fluxo_reservas.processar_resposta_cliente(
+                telefone=TELEFONE,
+                mensagem_cliente="Quero falar com a atendente",
+                conversa=conversa,
+            )
+            meta = conversa["metadata"]
+            self.assertIn("snapshot_estado_reserva", meta)
+            self.assertEqual(meta["snapshot_estado_reserva"].get("data_reserva"), "2026-08-06")
+            self.assertEqual(meta["snapshot_estado_reserva"].get("pessoas"), 15)
+
 
 if __name__ == "__main__":
     unittest.main()
