@@ -162,6 +162,26 @@ def buscar_cliente_por_telefone(telefone: str, *, tabela: str | None = None) -> 
     return None
 
 
+def buscar_cliente_por_id(cliente_id: str, *, tabela: str | None = None) -> dict[str, Any] | None:
+    cliente_id_limpo = _texto(cliente_id)
+    if not cliente_id_limpo:
+        return None
+
+    tabela_final = tabela or supabase.tabela_env("SUPABASE_CLIENTES_TABLE", DEFAULT_TABLE)
+    resultado = supabase.selecionar(
+        tabela_final,
+        filtros={"id": f"eq.{cliente_id_limpo}"},
+        limite=1,
+    )
+    if not resultado.get("ok"):
+        logger.warning("Nao foi possivel buscar cliente por id %s: %s", cliente_id_limpo, resultado.get("erro"))
+        return None
+    dados = resultado.get("data")
+    if isinstance(dados, list) and dados and isinstance(dados[0], dict):
+        return dados[0]
+    return None
+
+
 def listar_clientes(
     *,
     tabela: str | None = None,

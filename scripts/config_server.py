@@ -19,7 +19,7 @@ ROOT_DIR: Final[Path] = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from services import clientes_supabase, comprovantes_reserva, configuracoes_admin, conversas_supabase, disparador, fluxo_reservas, pdf_clientes, perfis, whatsapp_cloud
+from services import clientes_supabase, comprovantes_reserva, configuracoes_admin, conversas_supabase, disparador, fluxo_reservas, pdf_clientes, perfis, templates_aniversario, whatsapp_cloud
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +131,9 @@ class ConfigHandler(BaseHTTPRequestHandler):
             return
         if rota == "/api/perfis/ativar":
             self._ativar_perfil()
+            return
+        if rota in {"/api/perfis/template-previa", "/api/templates/aniversario/previa"}:
+            self._previa_template_aniversario()
             return
         if rota == "/api/disparos/aniversarios":
             self._disparar_aniversarios()
@@ -607,6 +610,38 @@ class ConfigHandler(BaseHTTPRequestHandler):
             self._responder_json(resultado, status=HTTPStatus.BAD_REQUEST)
             return
         self._responder_json(resultado)
+
+    def _previa_template_aniversario(self) -> None:
+        try:
+            payload = self._ler_json_body()
+            if not isinstance(payload, dict):
+                payload = {}
+        except ValueError as erro:
+            self._responder_erro(HTTPStatus.BAD_REQUEST, str(erro))
+            return
+
+        dados_cliente = dict(payload)
+        cliente_id = str(payload.get("cliente_id") or payload.get("id") or "").strip()
+        telefone = str(payload.get("telefone") or "").strip()
+
+        if cliente_id:
+            cliente_banco = clientes_supabase.buscar_cliente_por_id(cliente_id)
+            if cliente_banco:
+                dados_cliente = {**cliente_banco, **dados_cliente}
+        elif telefone:
+            cliente_banco = clientes_supabase.buscar_cliente_por_telefone(telefone)
+            if cliente_banco:
+                dados_cliente = {**cliente_banco, **dados_cliente}
+
+        data_referencia = payload.get("data_referencia")
+        bloco_campanha = payload.get("bloco_campanha") or payload.get("bloco")
+
+        resultado = templates_aniversario.selecionar_template_aniversario(
+            dados_cliente,
+            data_referencia=data_referencia,
+            bloco_campanha=bloco_campanha,
+        )
+        self._responder_json({"ok": True, "previa": resultado})
 
     def _disparar_aniversarios(self) -> None:
         try:
