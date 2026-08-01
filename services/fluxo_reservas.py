@@ -5,7 +5,7 @@ import os
 import re
 import threading
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, TypedDict
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -2231,6 +2231,62 @@ def processar_status_whatsapp(status: Mapping[str, Any]) -> dict[str, Any]:
         "status_interno": status_interno,
         "atualizacoes": atualizacoes,
     }
+
+
+STATUS_WHATSAPP_RANK: dict[str, int] = {
+    "preparando": 1,
+    "pendente": 1,
+    "enviado": 2,
+    "entregue": 3,
+    "lido": 4,
+    "respondido": 5,
+    "falhou": 99,
+}
+
+
+def _status_whatsapp_rank(status: str) -> int:
+    return STATUS_WHATSAPP_RANK.get(str(status or "").strip().lower(), 0)
+
+
+def _marcar_disparo_respondido_se_necessario(conversa: Mapping[str, Any], telefone: str) -> None:
+    meta = conversa.get("metadata") if isinstance(conversa.get("metadata"), Mapping) else {}
+    if meta.get("contexto_aniversario") or conversa.get("origem") == "aniversario":
+        tel_limpo = str(telefone or "").strip()
+        tabela = _tabela_disparos()
+        resultado = supabase.selecionar(
+            tabela,
+            colunas="id,metadata,status",
+            filtros={
+                "telefone": f"eq.{tel_limpo}",
+                "tipo_disparo": "eq.aniversario",
+            },
+            limite=1,
+            order="created_at.desc",
+        )
+        if resultado.get("ok") and isinstance(resultado.get("data"), list) and resultado["data"]:
+            item = resultado["data"][0]
+            meta_item = dict(item.get("metadata") or {})
+            meta_item["respondido"] = True
+            meta_item["respondido_em"] = datetime.now(timezone.utc).isoformat()
+            supabase.atualizar(
+                tabela,
+                {"status": "respondido", "metadata": meta_item},
+                filtros={"id": f"eq.{item.get('id')}"},
+                retornar=False,
+            )
+
+
+def _atualizar_janela_atendimento_cliente(conversa: Mapping[str, Any]) -> dict[str, Any]:
+    meta = dict(conversa.get("metadata") or {})
+    agora = datetime.now(timezone.utc)
+    ate = agora + timedelta(hours=24)
+    meta["ultima_mensagem_cliente_em"] = agora.isoformat()
+    meta["janela_atendimento_ate"] = ate.isoformat()
+    meta["janela_atendimento_ativa"] = True
+    if isinstance(conversa, dict):
+        conversa["metadata"] = meta
+    _atualizar_metadata_conversa(conversa, meta)
+    return meta
 
 
 def _buscar_conversa_debounce_raw(raw: Mapping[str, Any], telefone: str) -> Conversa | None:

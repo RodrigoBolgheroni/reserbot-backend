@@ -96,6 +96,100 @@ class WhatsAppCloudChannel:
                 "detalhe": str(erro),
             }
 
+    def enviar_template(
+        self,
+        telefone: str,
+        template_name: str,
+        primeiro_nome: str,
+        language: str = "pt_BR",
+        componentes: list[dict[str, Any]] | None = None,
+    ) -> ResultadoEnvioCanal:
+        telefone_limpo = normalizar_telefone(telefone)
+        if not telefone_limpo:
+            return {"ok": False, "telefone": telefone, "provider": self.provider, "erro": "telefone invalido"}
+        if not template_name.strip():
+            return {"ok": False, "telefone": telefone_limpo, "provider": self.provider, "erro": "nome do template obrigatorio"}
+
+        token = _access_token()
+        phone_id = _phone_number_id()
+        if not token or not phone_id:
+            return {
+                "ok": False,
+                "telefone": telefone_limpo,
+                "provider": self.provider,
+                "erro": "WhatsApp Cloud API nao configurada",
+            }
+
+        comp_final = componentes if componentes is not None else [
+            {
+                "type": "body",
+                "parameters": [
+                    {
+                        "type": "text",
+                        "text": primeiro_nome or "Cliente",
+                    }
+                ],
+            }
+        ]
+
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": telefone_limpo,
+            "type": "template",
+            "template": {
+                "name": template_name.strip(),
+                "language": {"code": language or "pt_BR"},
+                "components": comp_final,
+            },
+        }
+
+        request = Request(
+            f"https://graph.facebook.com/{_api_version()}/{phone_id}/messages",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+        )
+
+        try:
+            with urlopen(request, timeout=_timeout()) as response:
+                data = _ler_json(response.read().decode("utf-8"))
+                message_id = _extrair_message_id(data)
+                logger.info(
+                    "Template %s enviado pela WhatsApp Cloud API para %s. message_id=%s",
+                    template_name,
+                    telefone_limpo,
+                    message_id or "indisponivel",
+                )
+                return {
+                    "ok": True,
+                    "telefone": telefone_limpo,
+                    "provider": self.provider,
+                    "provider_message_id": message_id,
+                }
+        except HTTPError as erro:
+            detalhe = _ler_erro_http(erro)
+            logger.warning("WhatsApp Cloud API retornou HTTP %s ao enviar template %s: %s", erro.code, template_name, detalhe)
+            return {
+                "ok": False,
+                "telefone": telefone_limpo,
+                "provider": self.provider,
+                "erro": f"HTTP {erro.code}",
+                "detalhe": detalhe,
+            }
+        except (OSError, URLError) as erro:
+            logger.warning("Falha ao enviar template %s pela WhatsApp Cloud API: %s", template_name, erro)
+            return {
+                "ok": False,
+                "telefone": telefone_limpo,
+                "provider": self.provider,
+                "erro": "falha de conexao",
+                "detalhe": str(erro),
+            }
+
     def ler_ultima_mensagem(
         self,
         remetente_conhecido: str | None = None,

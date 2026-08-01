@@ -332,17 +332,21 @@ def _disparo_ja_registrado_supabase(
     data_referencia: date,
     *,
     tipo_disparo: str = "aniversario",
+    modo_teste: bool | None = False,
 ) -> bool:
     tabela = supabase.tabela_env("SUPABASE_DISPAROS_TABLE", DEFAULT_DISPAROS_TABLE)
+    filtros = {
+        "telefone": f"eq.{telefone}",
+        "tipo_disparo": f"eq.{tipo_disparo}",
+        "data_referencia": f"eq.{data_referencia.isoformat()}",
+    }
+    if modo_teste is not None:
+        filtros["modo_teste"] = f"eq.{str(modo_teste).lower()}"
+
     resultado = supabase.selecionar(
         tabela,
         colunas="id,status",
-        filtros={
-            "telefone": f"eq.{telefone}",
-            "tipo_disparo": f"eq.{tipo_disparo}",
-            "data_referencia": f"eq.{data_referencia.isoformat()}",
-            "modo_teste": "eq.false",
-        },
+        filtros=filtros,
         limite=1,
     )
     if not resultado.get("ok"):
@@ -362,8 +366,18 @@ def _registrar_disparo_supabase(
     envio: dict[str, Any],
     modo_teste: bool,
     tipo_disparo: str = "aniversario",
+    metadata_extra: dict[str, Any] | None = None,
 ) -> None:
     tabela = supabase.tabela_env("SUPABASE_DISPAROS_TABLE", DEFAULT_DISPAROS_TABLE)
+    metadata = {
+        "cliente_nome": cliente.get("nome", ""),
+        "perfil_id": cliente.get("perfil_id"),
+        "perfil_nome": cliente.get("perfil_nome"),
+        "dias_ate_aniversario": cliente.get("dias_ate_aniversario"),
+    }
+    if metadata_extra:
+        metadata.update(metadata_extra)
+
     payload = {
         "cliente_id": cliente.get("id") or None,
         "telefone": telefone,
@@ -375,16 +389,11 @@ def _registrar_disparo_supabase(
         "provider_message_id": envio.get("provider_message_id") or None,
         "erro": envio.get("erro") or envio.get("detalhe") or None,
         "modo_teste": bool(modo_teste),
-        "metadata": {
-            "cliente_nome": cliente.get("nome", ""),
-            "perfil_id": cliente.get("perfil_id"),
-            "perfil_nome": cliente.get("perfil_nome"),
-            "dias_ate_aniversario": cliente.get("dias_ate_aniversario"),
-        },
+        "metadata": metadata,
     }
     resultado = supabase.inserir(tabela, payload, retornar=False)
     if resultado.get("ok"):
-        logger.info("Disparo registrado em %s para telefone=%s modo_teste=%s.", tabela, telefone, modo_teste)
+        logger.info("Disparo registrado em %s para telefone=%s modo_teste=%s status=%s.", tabela, telefone, modo_teste, status)
     else:
         logger.warning(
             "Nao foi possivel registrar disparo em %s para telefone=%s: %s %s",
@@ -393,6 +402,222 @@ def _registrar_disparo_supabase(
             resultado.get("erro", ""),
             resultado.get("detalhe", ""),
         )
+
+
+def disparar_template_teste_individual(
+    cliente_ou_id: str | dict[str, Any],
+    *,
+    data_referencia: date | str | None = None,
+    bloco_campanha: str | None = None,
+    forcar_reenvio: bool = False,
+) -> dict[str, Any]:
+    if isinstance(cliente_ou_id, str):
+        cliente_id_ou_tel = cliente_ou_id.strip()
+        cliente = (
+            clientes_supabase.buscar_cliente_por_id(cliente_id_ou_tel)
+            or clientes_supabase.buscar_cliente_por_telefone(cliente_id_ou_tel)
+        )
+        if not cliente:
+            return {
+                "ok": False,
+                "status": "erro",
+                "motivo_bloqueio": "cliente_nao_encontrado",
+                "detalhe": "Cliente nao encontrado na base de dados.",
+            }
+    elif isinstance(cliente_ou_id, dict):
+        dados_input = dict(cliente_ou_id)
+        cid = str(dados_input.get("id") or dados_input.get("cliente_id") or "").strip()
+        tel = str(dados_input.get("telefone") or "").strip()
+        cliente = None
+        if cid:
+            cliente = clientes_supabase.buscar_cliente_por_id(cid)
+        if not cliente and tel:
+            cliente = clientes_supabase.buscar_cliente_por_telefone(tel)
+        if cliente:
+            cliente = {**cliente, **dados_input}
+        else:
+            cliente = dados_input
+    else:
+        return {
+            "ok": False,
+            "status": "erro",
+            "motivo_bloqueio": "cliente_invalido",
+            "detalhe": "Dados do cliente invalidos.",
+        }
+
+    if isinstance(data_referencia, date):
+        data_ref = data_referencia
+    elif isinstance(data_referencia, str) and data_referencia.strip():
+        try:
+            data_ref = date.fromisoformat(data_referencia.strip()[:10])
+        except ValueError:
+            data_ref = date.today()
+    else:
+        data_ref = date.today()
+
+    from services import templates_aniversario
+    selecao = templates_aniversario.selecionar_template_aniversario(
+        cliente,
+        data_referencia=data_ref,
+        bloco_campanha=bloco_campanha,
+    )
+
+    if not selecao.get("elegivel"):
+        return {
+            "ok": False,
+            "elegivel": False,
+            "status": "bloqueado",
+            "motivo_bloqueio": selecao.get("motivo_bloqueio"),
+            "detalhe": f"Perfil nao elegivel: {selecao.get('motivo_bloqueio')}",
+            "previa": selecao,
+        }
+
+    template_name = str(selecao.get("template_name") or "")
+    primeiro_nome = str(selecao.get("primeiro_nome") or "Cliente")
+    telefone_norm = str(selecao.get("telefone_normalizado") or "")
+
+    status_template = templates_aniversario.obter_status_template(template_name)
+    if status_template != "APPROVED":
+        return {
+            "ok": False,
+            "elegivel": True,
+            "status": "bloqueado",
+            "motivo_bloqueio": "template_nao_aprovado",
+            "detalhe": f"Template {template_name} com status '{status_template}' (esperado APPROVED)",
+            "template_name": template_name,
+            "status_template": status_template,
+        }
+
+    cliente_id = str(cliente.get("id") or "")
+    chave_idempotencia = f"{cliente_id}:{template_name}:{data_ref.isoformat()}:teste"
+    ja_enviado = _disparo_ja_registrado_supabase(telefone_norm, data_ref, tipo_disparo="aniversario", modo_teste=True)
+    if ja_enviado and not forcar_reenvio:
+        logger.info("Idempotencia: disparo de teste ja registrado hoje para %s", telefone_norm)
+        return {
+            "ok": False,
+            "status": "pulado",
+            "motivo_bloqueio": "idempotencia_bloqueado",
+            "detalhe": "Contato ja recebeu template de teste hoje. Use forcar_reenvio=True para reenvio forçado.",
+            "chave_idempotencia": chave_idempotencia,
+            "telefone_mascarado": f"{telefone_norm[:5]}****{telefone_norm[-4:]}" if len(telefone_norm) >= 9 else telefone_norm,
+        }
+
+    _registrar_disparo_supabase(
+        cliente=cliente,
+        telefone=telefone_norm,
+        data_referencia=data_ref,
+        mensagem=f"[Template: {template_name}] Olá {primeiro_nome}!",
+        status="preparando",
+        envio={"provider": "cloud"},
+        modo_teste=True,
+        tipo_disparo="aniversario",
+        metadata_extra={
+            "chave_idempotencia": chave_idempotencia,
+            "template_name": template_name,
+            "language": selecao.get("language", "pt_BR"),
+            "primeiro_nome": primeiro_nome,
+            "faixa": selecao.get("faixa"),
+            "categoria": selecao.get("categoria"),
+            "bloco": selecao.get("bloco"),
+            "forcar_reenvio": forcar_reenvio,
+        },
+    )
+
+    envio = whatsapp.enviar_template(
+        telefone=telefone_norm,
+        template_name=template_name,
+        primeiro_nome=primeiro_nome,
+        language=selecao.get("language", "pt_BR"),
+    )
+
+    tel_mascarado = f"{telefone_norm[:5]}****{telefone_norm[-4:]}" if len(telefone_norm) >= 9 else telefone_norm
+
+    if envio.get("ok"):
+        provider_message_id = str(envio.get("provider_message_id") or "")
+        _registrar_disparo_supabase(
+            cliente=cliente,
+            telefone=telefone_norm,
+            data_referencia=data_ref,
+            mensagem=f"[Template: {template_name}] Olá {primeiro_nome}!",
+            status="enviado",
+            envio=envio,
+            modo_teste=True,
+            tipo_disparo="aniversario",
+            metadata_extra={
+                "chave_idempotencia": chave_idempotencia,
+                "template_name": template_name,
+                "language": selecao.get("language", "pt_BR"),
+                "primeiro_nome": primeiro_nome,
+                "faixa": selecao.get("faixa"),
+                "categoria": selecao.get("categoria"),
+                "bloco": selecao.get("bloco"),
+                "forcar_reenvio": forcar_reenvio,
+            },
+        )
+
+        conversa_banco = fluxo_reservas.iniciar_conversa(
+            {
+                **cliente,
+                "telefone": telefone_norm,
+                "nome": cliente.get("nome") or primeiro_nome,
+            },
+            origem="aniversario",
+            mensagem_inicial=f"[Template: {template_name}] Olá {primeiro_nome}!",
+            metadata_conversa={
+                "contexto_aniversario": True,
+                "template_origem": template_name,
+                "provider_message_id": provider_message_id,
+                "janela_atendimento_ativa": False,
+            },
+        )
+
+        adicionar_conversa_ativa(
+            telefone=telefone_norm,
+            nome=str(cliente.get("nome") or primeiro_nome),
+            ultima_mensagem_cliente="__INIT__",
+            conversa_id=str(conversa_banco.get("id", "")),
+            perfil_id=str(cliente.get("perfil_id") or ""),
+            perfil_nome=str(cliente.get("perfil_nome") or ""),
+        )
+
+        return {
+            "ok": True,
+            "status": "enviado",
+            "telefone_mascarado": tel_mascarado,
+            "template_name": template_name,
+            "language": selecao.get("language", "pt_BR"),
+            "primeiro_nome": primeiro_nome,
+            "provider_message_id": provider_message_id,
+            "chave_idempotencia": chave_idempotencia,
+            "forcar_reenvio": forcar_reenvio,
+            "horario": datetime.now().isoformat(),
+        }
+
+    _registrar_disparo_supabase(
+        cliente=cliente,
+        telefone=telefone_norm,
+        data_referencia=data_ref,
+        mensagem=f"[Template: {template_name}] Olá {primeiro_nome}!",
+        status="falhou",
+        envio=envio,
+        modo_teste=True,
+        tipo_disparo="aniversario",
+        metadata_extra={
+            "chave_idempotencia": chave_idempotencia,
+            "template_name": template_name,
+            "erro": envio.get("erro"),
+            "detalhe": envio.get("detalhe"),
+        },
+    )
+
+    return {
+        "ok": False,
+        "status": "falhou",
+        "telefone_mascarado": tel_mascarado,
+        "template_name": template_name,
+        "erro": str(envio.get("erro") or "Falha ao enviar template pela WhatsApp Cloud API"),
+        "detalhe": str(envio.get("detalhe") or ""),
+    }
 
 
 def monitorar_respostas(parar_evento: threading.Event | None = None) -> None:

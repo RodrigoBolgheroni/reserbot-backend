@@ -135,6 +135,9 @@ class ConfigHandler(BaseHTTPRequestHandler):
         if rota in {"/api/perfis/template-previa", "/api/templates/aniversario/previa"}:
             self._previa_template_aniversario()
             return
+        if rota in {"/api/disparos/aniversario/teste-individual", "/api/disparos/aniversario-teste"}:
+            self._disparar_template_teste_individual()
+            return
         if rota == "/api/disparos/aniversarios":
             self._disparar_aniversarios()
             return
@@ -642,6 +645,35 @@ class ConfigHandler(BaseHTTPRequestHandler):
             bloco_campanha=bloco_campanha,
         )
         self._responder_json({"ok": True, "previa": resultado})
+
+    def _disparar_template_teste_individual(self) -> None:
+        try:
+            payload = self._ler_json_body()
+            if not isinstance(payload, dict):
+                payload = {}
+        except ValueError as erro:
+            self._responder_erro(HTTPStatus.BAD_REQUEST, str(erro))
+            return
+
+        cliente_id = str(payload.get("cliente_id") or payload.get("id") or payload.get("telefone") or "").strip()
+        if not cliente_id:
+            self._responder_erro(HTTPStatus.BAD_REQUEST, "cliente_id ou telefone e obrigatorio")
+            return
+
+        forcar_reenvio = bool(payload.get("forcar_reenvio"))
+        data_referencia = payload.get("data_referencia")
+        bloco_campanha = payload.get("bloco_campanha") or payload.get("bloco")
+
+        resultado = disparador.disparar_template_teste_individual(
+            payload,
+            data_referencia=data_referencia,
+            bloco_campanha=bloco_campanha,
+            forcar_reenvio=forcar_reenvio,
+        )
+        if not resultado.get("ok"):
+            self._responder_json(resultado, status=HTTPStatus.BAD_REQUEST if resultado.get("status") == "erro" else HTTPStatus.OK)
+            return
+        self._responder_json(resultado)
 
     def _disparar_aniversarios(self) -> None:
         try:

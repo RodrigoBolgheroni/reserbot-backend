@@ -34,6 +34,34 @@ MAPEAMENTO_TEMPLATES: Final[dict[tuple[str, str, str], str]] = {
     ("m", "36_mais", "fds"): "aniversario_m_36_mais_fds",
 }
 
+# Status configurado dos templates aprovados pela Meta
+STATUS_TEMPLATES_CONFIGURADOS: dict[str, str] = {
+    "aniversario_f_18_24_qua_qui": "APPROVED",
+    "aniversario_f_18_24_fds": "APPROVED",
+    "aniversario_f_25_35_qua_qui": "APPROVED",
+    "aniversario_f_25_35_fds": "APPROVED",
+    "aniversario_f_36_mais_qua_qui": "APPROVED",
+    "aniversario_f_36_mais_fds": "APPROVED",
+    "aniversario_m_18_24_qua_qui": "APPROVED",
+    "aniversario_m_18_24_fds": "APPROVED",
+    "aniversario_m_25_35_qua_qui": "APPROVED",
+    "aniversario_m_25_35_fds": "APPROVED",
+    "aniversario_m_36_mais_qua_qui": "APPROVED",
+    "aniversario_m_36_mais_fds": "APPROVED",
+    "aniversario_reforco_sem_resposta": "APPROVED",
+}
+
+
+def obter_status_template(template_name: str) -> str:
+    if not template_name:
+        return "unknown"
+    return STATUS_TEMPLATES_CONFIGURADOS.get(template_name.strip(), "unknown")
+
+
+def atualizar_status_template_configurado(template_name: str, status: str) -> None:
+    if template_name and status:
+        STATUS_TEMPLATES_CONFIGURADOS[template_name.strip()] = status.strip().upper()
+
 
 class ResultadoSelecaoTemplate(TypedDict):
     elegivel: bool

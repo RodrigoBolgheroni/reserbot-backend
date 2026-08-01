@@ -11,7 +11,7 @@ from services.comunicacao import ResultadoEnvioCanal
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["iniciar", "enviar", "enviar_com_resultado", "ler_ultima_mensagem"]
+__all__ = ["iniciar", "enviar", "enviar_com_resultado", "enviar_template", "ler_ultima_mensagem"]
 
 ROOT_DIR: Final[Path] = Path(__file__).resolve().parents[1]
 WHATSAPP_URL: Final[str] = "https://web.whatsapp.com"
@@ -83,6 +83,29 @@ def enviar_com_resultado(telefone: str, texto: str) -> ResultadoEnvioCanal:
             "provider": "selenium",
             "erro": "falha ao iniciar WhatsApp Web",
         }
+
+
+def enviar_template(
+    telefone: str,
+    template_name: str,
+    primeiro_nome: str,
+    language: str = "pt_BR",
+    componentes: list[dict[str, Any]] | None = None,
+) -> ResultadoEnvioCanal:
+    if _usar_cloud_api():
+        return _canal_cloud().enviar_template(
+            telefone=telefone,
+            template_name=template_name,
+            primeiro_nome=primeiro_nome,
+            language=language,
+            componentes=componentes,
+        )
+    return {
+        "ok": False,
+        "telefone": telefone,
+        "provider": "selenium",
+        "erro": "Envio de template via WhatsApp Cloud API requer provider=cloud",
+    }
 
     try:
         _abrir_conversa(telefone_limpo)
