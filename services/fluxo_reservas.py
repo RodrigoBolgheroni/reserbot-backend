@@ -65,6 +65,7 @@ def iniciar_conversa(
     origem: OrigemConversa = "aniversario",
     mensagem_inicial: str = "",
     status: str = "bot_ativo",
+    metadata_conversa: Mapping[str, Any] | None = None,
 ) -> Conversa:
     agora = _agora()
     telefone = str(cliente.get("telefone") or "").strip()
@@ -73,19 +74,24 @@ def iniciar_conversa(
         _finalizar_conversas_ativas_por_telefone(telefone, motivo="nova_conversa_bot")
         agente.limpar_historico(telefone)
     perfil_cliente = _resolver_perfil_seguro(cliente)
+
+    meta_base = {
+        "cliente_nome": cliente.get("nome", ""),
+        "perfil_mensagem": cliente.get("perfil_mensagem") or (perfil_cliente or {}).get("nome"),
+        "perfil_id": (perfil_cliente or {}).get("id"),
+        "perfil_nome": (perfil_cliente or {}).get("nome"),
+        "contexto_aniversario": str(origem or "").strip().lower() == "aniversario",
+    }
+    if metadata_conversa and isinstance(metadata_conversa, Mapping):
+        meta_base.update(dict(metadata_conversa))
+
     conversa: Conversa = {
         "cliente_id": str(cliente.get("id") or ""),
         "cliente_telefone": telefone,
         "status": status_conversa,
         "data_inicio": agora,
         "origem": origem,
-        "metadata": {
-            "cliente_nome": cliente.get("nome", ""),
-            "perfil_mensagem": cliente.get("perfil_mensagem") or (perfil_cliente or {}).get("nome"),
-            "perfil_id": (perfil_cliente or {}).get("id"),
-            "perfil_nome": (perfil_cliente or {}).get("nome"),
-            "contexto_aniversario": str(origem or "").strip().lower() == "aniversario",
-        },
+        "metadata": meta_base,
     }
 
     payload = _sem_vazios(conversa)
@@ -103,10 +109,12 @@ def iniciar_conversa(
         logger.warning("Conversa mantida localmente para %s: %s", telefone, resultado.get("erro"))
 
     if mensagem_inicial:
+        provider_msg_id = str((metadata_conversa or {}).get("provider_message_id") or "")
         registrar_mensagem(
             conversa,
             remetente="bot",
             conteudo=mensagem_inicial,
+            provider_message_id=provider_msg_id,
         )
 
     return conversa

@@ -552,46 +552,99 @@ def disparar_template_teste_individual(
                 "categoria": selecao.get("categoria"),
                 "bloco": selecao.get("bloco"),
                 "forcar_reenvio": forcar_reenvio,
-            },
-        )
-
-        conversa_banco = fluxo_reservas.iniciar_conversa(
-            {
-                **cliente,
-                "telefone": telefone_norm,
-                "nome": cliente.get("nome") or primeiro_nome,
-            },
-            origem="aniversario",
-            mensagem_inicial=f"[Template: {template_name}] Olá {primeiro_nome}!",
-            metadata_conversa={
-                "contexto_aniversario": True,
-                "template_origem": template_name,
                 "provider_message_id": provider_message_id,
-                "janela_atendimento_ativa": False,
             },
         )
 
-        adicionar_conversa_ativa(
-            telefone=telefone_norm,
-            nome=str(cliente.get("nome") or primeiro_nome),
-            ultima_mensagem_cliente="__INIT__",
-            conversa_id=str(conversa_banco.get("id", "")),
-            perfil_id=str(cliente.get("perfil_id") or ""),
-            perfil_nome=str(cliente.get("perfil_nome") or ""),
-        )
+        try:
+            conversa_banco = fluxo_reservas.iniciar_conversa(
+                {
+                    **cliente,
+                    "telefone": telefone_norm,
+                    "nome": cliente.get("nome") or primeiro_nome,
+                },
+                origem="aniversario",
+                mensagem_inicial=f"[Template: {template_name}] Olá {primeiro_nome}!",
+                metadata_conversa={
+                    "contexto_aniversario": True,
+                    "template_origem": template_name,
+                    "provider_message_id": provider_message_id,
+                    "disparo_id": cliente_id,
+                    "janela_atendimento_ativa": False,
+                },
+            )
 
-        return {
-            "ok": True,
-            "status": "enviado",
-            "telefone_mascarado": tel_mascarado,
-            "template_name": template_name,
-            "language": selecao.get("language", "pt_BR"),
-            "primeiro_nome": primeiro_nome,
-            "provider_message_id": provider_message_id,
-            "chave_idempotencia": chave_idempotencia,
-            "forcar_reenvio": forcar_reenvio,
-            "horario": datetime.now().isoformat(),
-        }
+            adicionar_conversa_ativa(
+                telefone=telefone_norm,
+                nome=str(cliente.get("nome") or primeiro_nome),
+                ultima_mensagem_cliente="__INIT__",
+                conversa_id=str(conversa_banco.get("id", "")),
+                perfil_id=str(cliente.get("perfil_id") or ""),
+                perfil_nome=str(cliente.get("perfil_nome") or ""),
+            )
+
+            return {
+                "ok": True,
+                "status": "enviado",
+                "telefone_mascarado": tel_mascarado,
+                "template_name": template_name,
+                "language": selecao.get("language", "pt_BR"),
+                "primeiro_nome": primeiro_nome,
+                "provider_message_id": provider_message_id,
+                "chave_idempotencia": chave_idempotencia,
+                "forcar_reenvio": forcar_reenvio,
+                "horario": datetime.now().isoformat(),
+            }
+        except Exception as local_err:
+            logger.exception(
+                "Falha local ao criar conversa apos envio aceito pela Meta. provider_message_id=%s erro=%s",
+                provider_message_id,
+                local_err,
+            )
+            _registrar_disparo_supabase(
+                cliente=cliente,
+                telefone=telefone_norm,
+                data_referencia=data_ref,
+                mensagem=f"[Template: {template_name}] Olá {primeiro_nome}!",
+                status="reconciliacao_pendente",
+                envio={
+                    **envio,
+                    "envio_meta_aceito": True,
+                    "persistencia_conversa_pendente": True,
+                    "erro_local": str(local_err),
+                },
+                modo_teste=True,
+                tipo_disparo="aniversario",
+                metadata_extra={
+                    "chave_idempotencia": chave_idempotencia,
+                    "template_name": template_name,
+                    "provider_message_id": provider_message_id,
+                    "envio_meta_aceito": True,
+                    "persistencia_conversa_pendente": True,
+                    "reconciliacao_pendente": True,
+                },
+            )
+
+            reconciliar_disparo(
+                provider_message_id=provider_message_id,
+                telefone=telefone_norm,
+                cliente=cliente,
+                template_name=template_name,
+                primeiro_nome=primeiro_nome,
+            )
+
+            return {
+                "ok": True,
+                "status": "reconciliacao_pendente",
+                "envio_meta_aceito": True,
+                "persistencia_conversa_pendente": True,
+                "detalhe": "Mensagem aceita pela Meta. Criacao local da conversa em reconciliacao.",
+                "telefone_mascarado": tel_mascarado,
+                "template_name": template_name,
+                "provider_message_id": provider_message_id,
+                "chave_idempotencia": chave_idempotencia,
+                "erro_local_sanitizado": "Falha na persistencia local da conversa (sanitizado).",
+            }
 
     _registrar_disparo_supabase(
         cliente=cliente,
@@ -846,3 +899,129 @@ def _int_env(nome: str, padrao: int) -> int:
         return int(os.getenv(nome, str(padrao)))
     except ValueError:
         return padrao
+
+
+def reconciliar_disparo(
+    *,
+    provider_message_id: str = "",
+    telefone: str = "",
+    cliente: Mapping[str, Any] | None = None,
+    template_name: str = "",
+    primeiro_nome: str = "",
+    disparo_id: str | None = None,
+) -> dict[str, Any]:
+    """Reconcilia uma conversa e mensagem local para um disparo que já foi aceito pela Meta.
+    NUNCA CHAMA A WHATSAPP CLOUD API NEM REENVIA O TEMPLATE.
+    """
+    logger.info("Iniciando reconciliacao de disparo: provider_message_id=%s telefone=%s", provider_message_id, telefone)
+    tel_norm = normalizar_telefone(telefone or (cliente or {}).get("telefone") or "")
+    if not tel_norm:
+        return {"ok": False, "erro": "telefone_invalido", "reconciliado": False}
+
+    cli = dict(cliente or {})
+    cli_id = str(cli.get("id") or cli.get("cliente_id") or "")
+    nome_cli = str(cli.get("nome") or primeiro_nome or "Cliente").strip() or "Cliente"
+    cli["telefone"] = tel_norm
+    cli["nome"] = nome_cli
+
+    # 1. Tentar buscar conversa existente
+    conversa = fluxo_reservas.buscar_conversa_ativa_por_telefone(tel_norm)
+    if not conversa:
+        try:
+            conversa = fluxo_reservas.iniciar_conversa(
+                cli,
+                origem="aniversario",
+                mensagem_inicial=f"[Template: {template_name}] Olá {primeiro_nome}!" if template_name else "Olá!",
+                metadata_conversa={
+                    "contexto_aniversario": True,
+                    "template_origem": template_name,
+                    "provider_message_id": provider_message_id,
+                    "disparo_id": disparo_id or cli_id,
+                    "janela_atendimento_ativa": False,
+                    "reconciliado": True,
+                },
+            )
+        except Exception as err:
+            logger.exception("Falha na reconciliacao ao criar conversa para %s: %s", tel_norm, err)
+            return {"ok": False, "erro": str(err), "reconciliado": False}
+    else:
+        # Garantir metadados atualizados na conversa existente
+        meta = dict(conversa.get("metadata") or {})
+        meta.update({
+            "contexto_aniversario": True,
+            "template_origem": template_name or meta.get("template_origem", ""),
+            "provider_message_id": provider_message_id or meta.get("provider_message_id", ""),
+            "disparo_id": disparo_id or cli_id or meta.get("disparo_id"),
+            "janela_atendimento_ativa": False,
+            "reconciliado": True,
+        })
+        fluxo_reservas._atualizar_metadata_conversa(conversa, meta)
+
+    # 2. Registrar em conversas ativas em memória
+    adicionar_conversa_ativa(
+        telefone=tel_norm,
+        nome=nome_cli,
+        ultima_mensagem_cliente="__INIT__",
+        conversa_id=str(conversa.get("id", "")),
+        perfil_id=str(cli.get("perfil_id") or ""),
+        perfil_nome=str(cli.get("perfil_nome") or ""),
+    )
+
+    # 3. Atualizar no Supabase
+    if provider_message_id:
+        tabela = supabase.tabela_env("SUPABASE_DISPAROS_TABLE", DEFAULT_DISPAROS_TABLE)
+        supabase.atualizar(
+            tabela,
+            {
+                "status": "enviado",
+                "erro": None,
+                "metadata": {
+                    "envio_meta_aceito": True,
+                    "persistencia_conversa_pendente": False,
+                    "reconciliado": True,
+                    "provider_message_id": provider_message_id,
+                },
+            },
+            filtros={"provider_message_id": f"eq.{provider_message_id}"},
+        )
+
+    logger.info("Reconciliacao concluida com sucesso para %s (conversa_id=%s).", tel_norm, conversa.get("id"))
+    return {
+        "ok": True,
+        "reconciliado": True,
+        "conversa_id": str(conversa.get("id", "")),
+        "provider_message_id": provider_message_id,
+    }
+
+
+def reconciliar_disparos_pendentes() -> list[dict[str, Any]]:
+    """Procura disparos com reconciliacao_pendente ou com provider_message_id e reconcilia as conversas.
+    JAMAIS CHAMA A META API.
+    """
+    tabela = supabase.tabela_env("SUPABASE_DISPAROS_TABLE", DEFAULT_DISPAROS_TABLE)
+    resultado = supabase.selecionar(
+        tabela,
+        colunas="*",
+        filtros={"status": "eq.reconciliacao_pendente"},
+        limite=100,
+    )
+
+    reconciliados = []
+    if resultado.get("ok") and resultado.get("data"):
+        for item in resultado["data"]:
+            pmid = str(item.get("provider_message_id") or "")
+            tel = str(item.get("telefone") or "")
+            meta = item.get("metadata") if isinstance(item.get("metadata"), Mapping) else {}
+            tpl = str(meta.get("template_name") or "")
+            nome = str(meta.get("primeiro_nome") or "Cliente")
+            cli_id = item.get("cliente_id")
+            res = reconciliar_disparo(
+                provider_message_id=pmid,
+                telefone=tel,
+                cliente={"id": cli_id, "telefone": tel, "nome": nome},
+                template_name=tpl,
+                primeiro_nome=nome,
+                disparo_id=item.get("id"),
+            )
+            reconciliados.append(res)
+    return reconciliados
