@@ -6,7 +6,7 @@ Esta pasta contem o backend Python do ReservaBot pronto para rodar separado do f
 
 - `main.py`: entrypoint de producao.
 - `scripts/config_server.py`: servidor HTTP/API.
-- `services/`: modulos de negocio, Supabase, Groq, WhatsApp Cloud API, PDF, perfis e reservas.
+- `services/`: modulos de negocio, providers Gemini/Groq, Supabase, WhatsApp Cloud API, PDF, perfis e reservas.
 - `supabase/schema.sql`: schema que deve ser rodado no Supabase antes do uso real.
 - `data/enviados.json` e `data/reservas.json`: fallback local minimo para compatibilidade.
 - `requirements.txt`: dependencias Python.
@@ -37,8 +37,19 @@ PORT=10000
 CONFIG_SERVER_HOST=0.0.0.0
 CORS_ALLOW_ORIGIN=https://seu-site.netlify.app
 
+AI_PRIMARY_PROVIDER=gemini
+AI_FALLBACK_PROVIDER=groq
+AI_TIMEOUT_SECONDS=30
+
+GEMINI_API_KEY=
+GEMINI_MODEL=gemini-2.5-flash-lite
+GEMINI_PRIMARY_MODEL=
+GEMINI_FALLBACK_MODEL=
+
 GROQ_API_KEY=
 GROQ_MODEL=llama-3.3-70b-versatile
+GROQ_PRIMARY_MODEL=
+GROQ_FALLBACK_MODEL=
 
 SUPABASE_URL=
 SUPABASE_SERVICE_ROLE_KEY=
@@ -65,6 +76,24 @@ EXECUTAR_DISPARO_AO_INICIAR=false
 ```
 
 `SUPABASE_SERVICE_ROLE_KEY` fica somente no Render. Nunca coloque essa chave no Netlify ou no HTML.
+
+## Providers de IA
+
+O backend usa o contrato interno estruturado do agente. O Gemini pode ser ativado como
+provider principal com `AI_PRIMARY_PROVIDER=gemini` e o Groq permanece como fallback
+com `AI_FALLBACK_PROVIDER=groq`. As chaves `GEMINI_API_KEY` e `GROQ_API_KEY` ficam
+somente no Render e nunca devem ser colocadas no frontend.
+
+Para voltar temporariamente ao Groq, configure `AI_PRIMARY_PROVIDER=groq` e mantenha
+`GROQ_API_KEY` configurada. O fluxo de reservas, comprovantes e aprovacao humana nao
+depende do provider escolhido.
+
+Os logs registram provider, modelo, resultado e categoria do erro, sem registrar
+chaves, prompts completos ou o historico integral da conversa.
+
+As variaveis `AI_FALLBACK_API_KEY`, `AI_FALLBACK_MODEL` e `AI_FALLBACK_BASE_URL`
+continuam disponiveis para o fallback OpenAI-compatible legado. Para usa-lo,
+configure `AI_FALLBACK_PROVIDER` como `openai` ou `openai_compatible`.
 
 ## CORS
 

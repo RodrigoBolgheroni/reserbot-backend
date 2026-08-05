@@ -418,7 +418,7 @@ def _processar_mensagem_sem_lock(
         texto_modelo = _payload_fallback_tecnico()
     else:
         try:
-            mensagens_groq = [
+            mensagens_ia = [
                 _mensagem_sistema(
                     nome_cliente,
                     perfil_cliente=perfil_cliente,
@@ -432,17 +432,22 @@ def _processar_mensagem_sem_lock(
             logger.info(
                 "DIAG_RESERVA historico_enviado_ia telefone=%s mensagens=%s",
                 telefone_limpo,
-                json.dumps(mensagens_groq, ensure_ascii=False),
+                _resumo_mensagens_ia(mensagens_ia),
             )
-            texto_modelo = _chamar_groq(
-                mensagens=mensagens_groq,
+            texto_modelo = _chamar_ia(
+                mensagens=mensagens_ia,
                 modelo=os.getenv("GROQ_PRIMARY_MODEL", "").strip() or os.getenv("GROQ_MODEL", MODELO_PADRAO),
                 response_format_json=True,
             )
         except Exception:
             logger.exception("Falha inesperada ao processar mensagem com IA.")
             texto_modelo = _payload_fallback_tecnico()
-    logger.info("DIAG_RESERVA json_bruto_ia telefone=%s resposta=%s", telefone_limpo, texto_modelo)
+    logger.info(
+        "DIAG_RESERVA json_bruto_ia telefone=%s tamanho=%s vazio=%s",
+        telefone_limpo,
+        len(texto_modelo or ""),
+        not bool(str(texto_modelo or "").strip()),
+    )
     json_valido = _extrair_json_resposta(texto_modelo) is not None
     logger.info("DIAG_RESERVA json_estruturado telefone=%s valido=%s tentativa_reparo=%s", telefone_limpo, json_valido, not json_valido)
     texto_para_interpretar = texto_modelo
@@ -457,10 +462,10 @@ def _processar_mensagem_sem_lock(
             texto_para_interpretar = texto_reparado
             reparo_aplicado = True
         logger.info(
-            "DIAG_RESERVA reparo_json_resultado telefone=%s sucesso=%s resposta=%s",
+            "DIAG_RESERVA reparo_json_resultado telefone=%s sucesso=%s tamanho=%s",
             telefone_limpo,
             bool(texto_reparado),
-            texto_reparado or "",
+            len(texto_reparado or ""),
         )
 
     interpretacao = interpretar_resposta_modelo(
@@ -3563,7 +3568,7 @@ def _gerar_resposta_ia_pos_validacao(
 
     resultado_validacao = _resultado_validacao(campo, estado)
     try:
-        texto_modelo = _chamar_groq(
+        texto_modelo = _chamar_ia(
             mensagens=[
                 {
                     "role": "system",
@@ -4861,7 +4866,7 @@ def _reparar_interpretacao_texto_simples(
     if not ia_fallback.tem_provedor_configurado():
         return ""
     try:
-        texto_modelo = _chamar_groq(
+        texto_modelo = _chamar_ia(
             mensagens=[
                 {
                     "role": "system",
@@ -4910,7 +4915,16 @@ def _reparar_interpretacao_texto_simples(
     return texto_modelo if _extrair_json_resposta(texto_modelo) is not None else ""
 
 
-def _chamar_groq(mensagens: Sequence[Mensagem], modelo: str, *, response_format_json: bool = False) -> str:
+def _chamar_ia(mensagens: Sequence[Mensagem], modelo: str, *, response_format_json: bool = False) -> str:
+    # Mantem os testes e extensoes antigas que substituem _chamar_groq.
+    legado = globals().get("_chamar_groq")
+    compatibilidade = globals().get("_CHAMAR_GROQ_COMPAT")
+    if legado is not None and legado is not compatibilidade:
+        return legado(mensagens=mensagens, modelo=modelo, response_format_json=response_format_json)
+    return _chamar_ia_impl(mensagens, modelo, response_format_json=response_format_json)
+
+
+def _chamar_ia_impl(mensagens: Sequence[Mensagem], modelo: str, *, response_format_json: bool = False) -> str:
     telefone = _telefone_processamento.get()
     estado = _estados_reserva.get(telefone, {}) if telefone else {}
     resultado = ia_fallback.executar_ia_com_fallback(
@@ -4932,6 +4946,14 @@ def _chamar_groq(mensagens: Sequence[Mensagem], modelo: str, *, response_format_
     return _payload_fallback_tecnico()
 
 
+def _chamar_groq(mensagens: Sequence[Mensagem], modelo: str, *, response_format_json: bool = False) -> str:
+    """Alias privado de compatibilidade para testes e integrações antigas."""
+    return _chamar_ia_impl(mensagens, modelo, response_format_json=response_format_json)
+
+
+_CHAMAR_GROQ_COMPAT = _chamar_groq
+
+
 def _texto_modelo_eh_fallback_tecnico(texto_modelo: str) -> bool:
     payload = _extrair_json_resposta(texto_modelo)
     return bool(
@@ -4943,6 +4965,20 @@ def _texto_modelo_eh_fallback_tecnico(texto_modelo: str) -> bool:
 
 def _json_contexto(valor: Mapping[str, Any] | Sequence[Any]) -> str:
     return json.dumps(valor, ensure_ascii=False, separators=(",", ":"))
+
+
+def _resumo_mensagens_ia(mensagens: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    return {
+        "quantidade": len(mensagens),
+        "mensagens": [
+            {
+                "role": str(item.get("role") or ""),
+                "tamanho_conteudo": len(str(item.get("content") or "")),
+            }
+            for item in mensagens
+            if isinstance(item, Mapping)
+        ],
+    }
 
 
 def _espacos_ativos(config: config_restaurante.ConfigRestaurante) -> list[config_restaurante.EspacoRestaurante]:

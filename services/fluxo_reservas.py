@@ -281,11 +281,12 @@ def processar_resposta_cliente(
         contexto_mensagem=contexto_mensagem,
     )
     logger.info(
-        "DIAG_RESERVA resposta_bruta_ia telefone=%s turn_id=%s conversa_id=%s texto=%r",
+        "DIAG_RESERVA resposta_bruta_ia telefone=%s turn_id=%s conversa_id=%s tamanho=%s status=%s",
         telefone_limpo,
         turn_id,
         conversa_id,
-        resposta.get("texto"),
+        len(str(resposta.get("texto") or "")),
+        resposta.get("status_reserva", ""),
     )
 
     resposta = _aplicar_fluxo_comprovante(
@@ -324,11 +325,12 @@ def processar_resposta_cliente(
         resposta=resposta,
     )
     logger.info(
-        "DIAG_RESERVA resposta_pos_fluxo telefone=%s turn_id=%s conversa_id=%s texto=%r",
+        "DIAG_RESERVA resposta_pos_fluxo telefone=%s turn_id=%s conversa_id=%s tamanho=%s status=%s",
         telefone_limpo,
         turn_id,
         conversa_id,
-        resposta.get("texto"),
+        len(str(resposta.get("texto") or "")),
+        resposta.get("status_reserva", ""),
     )
 
     if resposta["texto"]:
@@ -336,11 +338,11 @@ def processar_resposta_cliente(
         envio_ok = bool(envio.get("ok"))
         if envio_ok:
             logger.info(
-                "DIAG_RESERVA resposta_enviada_whatsapp telefone=%s turn_id=%s provider_message_id=%s texto=%r",
+                "DIAG_RESERVA resposta_enviada_whatsapp telefone=%s turn_id=%s provider_message_id=%s tamanho=%s",
                 telefone_limpo,
                 turn_id,
                 envio.get("provider_message_id"),
-                resposta["texto"],
+                len(str(resposta.get("texto") or "")),
             )
             registrar_mensagem(
                 conversa_atual,

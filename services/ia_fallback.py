@@ -13,6 +13,8 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from services import supabase
+from services.ai_providers import AIProviderError, AIProviderResult, GeminiProvider, GroqProvider
+from services.ai_providers.gemini_provider import DEFAULT_GEMINI_MODEL
 
 
 logger = logging.getLogger(__name__)
@@ -150,7 +152,8 @@ def sanitizar_mensagens_para_modelo(
 
 def tem_provedor_configurado() -> bool:
     return bool(
-        os.getenv("GROQ_API_KEY", "").strip()
+        os.getenv("GEMINI_API_KEY", "").strip()
+        or os.getenv("GROQ_API_KEY", "").strip()
         or (
             os.getenv("AI_FALLBACK_PROVIDER", "").strip()
             and os.getenv("AI_FALLBACK_API_KEY", "").strip()
@@ -168,50 +171,54 @@ def executar_ia_com_fallback(
     response_format_json: bool = False,
 ) -> ResultadoIA:
     mensagens_limpas = sanitizar_mensagens_para_modelo(mensagens)
-    candidatos = _candidatos_groq(modelo_preferido)
+    candidatos = _candidatos_providers(modelo_preferido)
     erros: list[str] = []
 
-    for indice, modelo in enumerate(candidatos):
+    for indice, (provider, modelo) in enumerate(candidatos):
         papel = "primary" if indice == 0 else "fallback"
-        if _cooldown_ativo("groq", modelo):
+        if _cooldown_ativo(provider, modelo):
             logger.warning(
-                "ai_model_cooldown_active provider=groq model=%s papel=%s telefone=%s conversa_id=%s",
+                "ai_model_cooldown_active provider=%s model=%s papel=%s telefone=%s conversa_id=%s",
+                provider,
                 modelo,
                 papel,
                 _mascarar_telefone(telefone),
                 conversa_id or "",
             )
-            erros.append(f"groq:{modelo}:cooldown")
+            erros.append(f"{provider}:{modelo}:cooldown")
             continue
 
         logger.info(
-            "ai_%s_started provider=groq model=%s telefone=%s conversa_id=%s",
+            "ai_%s_started provider=%s model=%s telefone=%s conversa_id=%s",
             papel,
+            provider,
             modelo,
             _mascarar_telefone(telefone),
             conversa_id or "",
         )
         try:
-            conteudo = _executar_groq_modelo(
-                mensagens_limpas,
+            resultado_provider = _executar_provider_normalizado(
+                provider=provider,
                 modelo=modelo,
+                mensagens=mensagens_limpas,
                 response_format_json=response_format_json,
             )
         except Exception as exc:
             codigo = _classificar_erro_ia(exc)
-            erros.append(f"groq:{modelo}:{codigo}")
+            erros.append(f"{provider}:{modelo}:{codigo}")
             if codigo == "rate_limit":
                 segundos = _retry_after_segundos(exc)
                 _registrar_cooldown(
-                    "groq",
+                    provider,
                     modelo,
                     segundos=segundos,
                     motivo="rate_limit",
                     mensagem=_sanitizar_erro(exc),
                 )
                 logger.warning(
-                    "ai_%s_rate_limited provider=groq model=%s retry_after_segundos=%s telefone=%s conversa_id=%s",
+                    "ai_%s_rate_limited provider=%s model=%s retry_after_segundos=%s telefone=%s conversa_id=%s",
                     papel,
+                    provider,
                     modelo,
                     segundos,
                     _mascarar_telefone(telefone),
@@ -222,6 +229,14 @@ def executar_ia_com_fallback(
                 "connection",
                 "timeout",
                 "server_error",
+                "network",
+                "authentication",
+                "model_not_found",
+                "invalid_schema",
+                "safety_block",
+                "missing_api_key",
+                "provider_error",
+                "provider_not_supported",
                 "response_format",
                 "bad_request",
                 "json_validate_failed",
@@ -230,8 +245,9 @@ def executar_ia_com_fallback(
                 "json_repair_failed",
             }:
                 logger.warning(
-                    "ai_%s_failed provider=groq model=%s erro_codigo=%s telefone=%s conversa_id=%s",
+                    "ai_%s_failed provider=%s model=%s erro_codigo=%s telefone=%s conversa_id=%s",
                     papel,
+                    provider,
                     modelo,
                     codigo,
                     _mascarar_telefone(telefone),
@@ -239,8 +255,9 @@ def executar_ia_com_fallback(
                 )
                 continue
             logger.exception(
-                "ai_%s_failed_unexpected provider=groq model=%s telefone=%s conversa_id=%s",
+                "ai_%s_failed_unexpected provider=%s model=%s telefone=%s conversa_id=%s",
                 papel,
+                provider,
                 modelo,
                 _mascarar_telefone(telefone),
                 conversa_id or "",
@@ -248,30 +265,33 @@ def executar_ia_com_fallback(
             continue
 
         logger.info(
-            "ai_%s_success provider=groq model=%s telefone=%s conversa_id=%s",
+            "ai_%s_success provider=%s model=%s telefone=%s conversa_id=%s",
             papel,
+            resultado_provider.provider,
             modelo,
             _mascarar_telefone(telefone),
             conversa_id or "",
         )
         return {
             "ok": True,
-            "provider": "groq",
+            "provider": resultado_provider.provider,
             "model": modelo,
-            "conteudo": conteudo,
+            "conteudo": resultado_provider.content,
             "usou_fallback": indice > 0,
         }
 
-    resultado_provider = _executar_provider_alternativo(
-        mensagens_limpas,
-        telefone=telefone,
-        conversa_id=conversa_id,
-        response_format_json=response_format_json,
-    )
-    if resultado_provider.get("ok"):
-        return resultado_provider
-    if resultado_provider.get("erro_codigo"):
-        erros.append(str(resultado_provider["erro_codigo"]))
+    provider_compat = _provider_fallback_config()
+    if provider_compat and provider_compat["provider"] not in {"gemini", "groq"}:
+        resultado_compat = _executar_provider_alternativo(
+            mensagens_limpas,
+            telefone=telefone,
+            conversa_id=conversa_id,
+            response_format_json=response_format_json,
+        )
+        if resultado_compat.get("ok"):
+            return resultado_compat
+        if resultado_compat.get("erro_codigo"):
+            erros.append(str(resultado_compat["erro_codigo"]))
 
     codigos = [e.split(":")[-1] for e in erros]
     apenas_bad_request = bool(codigos and all(c == "bad_request" for c in codigos))
@@ -313,6 +333,90 @@ def executar_ia_com_fallback(
         "encaminhar_humano": True,
         "erro_codigo": "todos_provedores_indisponiveis",
     }
+
+
+def _candidatos_providers(modelo_preferido: str | None) -> list[tuple[str, str]]:
+    """Monta a cadeia sem repetir provider/modelo."""
+    tem_gemini = bool(os.getenv("GEMINI_API_KEY", "").strip())
+    tem_groq = bool(os.getenv("GROQ_API_KEY", "").strip())
+    primario = os.getenv("AI_PRIMARY_PROVIDER", "").strip().lower()
+    fallback = os.getenv("AI_FALLBACK_PROVIDER", "").strip().lower()
+
+    if primario not in {"gemini", "groq"}:
+        if tem_gemini:
+            primario = "gemini"
+        elif tem_groq:
+            primario = "groq"
+        else:
+            primario = ""
+
+    if not fallback or fallback not in {"gemini", "groq"}:
+        fallback = "groq" if primario == "gemini" and tem_groq else "gemini" if primario == "groq" and tem_gemini else ""
+
+    candidatos: list[tuple[str, str]] = []
+    for provider in (primario, fallback):
+        if provider == "gemini":
+            modelos = _candidatos_gemini()
+        elif provider == "groq":
+            modelos = _candidatos_groq(modelo_preferido)
+        else:
+            modelos = []
+        for modelo in modelos:
+            candidato = (provider, modelo)
+            if candidato not in candidatos:
+                candidatos.append(candidato)
+    return candidatos
+
+
+def _candidatos_gemini() -> list[str]:
+    if not os.getenv("GEMINI_API_KEY", "").strip():
+        return []
+    primary = (
+        os.getenv("GEMINI_PRIMARY_MODEL", "").strip()
+        or os.getenv("GEMINI_MODEL", "").strip()
+        or DEFAULT_GEMINI_MODEL
+    )
+    fallback = os.getenv("GEMINI_FALLBACK_MODEL", "").strip()
+    candidatos = [primary]
+    if fallback and fallback not in candidatos:
+        candidatos.append(fallback)
+    return candidatos
+
+
+def _executar_provider_normalizado(
+    *,
+    provider: str,
+    modelo: str,
+    mensagens: Sequence[Mapping[str, Any]],
+    response_format_json: bool,
+) -> AIProviderResult:
+    schema = SCHEMA_RESERVA_BOT_RESPONSE if response_format_json else None
+    if provider == "gemini":
+        provedor = GeminiProvider(
+            api_key=os.getenv("GEMINI_API_KEY", "").strip(),
+            model=modelo,
+            timeout_seconds=_timeout_ia_seconds(),
+        )
+    elif provider == "groq":
+        provedor = GroqProvider(_executar_groq_modelo, modelo)
+    else:
+        raise AIProviderError(
+            f"provider nao suportado: {provider}",
+            error_code="provider_not_supported",
+        )
+    resultado = provedor.generate(
+        [dict(mensagem) for mensagem in mensagens],
+        response_schema=schema,
+        temperature=0.4,
+        max_output_tokens=500,
+    )
+    if response_format_json and resultado.parsed_json is None:
+        reparado = extrair_json_resposta(resultado.content)
+        if reparado is None:
+            raise JsonRepairFailed("json_repair_failed")
+        resultado.parsed_json = reparado
+        resultado.content = json.dumps(reparado, ensure_ascii=False)
+    return resultado
 
 
 def limpar_cooldowns_memoria() -> None:
@@ -500,7 +604,7 @@ def _criar_completion_groq(client: Any, kwargs: Mapping[str, Any]) -> Any:
 def _criar_cliente_groq(api_key: str) -> Any:
     from groq import Groq
 
-    return Groq(api_key=api_key)
+    return Groq(api_key=api_key, timeout=_timeout_ia_seconds(), max_retries=0)
 
 
 def _executar_groq_sem_json_mode_tolerante(
@@ -805,7 +909,7 @@ def _executar_fallback_provider(
         },
     )
     try:
-        with urlopen(request, timeout=30) as response:
+        with urlopen(request, timeout=_timeout_ia_seconds()) as response:
             corpo = response.read().decode("utf-8")
     except HTTPError as exc:
         raise _ErroHTTPProvider(exc.code, _ler_erro_http(exc), dict(exc.headers)) from exc
@@ -827,6 +931,8 @@ class _ErroHTTPProvider(RuntimeError):
 
 
 def _classificar_erro_ia(exc: Exception) -> str:
+    if isinstance(exc, AIProviderError):
+        return exc.error_code
     nome = exc.__class__.__name__
     status = _status_code(exc)
     texto = str(exc).lower()
@@ -1149,3 +1255,11 @@ def _ler_erro_http(exc: HTTPError) -> str:
     except Exception:
         corpo = str(exc)
     return _sanitizar_erro(RuntimeError(corpo))
+
+
+def _timeout_ia_seconds() -> float:
+    try:
+        valor = float(os.getenv("AI_TIMEOUT_SECONDS", "30"))
+    except (TypeError, ValueError):
+        valor = 30.0
+    return min(max(valor, 1.0), 120.0)
