@@ -47,3 +47,13 @@ def normalizar_telefone(telefone: str) -> str:
     if len(digitos) in (12, 13) and digitos.startswith("55"):
         return digitos
     return ""
+
+
+def mascarar_telefone(telefone: str) -> str:
+    """Mascara telefones para logs e mensagens de diagnostico."""
+    digitos = "".join(caractere for caractere in str(telefone or "") if caractere.isdigit())
+    if len(digitos) >= 9:
+        return f"{digitos[:5]}****{digitos[-4:]}"
+    if len(digitos) >= 4:
+        return f"****{digitos[-2:]}"
+    return "****"

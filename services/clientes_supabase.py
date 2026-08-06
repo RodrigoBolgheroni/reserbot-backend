@@ -8,6 +8,7 @@ from datetime import date, datetime
 from typing import Any, Final, TypedDict
 
 from services import mensagens, perfis, supabase
+from services.comunicacao import mascarar_telefone
 
 logger = logging.getLogger(__name__)
 
@@ -154,7 +155,7 @@ def buscar_cliente_por_telefone(telefone: str, *, tabela: str | None = None) -> 
         limite=1,
     )
     if not resultado.get("ok"):
-        logger.warning("Nao foi possivel buscar cliente %s: %s", telefone_limpo, resultado.get("erro"))
+        logger.warning("Nao foi possivel buscar cliente %s: %s", mascarar_telefone(telefone_limpo), resultado.get("erro"))
         return None
     dados = resultado.get("data")
     if isinstance(dados, list) and dados and isinstance(dados[0], dict):

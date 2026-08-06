@@ -9,7 +9,7 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from services.comunicacao import MensagemRecebida, ResultadoEnvioCanal, normalizar_telefone
+from services.comunicacao import MensagemRecebida, ResultadoEnvioCanal, mascarar_telefone, normalizar_telefone
 
 
 logger = logging.getLogger(__name__)
@@ -67,7 +67,7 @@ class WhatsAppCloudChannel:
                 message_id = _extrair_message_id(data)
                 logger.info(
                     "Mensagem enviada pela WhatsApp Cloud API para %s. message_id=%s",
-                    telefone_limpo,
+                    mascarar_telefone(telefone_limpo),
                     message_id or "indisponivel",
                 )
                 return {
@@ -172,7 +172,7 @@ class WhatsAppCloudChannel:
                 }
         except HTTPError as erro:
             detalhe = _ler_erro_http(erro)
-            logger.warning("WhatsApp Cloud API retornou HTTP %s ao enviar template %s: %s", erro.code, template_name, detalhe)
+            logger.warning("WhatsApp Cloud API retornou HTTP %s ao enviar template %s para %s: %s", erro.code, template_name, mascarar_telefone(telefone_limpo), detalhe)
             return {
                 "ok": False,
                 "telefone": telefone_limpo,

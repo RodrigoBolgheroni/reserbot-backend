@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Final, TypedDict
 
 from services import mensagens, supabase
+from services.comunicacao import mascarar_telefone
 from services.modelos import PerfilCliente
 
 
@@ -216,7 +217,7 @@ def classificar_cliente(
             melhor = (pontuacao, perfil)
 
     if melhor is None or melhor[0] <= 0:
-        logger.info("Cliente %s sem perfil compativel.", cliente.get("telefone", ""))
+        logger.info("Cliente %s sem perfil compativel.", mascarar_telefone(str(cliente.get("telefone", ""))))
         return None
 
     perfil = dict(melhor[1])

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, TypedDict
 
 from services import agente, clientes_supabase, dados, fluxo_reservas, mensagens, perfis, planilha, whatsapp
-from services.comunicacao import normalizar_telefone
+from services.comunicacao import mascarar_telefone, normalizar_telefone
 from services import supabase
 
 
@@ -671,6 +671,431 @@ def disparar_template_teste_individual(
         "erro": str(envio.get("erro") or "Falha ao enviar template pela WhatsApp Cloud API"),
         "detalhe": str(envio.get("detalhe") or ""),
     }
+
+
+def executar_disparo_agendado(
+    clientes: list[dict[str, Any]],
+    *,
+    data_referencia: date,
+    chave_idempotencia: str,
+    horario_programado: str,
+    dry_run: bool = False,
+    bloco_campanha: str | None = None,
+) -> dict[str, Any]:
+    """Executa um lote explicito de tres templates reais, com claim atomico.
+
+    O claim usa o indice unico de producao existente em disparos_mensagens para
+    reservar cada telefone antes de chamar a Meta. Assim, uma segunda execucao
+    nao envia novamente, inclusive se ocorrer em paralelo no mesmo Cron Job.
+    """
+    chave = str(chave_idempotencia or "").strip()
+    if len(clientes) != 3:
+        return _erro_lote_agendado(
+            f"Lote rejeitado: eram esperados exatamente 3 destinatarios, recebido={len(clientes)}."
+        )
+    if not chave:
+        return _erro_lote_agendado("DISPARO_CHAVE_IDEMPOTENCIA e obrigatoria.")
+
+    identidades: set[str] = set()
+    preparados: list[dict[str, Any]] = []
+    for cliente in clientes:
+        cliente_id = str(cliente.get("id") or "").strip()
+        telefone = normalizar_telefone(str(cliente.get("telefone") or ""))
+        identidade = cliente_id or telefone
+        if not identidade or identidade in identidades:
+            return _erro_lote_agendado("Lote rejeitado: os tres destinatarios precisam ser distintos.")
+        identidades.add(identidade)
+
+        preparado = _preparar_template_agendado(
+            cliente,
+            data_referencia=data_referencia,
+            bloco_campanha=bloco_campanha,
+        )
+        if not preparado.get("ok"):
+            return {
+                **_erro_lote_agendado("Lote rejeitado na validacao; nenhum envio foi iniciado."),
+                "validacoes": [
+                    _resumo_template_agendado(item) for item in preparados
+                ] + [{
+                    "cliente_id_mascarado": _mascarar_id(cliente_id),
+                    "telefone_mascarado": mascarar_telefone(telefone),
+                    "ok": False,
+                    "motivo": preparado.get("motivo") or "validacao_falhou",
+                    "template_name": preparado.get("template_name", ""),
+                }],
+            }
+        preparado["data_referencia"] = data_referencia
+        preparados.append(preparado)
+
+    resumo_base = {
+        "total_destinatarios": 3,
+        "chave_idempotencia": chave,
+        "horario_programado": horario_programado,
+        "data_referencia": data_referencia.isoformat(),
+        "validacoes": [_resumo_template_agendado(item) for item in preparados],
+    }
+    if dry_run:
+        logger.info(
+            "DRY_RUN=true: destinatarios=%s chave=%s horario=%s nenhum envio sera realizado.",
+            len(preparados),
+            chave,
+            horario_programado,
+        )
+        for item in preparados:
+            logger.info(
+                "DRY_RUN destinatario id=%s telefone=%s template=%s.",
+                _mascarar_id(str(item["cliente"].get("id") or "")),
+                mascarar_telefone(str(item["telefone"])),
+                item["template_name"],
+            )
+        return {
+            "ok": True,
+            "dry_run": True,
+            **resumo_base,
+            "confirmacao": "nenhum envio ocorreu",
+            "resultados": [
+                {
+                    **_resumo_template_agendado(item),
+                    "status": "validado",
+                    "enviado": False,
+                }
+                for item in preparados
+            ],
+        }
+
+    if not supabase.configurado():
+        return _erro_lote_agendado("Supabase nao configurado; envio real abortado antes do primeiro envio.")
+    if os.getenv("WHATSAPP_PROVIDER", "cloud").strip().lower() != "cloud":
+        return _erro_lote_agendado("Envio real agendado exige WHATSAPP_PROVIDER=cloud.")
+
+    claims: list[dict[str, Any]] = []
+    resultados: list[dict[str, Any]] = []
+    for item in preparados:
+        claim = _reivindicar_disparo_agendado(
+            item,
+            data_referencia=data_referencia,
+            chave_idempotencia=chave,
+            horario_programado=horario_programado,
+        )
+        if claim.get("duplicado"):
+            resultados.append({
+                **_resumo_template_agendado(item),
+                "status": "pulado",
+                "enviado": False,
+                "detalhe": "Disparo real ja reservado ou registrado para este telefone e data.",
+            })
+            continue
+        if not claim.get("ok"):
+            for reservado in claims:
+                _atualizar_disparo_agendado(
+                    reservado,
+                    status="falha",
+                    erro="Preflight do lote falhou antes do envio; nenhum envio foi iniciado.",
+                )
+            return {
+                "ok": False,
+                **resumo_base,
+                "aborted": True,
+                "erro": "Nao foi possivel reservar todos os disparos antes do envio.",
+                "detalhe": str(claim.get("detalhe") or "Falha ao registrar claim no Supabase."),
+                "resultados": resultados,
+            }
+        claims.append({**item, "disparo_id": claim.get("disparo_id")})
+
+    for item in claims:
+        resultados.append(
+            _enviar_template_agendado(
+                item,
+                data_referencia=data_referencia,
+                chave_idempotencia=chave,
+                horario_programado=horario_programado,
+            )
+        )
+
+    falhas = sum(1 for item in resultados if item.get("status") in {"falha", "erro_registro"})
+    enviados = sum(1 for item in resultados if item.get("enviado"))
+    logger.info(
+        "Disparo agendado finalizado: destinatarios=%s enviados=%s falhas=%s pulados=%s chave=%s.",
+        len(resultados),
+        enviados,
+        falhas,
+        sum(1 for item in resultados if item.get("status") == "pulado"),
+        chave,
+    )
+    return {
+        "ok": falhas == 0,
+        **resumo_base,
+        "dry_run": False,
+        "enviados": enviados,
+        "falhas": falhas,
+        "resultados": resultados,
+    }
+
+
+def _preparar_template_agendado(
+    cliente: dict[str, Any],
+    *,
+    data_referencia: date,
+    bloco_campanha: str | None,
+) -> dict[str, Any]:
+    from services import templates_aniversario
+
+    selecao = templates_aniversario.selecionar_template_aniversario(
+        cliente,
+        data_referencia=data_referencia,
+        bloco_campanha=bloco_campanha,
+    )
+    telefone = normalizar_telefone(str(cliente.get("telefone") or ""))
+    template_name = str(selecao.get("template_name") or "")
+    if not telefone:
+        return {"ok": False, "motivo": "telefone_invalido", "template_name": template_name}
+    if not selecao.get("elegivel"):
+        return {
+            "ok": False,
+            "motivo": str(selecao.get("motivo_bloqueio") or "cliente_nao_elegivel"),
+            "template_name": template_name,
+        }
+    if templates_aniversario.obter_status_template(template_name) != "APPROVED":
+        return {
+            "ok": False,
+            "motivo": "template_nao_aprovado",
+            "template_name": template_name,
+            "status_template": templates_aniversario.obter_status_template(template_name),
+        }
+    return {
+        "ok": True,
+        "cliente": cliente,
+        "telefone": telefone,
+        "template_name": template_name,
+        "language": str(selecao.get("language") or "pt_BR"),
+        "primeiro_nome": str(selecao.get("primeiro_nome") or "Cliente"),
+        "selecao": selecao,
+    }
+
+
+def _reivindicar_disparo_agendado(
+    item: dict[str, Any],
+    *,
+    data_referencia: date,
+    chave_idempotencia: str,
+    horario_programado: str,
+) -> dict[str, Any]:
+    cliente = item["cliente"]
+    metadata = {
+        "chave_idempotencia": chave_idempotencia,
+        "horario_programado": horario_programado,
+        "template_name": item["template_name"],
+        "language": item["language"],
+        "primeiro_nome": item["primeiro_nome"],
+        "categoria": item["selecao"].get("categoria"),
+        "faixa": item["selecao"].get("faixa"),
+        "bloco": item["selecao"].get("bloco"),
+        "agendamento_unico": True,
+    }
+    payload = {
+        "cliente_id": cliente.get("id") or None,
+        "telefone": item["telefone"],
+        "tipo_disparo": "aniversario",
+        "data_referencia": data_referencia.isoformat(),
+        "mensagem": f"[Template: {item['template_name']}] Ola {item['primeiro_nome']}!",
+        "status": "pendente",
+        "provider": "cloud",
+        "modo_teste": False,
+        "metadata": metadata,
+    }
+    item["metadata_disparo"] = metadata
+    tabela = supabase.tabela_env("SUPABASE_DISPAROS_TABLE", DEFAULT_DISPAROS_TABLE)
+    resultado = supabase.inserir(tabela, payload, retornar=True)
+    if resultado.get("ok"):
+        dados = resultado.get("data")
+        registro = dados[0] if isinstance(dados, list) and dados and isinstance(dados[0], dict) else (dados if isinstance(dados, dict) else {})
+        return {"ok": True, "disparo_id": registro.get("id")}
+    if resultado.get("status") == 409:
+        logger.info(
+            "Idempotencia: claim ja existe para telefone=%s data=%s.",
+            mascarar_telefone(item["telefone"]),
+            data_referencia.isoformat(),
+        )
+        return {"ok": False, "duplicado": True}
+    return {
+        "ok": False,
+        "detalhe": str(resultado.get("detalhe") or resultado.get("erro") or "Falha ao registrar disparo."),
+    }
+
+
+def _enviar_template_agendado(
+    item: dict[str, Any],
+    *,
+    data_referencia: date,
+    chave_idempotencia: str,
+    horario_programado: str,
+) -> dict[str, Any]:
+    telefone = str(item["telefone"])
+    resumo = _resumo_template_agendado(item)
+    try:
+        envio = whatsapp.enviar_template(
+            telefone=telefone,
+            template_name=item["template_name"],
+            primeiro_nome=item["primeiro_nome"],
+            language=item["language"],
+        )
+    except Exception as erro:
+        envio = {"ok": False, "provider": "cloud", "erro": "excecao_no_envio", "detalhe": str(erro)}
+
+    if not envio.get("ok"):
+        registro_ok = _atualizar_disparo_agendado(
+            item,
+            status="falha",
+            erro=str(envio.get("erro") or envio.get("detalhe") or "Falha no envio."),
+            envio=envio,
+        )
+        return {
+            **resumo,
+            "status": "falha" if registro_ok else "erro_registro",
+            "enviado": False,
+            "detalhe": "Falha no envio; tentativa registrada." if registro_ok else "Falha no envio e no registro da tentativa.",
+        }
+
+    provider_message_id = str(envio.get("provider_message_id") or "")
+    metadata_conversa = {
+        "contexto_aniversario": True,
+        "template_origem": item["template_name"],
+        "provider_message_id": provider_message_id,
+        "disparo_id": str(item["disparo_id"] or item["cliente"].get("id") or ""),
+        "chave_idempotencia": chave_idempotencia,
+        "janela_atendimento_ativa": False,
+        "horario_programado": horario_programado,
+    }
+    registro_ok = _atualizar_disparo_agendado(
+        item,
+        status="enviado",
+        erro="",
+        envio=envio,
+        metadata_extra={"provider_message_id": provider_message_id},
+    )
+    try:
+        conversa = fluxo_reservas.iniciar_conversa(
+            {
+                **item["cliente"],
+                "telefone": telefone,
+                "nome": item["cliente"].get("nome") or item["primeiro_nome"],
+            },
+            origem="aniversario",
+            mensagem_inicial=f"[Template: {item['template_name']}] Ola {item['primeiro_nome']}!",
+            metadata_conversa=metadata_conversa,
+        )
+        conversa_id = str(conversa.get("id") or "")
+        adicionar_conversa_ativa(
+            telefone=telefone,
+            nome=str(item["cliente"].get("nome") or item["primeiro_nome"]),
+            ultima_mensagem_cliente="__INIT__",
+            conversa_id=conversa_id,
+            perfil_id=str(item["cliente"].get("perfil_id") or ""),
+            perfil_nome=str(item["cliente"].get("perfil_nome") or ""),
+        )
+        _atualizar_disparo_agendado(
+            item,
+            status="enviado",
+            erro="",
+            envio=envio,
+            metadata_extra={"provider_message_id": provider_message_id, "conversa_id": conversa_id},
+        )
+        return {
+            **resumo,
+            "status": "enviado" if registro_ok else "erro_registro",
+            "enviado": True,
+            "provider_message_id": provider_message_id,
+            "conversa_id": conversa_id,
+            "detalhe": "Mensagem aceita pela Meta e conversa bot_ativo criada." if registro_ok else "Mensagem aceita pela Meta; registro precisa ser conferido.",
+        }
+    except Exception as erro:
+        logger.exception(
+            "Mensagem aceita pela Meta; falha ao criar conversa para telefone=%s.",
+            mascarar_telefone(telefone),
+        )
+        _atualizar_disparo_agendado(
+            item,
+            status="enviado",
+            erro="",
+            envio=envio,
+            metadata_extra={
+                "provider_message_id": provider_message_id,
+                "conversa_persistencia_pendente": True,
+                "erro_conversa_sanitizado": "Falha na persistencia local da conversa.",
+            },
+        )
+        return {
+            **resumo,
+            "status": "enviado_conversa_pendente",
+            "enviado": True,
+            "provider_message_id": provider_message_id,
+            "detalhe": "Mensagem aceita pela Meta; conversa pendente de reconciliacao.",
+        }
+
+
+def _atualizar_disparo_agendado(
+    item: dict[str, Any],
+    *,
+    status: str,
+    erro: str = "",
+    envio: dict[str, Any] | None = None,
+    metadata_extra: dict[str, Any] | None = None,
+) -> bool:
+    metadata = dict(item.get("metadata_disparo") or {})
+    metadata.update(metadata_extra or {})
+    payload: dict[str, Any] = {
+        "status": status,
+        "erro": erro or None,
+        "metadata": metadata,
+    }
+    if envio is not None:
+        payload.update(
+            {
+                "provider": envio.get("provider") or "cloud",
+                "provider_message_id": envio.get("provider_message_id") or None,
+            }
+        )
+    tabela = supabase.tabela_env("SUPABASE_DISPAROS_TABLE", DEFAULT_DISPAROS_TABLE)
+    filtros = {"id": f"eq.{item.get('disparo_id')}"} if item.get("disparo_id") else {
+        "telefone": f"eq.{item['telefone']}",
+        "tipo_disparo": "eq.aniversario",
+        "data_referencia": f"eq.{item['data_referencia'].isoformat()}" if isinstance(item.get("data_referencia"), date) else "eq." + str(item.get("data_referencia") or ""),
+        "modo_teste": "eq.false",
+    }
+    resultado = supabase.atualizar(tabela, payload, filtros=filtros, retornar=False)
+    if not resultado.get("ok"):
+        logger.error(
+            "Falha ao atualizar disparo telefone=%s status=%s erro=%s.",
+            mascarar_telefone(str(item["telefone"])),
+            status,
+            resultado.get("erro", ""),
+        )
+    return bool(resultado.get("ok"))
+
+
+def _resumo_template_agendado(item: dict[str, Any]) -> dict[str, Any]:
+    cliente = item.get("cliente") or {}
+    telefone = str(item.get("telefone") or cliente.get("telefone") or "")
+    return {
+        "cliente_id_mascarado": _mascarar_id(str(cliente.get("id") or "")),
+        "telefone_mascarado": mascarar_telefone(telefone),
+        "template_name": str(item.get("template_name") or ""),
+        "language": str(item.get("language") or "pt_BR"),
+        "perfil_nome": str(item.get("selecao", {}).get("perfil_nome") or cliente.get("perfil_nome") or ""),
+        "ok": True,
+    }
+
+
+def _mascarar_id(valor: str) -> str:
+    texto = str(valor or "")
+    if len(texto) >= 8:
+        return f"{texto[:4]}****{texto[-4:]}"
+    return "****" if texto else "(ausente)"
+
+
+def _erro_lote_agendado(mensagem: str) -> dict[str, Any]:
+    logger.error("Disparo agendado abortado: %s", mensagem)
+    return {"ok": False, "dry_run": False, "aborted": True, "erro": mensagem, "resultados": []}
 
 
 def monitorar_respostas(parar_evento: threading.Event | None = None) -> None:

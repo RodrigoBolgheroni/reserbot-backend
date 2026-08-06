@@ -28,6 +28,98 @@ python main.py
 
 O servidor usa `PORT` da plataforma e escuta em `0.0.0.0`.
 
+## Disparo unico agendado de 06/08/2026
+
+O backend nao possui scheduler em memoria ativo. Para este disparo especifico,
+use um Render Cron Job executando `scripts/disparo_agendado.py`. O comando usa
+somente os tres clientes informados explicitamente por `DISPARO_CLIENTE_IDS` ou
+`DISPARO_TELEFONES`; ele nao consulta a lista automatica de aniversariantes.
+
+O job faz uma validacao completa dos tres clientes e dos templates antes do
+primeiro envio. Em producao, cria primeiro uma linha `pendente` com
+`modo_teste=false` em `disparos_mensagens`. O indice unico de producao ja
+existente nessa tabela impede um segundo claim para o mesmo telefone/data. A
+linha e atualizada para `enviado` ou `falha`, e a conversa e criada com
+`status=bot_ativo`. Nenhum schema novo e necessario.
+
+### Variaveis temporarias do job
+
+Configure exatamente uma das listas abaixo no Cron Job. Nao coloque telefones
+ou chaves no repositorio:
+
+```bash
+DISPARO_CLIENTE_IDS=id-1,id-2,id-3
+# ou, alternativamente:
+# DISPARO_TELEFONES=5511999990001,5511999990002,5511999990003
+
+DRY_RUN=true
+DISPARO_DATA_REFERENCIA=2026-08-06
+DISPARO_HORARIO_LOCAL=19:00
+DISPARO_TIMEZONE=America/Sao_Paulo
+DISPARO_CHAVE_IDEMPOTENCIA=disparo-2026-08-06-19h-3-clientes
+```
+
+Para validar sem enviar:
+
+```bash
+DRY_RUN=true python scripts/disparo_agendado.py
+```
+
+Depois de confirmar no log que `total_destinatarios=3`, os tres templates
+estao aprovados e aparece `confirmacao: nenhum envio ocorreu`, altere somente
+`DRY_RUN=false`. O comando real e:
+
+```bash
+DRY_RUN=false python scripts/disparo_agendado.py
+```
+
+O script recusa qualquer quantidade diferente de tres, telefones invalidos,
+IDs repetidos, cliente ausente, perfil inelegivel, template nao aprovado,
+execucao antes das 19:00 ou execucao em outra data. A chave, a data e o fuso
+tambem sao fixos neste job para evitar reutilizacao acidental.
+
+### Configuracao exata no Render
+
+Crie um servico do tipo **Cron Job** no mesmo repositorio/branch do backend:
+
+- Root Directory: `reserva-backend`
+- Build Command: `pip install -r requirements.txt`
+- Schedule: `0 22 6 8 *` (22:00 UTC = 19:00 em `America/Sao_Paulo` em 06/08/2026)
+- Command: `python scripts/disparo_agendado.py`
+- Runtime: Python 3, com as mesmas variaveis de Supabase e WhatsApp Cloud do web service
+- `WHATSAPP_PROVIDER=cloud`
+
+Copie para o Cron Job as variaveis de conexao ja usadas pelo backend
+(`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, tabelas `SUPABASE_*`,
+`WHATSAPP_API_VERSION`, `WHATSAPP_PHONE_NUMBER_ID` e
+`WHATSAPP_ACCESS_TOKEN`) e as variaveis temporarias acima. Mantenha
+`DRY_RUN=true` no primeiro deploy. Render interpreta as expressoes de Cron em
+UTC; o job tambem valida o fuso e bloqueia execucoes fora de 06/08/2026.
+
+Para cancelar antes das 19:00, apague o Cron Job ou altere `DRY_RUN` para
+`true` antes da proxima execucao. Depois de um sucesso, remova o Cron Job (ou
+deixe-o inofensivo: a data fixa impede novo disparo em 07/08/2026).
+
+### Conferencia depois das 19:00
+
+No Supabase, confira as tres linhas da chave e os retornos da Meta:
+
+```sql
+select cliente_id, status, provider_message_id, modo_teste,
+       metadata->>'chave_idempotencia' as chave,
+       metadata->>'template_name' as template_name
+from public.disparos_mensagens
+where tipo_disparo = 'aniversario'
+  and data_referencia = '2026-08-06'
+  and modo_teste = false
+  and metadata->>'chave_idempotencia' = 'disparo-2026-08-06-19h-3-clientes';
+```
+
+Deve haver exatamente tres linhas, com `status=enviado`, `entregue` ou
+`lido`. `provider_message_id` identifica cada mensagem; os webhooks da Meta
+atualizam `entregue`/`lido` e preservam a chave. Confira também `conversas` por
+esses `cliente_id`, esperando `origem=aniversario` e `status=bot_ativo`.
+
 ## Variaveis obrigatorias
 
 Configure no painel do Render:
